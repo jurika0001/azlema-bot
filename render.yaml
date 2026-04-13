@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: azlema-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: MEXC_API_KEY
+        sync: false          # set manually in Render dashboard
+      - key: MEXC_API_SECRET
+        sync: false
+      - key: APP_URL
+        sync: false          # set to your Render URL e.g. https://azlema-bot.onrender.com
+      - key: SYMBOL
+        value: ETH_USDT
+      - key: TIMEFRAME
+        value: Min15
+      - key: LEVERAGE
+        value: "1"
+      - key: CONTRACT_SIZE
+        value: "1"
+      - key: PERIOD
+        value: "20"
+      - key: GAIN_LIMIT
+        value: "50"
+      - key: THRESHOLD
+        value: "0.0"
+      - key: TRADES_FILE
+        value: trades.json
