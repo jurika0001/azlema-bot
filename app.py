@@ -38,7 +38,7 @@ PORT       = int(os.environ.get("PORT", 8080))
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-SYMBOL     = "ETH/USDT:USDT"
+SYMBOL     = "ETHUSDT"
 TIMEFRAME  = "30m"
 LEVERAGE   = 1
 RISK_PCT   = 0.01
@@ -162,11 +162,13 @@ def trading_loop():
             ex = build_exchange()
             ex.load_markets()
 
-            # Set 1x leverage (ignore if already set)
+            # Set 1x leverage — Phemex exige leverageEr em escala interna
             try:
-                ex.set_leverage(LEVERAGE, SYMBOL)
-            except Exception:
-                pass
+                ex.set_leverage(LEVERAGE, SYMBOL, params={
+                    "leverageEr": LEVERAGE * 10000,
+                })
+            except Exception as e:
+                log.warning(f"set_leverage ignorado: {e}")
 
             # Fetch last 120 closed 30m candles (exclude live bar)
             ohlcv  = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=121)
@@ -188,12 +190,13 @@ def trading_loop():
                     "last_check": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                 })
 
-            # Current position
+            # Current position — comparacao flexivel de simbolo
             positions = ex.fetch_positions([SYMBOL])
             cur_side  = "FLAT"
             cur_qty   = 0.0
             for p in positions:
-                if p.get("symbol") == SYMBOL:
+                sym = p.get("symbol") or ""
+                if SYMBOL in sym or sym in SYMBOL:
                     contracts = float(p.get("contracts") or 0)
                     if contracts > 0:
                         cur_side = "LONG" if p.get("side") == "long" else "SHORT"
@@ -204,27 +207,36 @@ def trading_loop():
 
             # Balance & quantity
             bal_info = ex.fetch_balance()
-            balance  = float((bal_info.get("USDT") or {}).get("free") or 100)
+            usdt     = bal_info.get("USDT") or bal_info.get("usdt") or {}
+            balance  = float(usdt.get("free") or usdt.get("total") or 1000)
             with _lock:
                 status["balance"] = round(balance, 2)
 
-            mintick = ex.markets[SYMBOL].get("precision", {}).get("price", 0.01)
+            market  = ex.markets.get(SYMBOL, {})
+            mintick = market.get("precision", {}).get("price", 0.01)
             if isinstance(mintick, int):
                 mintick = 10 ** (-mintick)
-            sl_usdt = SL_TICKS * mintick
+            sl_usdt = max(SL_TICKS * float(mintick), 0.01)
             qty     = max(round((RISK_PCT * balance) / sl_usdt, 3), 0.001)
 
-            # Execute
+            # Parametros obrigatorios para ordens no Phemex
+            order_params = {"timeInForce": "ImmediateOrCancel"}
+
+            # Execute — fecha posicao oposta antes de abrir nova (one-way mode)
             if signal == "LONG" and cur_side != "LONG":
-                amount = qty * 2 if cur_side == "SHORT" else qty
-                order  = ex.create_market_order(SYMBOL, "buy", amount)
+                if cur_side == "SHORT":
+                    ex.create_market_order(SYMBOL, "buy", cur_qty,
+                                           params={**order_params, "reduceOnly": True})
+                order = ex.create_market_order(SYMBOL, "buy", qty, params=order_params)
                 _record("LONG", price, qty, ec, ema, order)
                 with _lock:
                     status["position"] = "LONG"
 
             elif signal == "SHORT" and cur_side != "SHORT":
-                amount = qty * 2 if cur_side == "LONG" else qty
-                order  = ex.create_market_order(SYMBOL, "sell", amount)
+                if cur_side == "LONG":
+                    ex.create_market_order(SYMBOL, "sell", cur_qty,
+                                           params={**order_params, "reduceOnly": True})
+                order = ex.create_market_order(SYMBOL, "sell", qty, params=order_params)
                 _record("SHORT", price, qty, ec, ema, order)
                 with _lock:
                     status["position"] = "SHORT"
