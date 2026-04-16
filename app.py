@@ -38,7 +38,7 @@ PORT       = int(os.environ.get("PORT", 8080))
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-SYMBOL     = "ETHUSDT"
+SYMBOL     = "ETH/USDT:USDT"
 TIMEFRAME  = "30m"
 LEVERAGE   = 1
 RISK_PCT   = 0.01
@@ -74,8 +74,14 @@ def build_exchange():
         "secret":          API_SECRET,
         "enableRateLimit": True,
         "options":         {"defaultType": "swap"},
+        # Phemex testnet URLs explícitas — set_sandbox_mode tem bug no ccxt
+        "urls": {
+            "api": {
+                "public":  "https://testnet-api.phemex.com",
+                "private": "https://testnet-api.phemex.com",
+            }
+        },
     })
-    ex.set_sandbox_mode(True)   # uses testnet-api.phemex.com
     return ex
 
 # ─────────────────────────────────────────────────────────────
@@ -162,11 +168,9 @@ def trading_loop():
             ex = build_exchange()
             ex.load_markets()
 
-            # Set 1x leverage — Phemex exige leverageEr em escala interna
+            # Set 1x leverage — ignorar erro, posicao ja abre com leverage padrao
             try:
-                ex.set_leverage(LEVERAGE, SYMBOL, params={
-                    "leverageEr": LEVERAGE * 10000,
-                })
+                ex.set_leverage(LEVERAGE, SYMBOL)
             except Exception as e:
                 log.warning(f"set_leverage ignorado: {e}")
 
@@ -190,7 +194,7 @@ def trading_loop():
                     "last_check": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                 })
 
-            # Current position — comparacao flexivel de simbolo
+            # Current position
             positions = ex.fetch_positions([SYMBOL])
             cur_side  = "FLAT"
             cur_qty   = 0.0
@@ -219,10 +223,9 @@ def trading_loop():
             sl_usdt = max(SL_TICKS * float(mintick), 0.01)
             qty     = max(round((RISK_PCT * balance) / sl_usdt, 3), 0.001)
 
-            # Parametros obrigatorios para ordens no Phemex
+            # Execute — fecha posicao oposta antes de abrir nova (one-way mode)
             order_params = {"timeInForce": "ImmediateOrCancel"}
 
-            # Execute — fecha posicao oposta antes de abrir nova (one-way mode)
             if signal == "LONG" and cur_side != "LONG":
                 if cur_side == "SHORT":
                     ex.create_market_order(SYMBOL, "buy", cur_qty,
