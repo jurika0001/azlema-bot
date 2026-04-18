@@ -2,10 +2,15 @@
 """
 Phemex Paper Trading Bot — Adaptive Zero Lag EMA
 30-minute timeframe | Paper Futures | 1x Leverage
+Usa API REST direta do Phemex testnet (sem ccxt para ordens)
 """
 
 import os
 import time
+import hmac
+import hashlib
+import json
+import uuid
 import threading
 import logging
 from datetime import datetime, timezone
@@ -38,14 +43,17 @@ PORT       = int(os.environ.get("PORT", 8080))
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-SYMBOL     = "ETH/USDT:USDT"
-TIMEFRAME  = "30m"
-LEVERAGE   = 1
-RISK_PCT   = 0.01
-SL_TICKS   = 2000
-GAIN_LIMIT = 50
-PERIOD     = 20
-THRESHOLD  = 0.0
+TESTNET_BASE  = "https://testnet-api.phemex.com"
+RAW_SYMBOL    = "ETHUSDT"          # Phemex raw symbol
+CCXT_SYMBOL   = "ETH/USDT:USDT"   # ccxt symbol (apenas para OHLCV)
+TIMEFRAME     = "30m"
+RISK_PCT      = 0.01
+SL_TICKS      = 2000
+GAIN_LIMIT    = 50
+PERIOD        = 20
+THRESHOLD     = 0.0
+# ETHUSDT perp no Phemex: 1 contrato = 0.001 ETH
+CONTRACT_SIZE = 0.001
 
 # ─────────────────────────────────────────────────────────────
 # SHARED STATE
@@ -66,16 +74,111 @@ status = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# PHEMEX PAPER (TESTNET)
+# PHEMEX TESTNET — API REST DIRETA COM ASSINATURA HMAC
 # ─────────────────────────────────────────────────────────────
-def build_exchange():
+def _phemex_sign(path: str, query: str, expiry: str, body: str) -> str:
+    msg = path + query + expiry + body
+    return hmac.new(
+        API_SECRET.encode("utf-8"),
+        msg.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _phemex_headers(path: str, query: str = "", body: str = "") -> dict:
+    expiry = str(int(time.time()) + 60)
+    return {
+        "x-phemex-access-token":      API_KEY,
+        "x-phemex-request-expiry":    expiry,
+        "x-phemex-request-signature": _phemex_sign(path, query, expiry, body),
+        "Content-Type":               "application/json",
+    }
+
+
+def phemex_get(path: str, params: dict = None) -> dict:
+    query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+    url   = TESTNET_BASE + path + (f"?{query}" if query else "")
+    resp  = requests.get(url, headers=_phemex_headers(path, query), timeout=10)
+    return resp.json()
+
+
+def phemex_post(path: str, body: dict) -> dict:
+    body_str = json.dumps(body, separators=(",", ":"))
+    resp     = requests.post(
+        TESTNET_BASE + path,
+        headers=_phemex_headers(path, "", body_str),
+        data=body_str,
+        timeout=10,
+    )
+    return resp.json()
+
+
+# ─────────────────────────────────────────────────────────────
+# PHEMEX HELPERS
+# ─────────────────────────────────────────────────────────────
+def get_balance_and_position():
+    """
+    Retorna (balance_usdt, cur_side, cur_qty_contracts).
+    cur_side: 'LONG' | 'SHORT' | 'FLAT'
+    """
+    data      = phemex_get("/accounts/accountPositions", {"currency": "USDT"})
+    result    = data.get("data") or {}
+    account   = result.get("account") or {}
+    positions = result.get("positions") or []
+
+    # accountBalanceEv escalado por 1e8
+    bal_ev  = account.get("accountBalanceEv") or 0
+    balance = bal_ev / 1e8
+
+    cur_side = "FLAT"
+    cur_qty  = 0
+    for p in positions:
+        if p.get("symbol") == RAW_SYMBOL:
+            size = int(p.get("size") or 0)
+            if size > 0:
+                side_raw = p.get("side") or ""
+                cur_side = "LONG" if side_raw == "Buy" else "SHORT"
+                cur_qty  = size
+    return balance, cur_side, cur_qty
+
+
+def place_order(side: str, qty_contracts: int, reduce_only: bool = False) -> dict:
+    """
+    side: 'Buy' | 'Sell'
+    qty_contracts: numero inteiro de contratos
+    """
+    body = {
+        "symbol":     RAW_SYMBOL,
+        "clOrdID":    uuid.uuid4().hex[:16],
+        "side":       side,
+        "orderType":  "Market",
+        "orderQty":   qty_contracts,
+        "reduceOnly": reduce_only,
+    }
+    log.info(f"Enviando ordem: {body}")
+    resp = phemex_post("/orders", body)
+    log.info(f"Resposta: {resp}")
+    return resp
+
+
+def close_position(cur_side: str, cur_qty: int):
+    if cur_qty <= 0:
+        return
+    close_side = "Sell" if cur_side == "LONG" else "Buy"
+    resp = place_order(close_side, cur_qty, reduce_only=True)
+    if resp.get("code") == 0:
+        log.info(f"Posicao {cur_side} fechada ({cur_qty} contratos)")
+    else:
+        log.warning(f"Erro ao fechar {cur_side}: {resp}")
+
+
+# ─────────────────────────────────────────────────────────────
+# ccxt — somente para OHLCV publico (sem autenticacao)
+# ─────────────────────────────────────────────────────────────
+def build_exchange_ohlcv():
     ex = ccxt.phemex({
-        "apiKey":          API_KEY,
-        "secret":          API_SECRET,
         "enableRateLimit": True,
         "options":         {"defaultType": "swap"},
-        # Forcar URLs do testnet diretamente — set_sandbox_mode tem bug no ccxt/Phemex
-        "hostname":        "testnet-api.phemex.com",
         "urls": {
             "api": {
                 "public":  "https://testnet-api.phemex.com",
@@ -85,33 +188,27 @@ def build_exchange():
     })
     return ex
 
+
 # ─────────────────────────────────────────────────────────────
 # AZLEMA CALCULATION
 # ─────────────────────────────────────────────────────────────
 def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
-    """
-    Returns (ec, ema, least_error_pct).
-    EC > EMA → LONG  |  EC < EMA → SHORT
-    """
     arr = np.array(closes, dtype=np.float64)
     n   = len(arr)
     if n < period + 10:
         return None, None, None
 
-    alpha = 2.0 / (period + 1)
-
-    # EMA
-    ema = np.empty(n)
+    alpha  = 2.0 / (period + 1)
+    ema    = np.empty(n)
     ema[0] = arr[0]
     for i in range(1, n):
         ema[i] = alpha * arr[i] + (1 - alpha) * ema[i - 1]
 
-    # Best Gain search
     best_gain   = 0.0
     least_error = 1e18
     for g_int in range(-gain_limit * 10, gain_limit * 10 + 1):
-        g  = g_int / 10.0
-        ec = np.empty(n)
+        g     = g_int / 10.0
+        ec    = np.empty(n)
         ec[0] = arr[0]
         for i in range(1, n):
             ec[i] = alpha * (ema[i] + g * (arr[i] - ec[i - 1])) + (1 - alpha) * ec[i - 1]
@@ -120,8 +217,7 @@ def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
             least_error = err
             best_gain   = g
 
-    # Final EC with best gain
-    ec = np.empty(n)
+    ec    = np.empty(n)
     ec[0] = arr[0]
     for i in range(1, n):
         ec[i] = alpha * (ema[i] + best_gain * (arr[i] - ec[i - 1])) + (1 - alpha) * ec[i - 1]
@@ -129,55 +225,58 @@ def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
     err_pct = 100.0 * least_error / arr[-1] if arr[-1] != 0 else 0.0
     return float(ec[-1]), float(ema[-1]), err_pct
 
+
 # ─────────────────────────────────────────────────────────────
-# TIMING — wait until next 30m candle close
+# TIMING
 # ─────────────────────────────────────────────────────────────
 def seconds_to_next_30m() -> float:
     now  = datetime.now(timezone.utc)
     secs = now.minute * 60 + now.second + now.microsecond / 1e6
     wait = (1800 - secs) if secs < 1800 else (3600 - secs)
-    return wait + 5   # +5 s buffer so candle is confirmed
+    return wait + 5
+
 
 # ─────────────────────────────────────────────────────────────
 # TRADING LOOP
 # ─────────────────────────────────────────────────────────────
-def _record(side, price, qty, ec, ema, order):
+def _record(side, price, qty, ec, ema, order_resp):
+    data  = order_resp.get("data") or {}
+    oid   = data.get("orderID") or data.get("clOrdID") or "—"
     entry = {
         "time":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "side":     side,
         "price":    round(price, 4),
-        "qty":      round(qty, 4),
+        "qty":      qty,
         "ec":       round(ec, 4),
         "ema":      round(ema, 4),
-        "order_id": (order or {}).get("id", "—"),
+        "order_id": oid,
     }
     with _lock:
         trade_history.appendleft(entry)
-    log.info(f"TRADE ▶ {side} {qty} @ {price}")
+    log.info(f"TRADE ▶ {side} {qty} contratos @ {price}")
 
 
 def trading_loop():
     status["running"] = True
-    log.info("Trading loop started — waiting for first 30m candle")
+    log.info("Trading loop iniciado — aguardando proximo candle 30m")
+
+    ex = build_exchange_ohlcv()
 
     while True:
         wait = seconds_to_next_30m()
-        log.info(f"Next candle in {wait:.0f}s")
+        log.info(f"Proximo candle em {wait:.0f}s")
         time.sleep(wait)
 
         try:
-            ex = build_exchange()
-            ex.load_markets()
-
-            # Fetch last 120 closed 30m candles (exclude live bar)
-            ohlcv  = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=121)
+            # ── OHLCV via ccxt publico ─────────────────────────────
+            ohlcv  = ex.fetch_ohlcv(CCXT_SYMBOL, TIMEFRAME, limit=121)
             closes = [c[4] for c in ohlcv[:-1]]
             price  = float(closes[-1])
 
-            # AZLEMA
+            # ── AZLEMA ────────────────────────────────────────────
             ec, ema, err_pct = azlema(closes)
             if ec is None:
-                log.warning("Not enough bars for AZLEMA")
+                log.warning("Barras insuficientes para AZLEMA")
                 continue
 
             signal = "LONG" if ec > ema else "SHORT"
@@ -189,66 +288,53 @@ def trading_loop():
                     "last_check": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                 })
 
-            # Current position
-            positions = ex.fetch_positions([SYMBOL])
-            cur_side  = "FLAT"
-            cur_qty   = 0.0
-            for p in positions:
-                sym = p.get("symbol") or ""
-                if SYMBOL in sym or sym in SYMBOL or sym.replace("/","").replace(":USDT","") == "ETHUSDT":
-                    contracts = float(p.get("contracts") or 0)
-                    if contracts > 0:
-                        cur_side = "LONG" if p.get("side") == "long" else "SHORT"
-                        cur_qty  = contracts
-
+            # ── POSICAO E SALDO via API direta ────────────────────
+            balance, cur_side, cur_qty = get_balance_and_position()
             with _lock:
                 status["position"] = cur_side
+                status["balance"]  = round(balance, 2)
 
-            # Balance & quantity
-            bal_info = ex.fetch_balance()
-            usdt    = bal_info.get("USDT") or bal_info.get("usdt") or {}
-            balance = float(usdt.get("free") or usdt.get("total") or 1000)
-            with _lock:
-                status["balance"] = round(balance, 2)
+            # ── QUANTIDADE ────────────────────────────────────────
+            risk_usdt     = RISK_PCT * balance
+            qty_eth       = risk_usdt / price if price > 0 else 0
+            qty_contracts = max(int(qty_eth / CONTRACT_SIZE), 1)
 
-            market  = ex.markets.get(SYMBOL, {})
-            mintick = market.get("precision", {}).get("price", 0.01)
-            if isinstance(mintick, int):
-                mintick = 10 ** (-mintick)
-            mintick = float(mintick) if mintick else 0.01
-            sl_usdt = max(SL_TICKS * mintick, 0.01)
-            qty     = max(round((RISK_PCT * balance) / sl_usdt, 3), 0.001)
+            log.info(
+                f"Signal={signal} | Pos={cur_side}({cur_qty}) | "
+                f"EC={ec:.2f} EMA={ema:.2f} | "
+                f"Bal={balance:.2f} USDT | Qty={qty_contracts} contratos"
+            )
 
-            # Execute — fecha posicao oposta antes de abrir nova, sem params extras
+            # ── EXECUTAR ──────────────────────────────────────────
             if signal == "LONG" and cur_side != "LONG":
                 if cur_side == "SHORT" and cur_qty > 0:
-                    try:
-                        ex.create_market_order(SYMBOL, "buy", cur_qty)
-                        log.info(f"Fechou SHORT {cur_qty}")
-                    except Exception as ce:
-                        log.warning(f"Erro ao fechar SHORT: {ce}")
-                order = ex.create_market_order(SYMBOL, "buy", qty)
-                _record("LONG", price, qty, ec, ema, order)
-                with _lock:
-                    status["position"] = "LONG"
+                    close_position("SHORT", cur_qty)
+                    time.sleep(0.5)
+                resp = place_order("Buy", qty_contracts)
+                if resp.get("code") == 0:
+                    _record("LONG", price, qty_contracts, ec, ema, resp)
+                    with _lock:
+                        status["position"] = "LONG"
+                else:
+                    raise Exception(f"Ordem BUY rejeitada: {resp}")
 
             elif signal == "SHORT" and cur_side != "SHORT":
                 if cur_side == "LONG" and cur_qty > 0:
-                    try:
-                        ex.create_market_order(SYMBOL, "sell", cur_qty)
-                        log.info(f"Fechou LONG {cur_qty}")
-                    except Exception as ce:
-                        log.warning(f"Erro ao fechar LONG: {ce}")
-                order = ex.create_market_order(SYMBOL, "sell", qty)
-                _record("SHORT", price, qty, ec, ema, order)
-                with _lock:
-                    status["position"] = "SHORT"
+                    close_position("LONG", cur_qty)
+                    time.sleep(0.5)
+                resp = place_order("Sell", qty_contracts)
+                if resp.get("code") == 0:
+                    _record("SHORT", price, qty_contracts, ec, ema, resp)
+                    with _lock:
+                        status["position"] = "SHORT"
+                else:
+                    raise Exception(f"Ordem SELL rejeitada: {resp}")
 
             else:
-                log.info(f"Hold {cur_side} | EC={ec:.4f} EMA={ema:.4f}")
+                log.info(f"Mantendo {cur_side} | sem acao")
 
         except Exception as exc:
-            msg = str(exc)[:160]
+            msg = str(exc)[:200]
             log.error(f"Bot error: {msg}")
             with _lock:
                 status["errors"].appendleft({
@@ -256,11 +342,12 @@ def trading_loop():
                     "msg":  msg,
                 })
 
+
 # ─────────────────────────────────────────────────────────────
 # INTERNAL KEEPALIVE — 3 threads: 8 s / 15 s / 23 s
 # ─────────────────────────────────────────────────────────────
 def _ka_worker(interval: int, name: str):
-    time.sleep(interval + 3)    # stagger startup
+    time.sleep(interval + 3)
     while True:
         time.sleep(interval)
         try:
@@ -271,12 +358,14 @@ def _ka_worker(interval: int, name: str):
         with _lock:
             ka_log.appendleft(msg)
 
+
 # ─────────────────────────────────────────────────────────────
 # FLASK ROUTES
 # ─────────────────────────────────────────────────────────────
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "ts": datetime.utcnow().isoformat()})
+
 
 @app.route("/health")
 def health():
@@ -287,14 +376,16 @@ def health():
         "signal":   status["signal"],
     })
 
+
 @app.route("/")
 def dashboard():
     with _lock:
-        snap          = dict(status)
+        snap           = dict(status)
         snap["errors"] = list(status["errors"])
-        trades        = list(trade_history)
-        ka            = list(ka_log)
+        trades         = list(trade_history)
+        ka             = list(ka_log)
     return render_template_string(_HTML, s=snap, trades=trades, ka=ka)
+
 
 # ─────────────────────────────────────────────────────────────
 # DASHBOARD HTML
@@ -320,10 +411,10 @@ _HTML = """<!DOCTYPE html>
 <body>
 <div class="container-fluid py-3 px-4">
   <div class="d-flex align-items-center mb-3 flex-wrap gap-2">
-    <h5 class="mb-0 me-2">⚡ AZLEMA Bot</h5>
+    <h5 class="mb-0 me-2">&#9889; AZLEMA Bot</h5>
     <span class="badge {{'bg-success' if s.running else 'bg-danger'}}">
       {{'RUNNING' if s.running else 'STOPPED'}}</span>
-    <small class="text-secondary">Phemex Paper · ETH/USDT · 30m · 1×</small>
+    <small class="text-secondary">Phemex Paper &middot; ETH/USDT &middot; 30m &middot; 1&times;</small>
     <small class="text-secondary ms-auto">auto-refresh 30s</small>
   </div>
 
@@ -364,7 +455,7 @@ _HTML = """<!DOCTYPE html>
         <table class="table table-dark table-hover table-sm mb-0">
           <thead><tr>
             <th>Time (UTC)</th><th>Side</th><th>Price</th>
-            <th>Qty</th><th>EC</th><th>EMA</th><th>Order ID</th>
+            <th>Contratos</th><th>EC</th><th>EMA</th><th>Order ID</th>
           </tr></thead>
           <tbody>
           {% for t in trades %}
@@ -381,7 +472,7 @@ _HTML = """<!DOCTYPE html>
         </div>
         {% else %}
         <div class="text-secondary text-center py-5">
-          No trades yet — waiting for first 30m candle close.
+          Nenhuma trade ainda &mdash; aguardando fechamento do proximo candle 30m.
         </div>
         {% endif %}
       </div>
@@ -391,7 +482,7 @@ _HTML = """<!DOCTYPE html>
       <div class="card p-3 mb-3">
         <h6 class="text-secondary mb-2">Keepalive (8s / 15s / 23s)</h6>
         {% for k in ka %}<div class="ka">{{k}}</div>
-        {% else %}<div class="text-secondary small">Starting...</div>{% endfor %}
+        {% else %}<div class="text-secondary small">Iniciando...</div>{% endfor %}
       </div>
       {% if s.errors %}
       <div class="card p-3">
@@ -406,9 +497,10 @@ _HTML = """<!DOCTYPE html>
 </html>"""
 
 # ─────────────────────────────────────────────────────────────
-# STARTUP — runs once at module import (works with gunicorn too)
+# STARTUP
 # ─────────────────────────────────────────────────────────────
 _started = False
+
 
 def _start_background():
     global _started
@@ -418,7 +510,8 @@ def _start_background():
     for interval, name in [(8, "KA-8s"), (15, "KA-15s"), (23, "KA-23s")]:
         threading.Thread(target=_ka_worker, args=(interval, name), daemon=True).start()
     threading.Thread(target=trading_loop, daemon=True).start()
-    log.info("Background threads started (trading + 3x keepalive)")
+    log.info("Background threads iniciados (trading + 3x keepalive)")
+
 
 _start_background()
 
