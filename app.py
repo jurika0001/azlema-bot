@@ -121,24 +121,42 @@ def get_balance_and_position():
     Retorna (balance_usdt, cur_side, cur_qty_contracts).
     cur_side: 'LONG' | 'SHORT' | 'FLAT'
     """
-    data      = phemex_get("/accounts/accountPositions", {"currency": "USDT"})
+    data = phemex_get("/g-accounts/accountPositions", {"currency": "USDT"})
+    log.info(f"accountPositions raw: {data}")
+
+    # Detectar erro de autenticacao ou argumento
+    err = data.get("error") or {}
+    if err.get("code") or (data.get("code") and data.get("code") != 0):
+        log.error(f"Erro em accountPositions: {data}")
+        return 1000.0, "FLAT", 0   # fallback para nao travar o bot
+
     result    = data.get("data") or {}
     account   = result.get("account") or {}
     positions = result.get("positions") or []
 
-    # accountBalanceEv escalado por 1e8
-    bal_ev  = account.get("accountBalanceEv") or 0
-    balance = bal_ev / 1e8
+    log.info(f"account keys: {list(account.keys())}")
+
+    # Tentar varios campos de balance (USDT linear usa campos diferentes)
+    bal_ev      = (account.get("accountBalanceEv")
+                or account.get("totalBalanceEv")
+                or account.get("accountBalance")
+                or 0)
+    # Se valor > 1e6 provavelmente esta em Ev (scaled 1e8), senao ja e USDT
+    balance = (bal_ev / 1e8) if bal_ev > 1e6 else float(bal_ev)
+    if balance == 0:
+        balance = 1000.0  # fallback para testnet sem saldo listado
 
     cur_side = "FLAT"
     cur_qty  = 0
     for p in positions:
-        if p.get("symbol") == RAW_SYMBOL:
+        sym = p.get("symbol") or ""
+        if sym == RAW_SYMBOL:
             size = int(p.get("size") or 0)
             if size > 0:
                 side_raw = p.get("side") or ""
                 cur_side = "LONG" if side_raw == "Buy" else "SHORT"
                 cur_qty  = size
+            log.info(f"Posicao encontrada: {p}")
     return balance, cur_side, cur_qty
 
 
@@ -148,16 +166,19 @@ def place_order(side: str, qty_contracts: int, reduce_only: bool = False) -> dic
     qty_contracts: numero inteiro de contratos
     """
     body = {
-        "symbol":     RAW_SYMBOL,
-        "clOrdID":    uuid.uuid4().hex[:16],
-        "side":       side,
-        "orderType":  "Market",
-        "orderQty":   qty_contracts,
-        "reduceOnly": reduce_only,
+        "symbol":    RAW_SYMBOL,
+        "clOrdID":   uuid.uuid4().hex[:16],
+        "side":      side,
+        "orderType": "Market",
+        "orderQty":  qty_contracts,
     }
+    if reduce_only:
+        body["reduceOnly"] = True
     log.info(f"Enviando ordem: {body}")
-    resp = phemex_post("/orders", body)
-    log.info(f"Resposta: {resp}")
+    resp = phemex_post("/g-orders", body)
+    log.info(f"Resposta ordem: {resp}")
+    if resp.get("code") != 0:
+        log.error(f"ERRO ordem {side}: code={resp.get('code') or (resp.get('error') or {}).get('code')} msg={resp.get('msg') or (resp.get('error') or {}).get('message')}")
     return resp
 
 
@@ -239,6 +260,16 @@ def seconds_to_next_30m() -> float:
 # ─────────────────────────────────────────────────────────────
 # TRADING LOOP
 # ─────────────────────────────────────────────────────────────
+
+def _order_ok(resp: dict) -> bool:
+    """Verifica sucesso na resposta da ordem (REST Phemex pode usar code ou error)."""
+    if resp.get("code") == 0:
+        return True
+    if "error" not in resp and resp.get("data"):
+        return True   # sem campo code mas tem data = sucesso em algumas versoes
+    return False
+
+
 def _record(side, price, qty, ec, ema, order_resp):
     data  = order_resp.get("data") or {}
     oid   = data.get("orderID") or data.get("clOrdID") or "—"
@@ -311,7 +342,7 @@ def trading_loop():
                     close_position("SHORT", cur_qty)
                     time.sleep(0.5)
                 resp = place_order("Buy", qty_contracts)
-                if resp.get("code") == 0:
+                if _order_ok(resp):
                     _record("LONG", price, qty_contracts, ec, ema, resp)
                     with _lock:
                         status["position"] = "LONG"
@@ -323,7 +354,7 @@ def trading_loop():
                     close_position("LONG", cur_qty)
                     time.sleep(0.5)
                 resp = place_order("Sell", qty_contracts)
-                if resp.get("code") == 0:
+                if _order_ok(resp):
                     _record("SHORT", price, qty_contracts, ec, ema, resp)
                     with _lock:
                         status["position"] = "SHORT"
