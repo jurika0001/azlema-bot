@@ -74,7 +74,8 @@ def build_exchange():
         "secret":          API_SECRET,
         "enableRateLimit": True,
         "options":         {"defaultType": "swap"},
-        # Phemex testnet URLs explícitas — set_sandbox_mode tem bug no ccxt
+        # Forcar URLs do testnet diretamente — set_sandbox_mode tem bug no ccxt/Phemex
+        "hostname":        "testnet-api.phemex.com",
         "urls": {
             "api": {
                 "public":  "https://testnet-api.phemex.com",
@@ -168,12 +169,6 @@ def trading_loop():
             ex = build_exchange()
             ex.load_markets()
 
-            # Set 1x leverage — ignorar erro, posicao ja abre com leverage padrao
-            try:
-                ex.set_leverage(LEVERAGE, SYMBOL)
-            except Exception as e:
-                log.warning(f"set_leverage ignorado: {e}")
-
             # Fetch last 120 closed 30m candles (exclude live bar)
             ohlcv  = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=121)
             closes = [c[4] for c in ohlcv[:-1]]
@@ -200,7 +195,7 @@ def trading_loop():
             cur_qty   = 0.0
             for p in positions:
                 sym = p.get("symbol") or ""
-                if SYMBOL in sym or sym in SYMBOL:
+                if SYMBOL in sym or sym in SYMBOL or sym.replace("/","").replace(":USDT","") == "ETHUSDT":
                     contracts = float(p.get("contracts") or 0)
                     if contracts > 0:
                         cur_side = "LONG" if p.get("side") == "long" else "SHORT"
@@ -211,8 +206,8 @@ def trading_loop():
 
             # Balance & quantity
             bal_info = ex.fetch_balance()
-            usdt     = bal_info.get("USDT") or bal_info.get("usdt") or {}
-            balance  = float(usdt.get("free") or usdt.get("total") or 1000)
+            usdt    = bal_info.get("USDT") or bal_info.get("usdt") or {}
+            balance = float(usdt.get("free") or usdt.get("total") or 1000)
             with _lock:
                 status["balance"] = round(balance, 2)
 
@@ -220,26 +215,31 @@ def trading_loop():
             mintick = market.get("precision", {}).get("price", 0.01)
             if isinstance(mintick, int):
                 mintick = 10 ** (-mintick)
-            sl_usdt = max(SL_TICKS * float(mintick), 0.01)
+            mintick = float(mintick) if mintick else 0.01
+            sl_usdt = max(SL_TICKS * mintick, 0.01)
             qty     = max(round((RISK_PCT * balance) / sl_usdt, 3), 0.001)
 
-            # Execute — fecha posicao oposta antes de abrir nova (one-way mode)
-            order_params = {"timeInForce": "ImmediateOrCancel"}
-
+            # Execute — fecha posicao oposta antes de abrir nova, sem params extras
             if signal == "LONG" and cur_side != "LONG":
-                if cur_side == "SHORT":
-                    ex.create_market_order(SYMBOL, "buy", cur_qty,
-                                           params={**order_params, "reduceOnly": True})
-                order = ex.create_market_order(SYMBOL, "buy", qty, params=order_params)
+                if cur_side == "SHORT" and cur_qty > 0:
+                    try:
+                        ex.create_market_order(SYMBOL, "buy", cur_qty)
+                        log.info(f"Fechou SHORT {cur_qty}")
+                    except Exception as ce:
+                        log.warning(f"Erro ao fechar SHORT: {ce}")
+                order = ex.create_market_order(SYMBOL, "buy", qty)
                 _record("LONG", price, qty, ec, ema, order)
                 with _lock:
                     status["position"] = "LONG"
 
             elif signal == "SHORT" and cur_side != "SHORT":
-                if cur_side == "LONG":
-                    ex.create_market_order(SYMBOL, "sell", cur_qty,
-                                           params={**order_params, "reduceOnly": True})
-                order = ex.create_market_order(SYMBOL, "sell", qty, params=order_params)
+                if cur_side == "LONG" and cur_qty > 0:
+                    try:
+                        ex.create_market_order(SYMBOL, "sell", cur_qty)
+                        log.info(f"Fechou LONG {cur_qty}")
+                    except Exception as ce:
+                        log.warning(f"Erro ao fechar LONG: {ce}")
+                order = ex.create_market_order(SYMBOL, "sell", qty)
                 _record("SHORT", price, qty, ec, ema, order)
                 with _lock:
                     status["position"] = "SHORT"
