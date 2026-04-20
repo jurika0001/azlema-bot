@@ -52,8 +52,6 @@ SL_TICKS      = 2000
 GAIN_LIMIT    = 50
 PERIOD        = 20
 THRESHOLD     = 0.0
-# ETHUSDT perp no Phemex: 1 contrato = 0.001 ETH
-CONTRACT_SIZE = 0.001
 
 # ─────────────────────────────────────────────────────────────
 # SHARED STATE
@@ -77,6 +75,8 @@ status = {
 # PHEMEX TESTNET — API REST DIRETA COM ASSINATURA HMAC
 # ─────────────────────────────────────────────────────────────
 def _phemex_sign(path: str, query: str, expiry: str, body: str) -> str:
+    # Phemex signature: HMAC-SHA256(secret, path + queryString + expiry + body)
+    # query must NOT include "?"
     msg = path + query + expiry + body
     return hmac.new(
         API_SECRET.encode("utf-8"),
@@ -86,31 +86,59 @@ def _phemex_sign(path: str, query: str, expiry: str, body: str) -> str:
 
 
 def _phemex_headers(path: str, query: str = "", body: str = "") -> dict:
-    expiry = str(int(time.time()) + 60)
+    expiry = str(int(time.time()) + 60)  # 60s window
+    sig    = _phemex_sign(path, query, expiry, body)
+    log.debug(f"HMAC path={path} query={query!r} expiry={expiry} sig={sig[:12]}...")
     return {
         "x-phemex-access-token":      API_KEY,
         "x-phemex-request-expiry":    expiry,
-        "x-phemex-request-signature": _phemex_sign(path, query, expiry, body),
+        "x-phemex-request-signature": sig,
         "Content-Type":               "application/json",
     }
 
 
 def phemex_get(path: str, params: dict = None) -> dict:
-    query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+    # Sort params for deterministic query string (required by Phemex)
+    sorted_params = sorted((params or {}).items())
+    query = "&".join(f"{k}={v}" for k, v in sorted_params)
     url   = TESTNET_BASE + path + (f"?{query}" if query else "")
-    resp  = requests.get(url, headers=_phemex_headers(path, query), timeout=10)
-    return resp.json()
+    hdrs  = _phemex_headers(path, query)
+    log.debug(f"GET {url}")
+    resp  = requests.get(url, headers=hdrs, timeout=10)
+    data  = resp.json()
+    log.debug(f"GET {path} -> {str(data)[:200]}")
+    return data
 
 
 def phemex_post(path: str, body: dict) -> dict:
     body_str = json.dumps(body, separators=(",", ":"))
+    hdrs     = _phemex_headers(path, "", body_str)
+    log.info(f"POST {path} body={body_str}")
     resp     = requests.post(
         TESTNET_BASE + path,
-        headers=_phemex_headers(path, "", body_str),
+        headers=hdrs,
         data=body_str,
         timeout=10,
     )
-    return resp.json()
+    data = resp.json()
+    log.info(f"POST {path} -> {data}")
+    return data
+
+
+def phemex_put(path: str, body: dict) -> dict:
+    """PUT com body JSON — usado em /g-orders/create."""
+    body_str = json.dumps(body, separators=(",", ":"))
+    hdrs     = _phemex_headers(path, "", body_str)
+    log.info(f"PUT {path} body={body_str}")
+    resp     = requests.put(
+        TESTNET_BASE + path,
+        headers=hdrs,
+        data=body_str,
+        timeout=10,
+    )
+    data = resp.json()
+    log.info(f"PUT {path} -> {data}")
+    return data
 
 
 # ─────────────────────────────────────────────────────────────
@@ -118,7 +146,7 @@ def phemex_post(path: str, body: dict) -> dict:
 # ─────────────────────────────────────────────────────────────
 def get_balance_and_position():
     """
-    Retorna (balance_usdt, cur_side, cur_qty_contracts).
+    Retorna (balance_usdt, cur_side, cur_qty_eth).
     cur_side: 'LONG' | 'SHORT' | 'FLAT'
     """
     data = phemex_get("/g-accounts/accountPositions", {"currency": "USDT"})
@@ -147,48 +175,60 @@ def get_balance_and_position():
         balance = 1000.0  # fallback para testnet sem saldo listado
 
     cur_side = "FLAT"
-    cur_qty  = 0
+    cur_qty  = 0.0
     for p in positions:
         sym = p.get("symbol") or ""
         if sym == RAW_SYMBOL:
-            size = int(p.get("size") or 0)
-            if size > 0:
+            log.info(f"Posicao encontrada: {p}")
+            # Linear API usa sizeRq (string ETH) ou size (int contratos)
+            size_rq  = float(p.get("sizeRq") or p.get("size") or 0)
+            if size_rq > 0:
                 side_raw = p.get("side") or ""
                 cur_side = "LONG" if side_raw == "Buy" else "SHORT"
-                cur_qty  = size
-            log.info(f"Posicao encontrada: {p}")
+                cur_qty  = size_rq
     return balance, cur_side, cur_qty
 
 
-def place_order(side: str, qty_contracts: int, reduce_only: bool = False) -> dict:
+def place_order(side: str, qty_eth: float, reduce_only: bool = False) -> dict:
     """
-    side: 'Buy' | 'Sell'
-    qty_contracts: numero inteiro de contratos
+    Phemex linear perpetual (ETHUSDT):
+      - Endpoint: PUT /g-orders/create
+      - orderQtyRq: string, quantidade em ETH (ex: "0.01")
+      - posSide: "Long" para Buy, "Short" para Sell
+      - ordType: "Market"
     """
+    pos_side = "Long" if side == "Buy" else "Short"
+    # Arredondar para 3 casas decimais (tick size ETHUSDT = 0.001)
+    qty_str  = f"{float(qty_eth):.3f}"
     body = {
-        "symbol":    RAW_SYMBOL,
-        "clOrdID":   uuid.uuid4().hex[:16],
-        "side":      side,
-        "orderType": "Market",
-        "orderQty":  qty_contracts,
+        "symbol":      RAW_SYMBOL,
+        "clOrdID":     uuid.uuid4().hex[:16],
+        "side":        side,
+        "posSide":     pos_side,
+        "ordType":     "Market",
+        "orderQtyRq":  qty_str,
     }
     if reduce_only:
         body["reduceOnly"] = True
-    log.info(f"Enviando ordem: {body}")
-    resp = phemex_post("/g-orders", body)
+    log.info(f"Enviando ordem PUT /g-orders/create : {body}")
+    resp = phemex_put("/g-orders/create", body)
     log.info(f"Resposta ordem: {resp}")
     if resp.get("code") != 0:
-        log.error(f"ERRO ordem {side}: code={resp.get('code') or (resp.get('error') or {}).get('code')} msg={resp.get('msg') or (resp.get('error') or {}).get('message')}")
+        log.error(
+            f"ERRO ordem {side}: "
+            f"code={resp.get('code') or (resp.get('error') or {}).get('code')} "
+            f"msg={resp.get('msg') or (resp.get('error') or {}).get('message')}"
+        )
     return resp
 
 
-def close_position(cur_side: str, cur_qty: int):
-    if cur_qty <= 0:
+def close_position(cur_side: str, cur_qty_eth: float):
+    if cur_qty_eth <= 0:
         return
     close_side = "Sell" if cur_side == "LONG" else "Buy"
-    resp = place_order(close_side, cur_qty, reduce_only=True)
-    if resp.get("code") == 0:
-        log.info(f"Posicao {cur_side} fechada ({cur_qty} contratos)")
+    resp = place_order(close_side, cur_qty_eth, reduce_only=True)
+    if _order_ok(resp):
+        log.info(f"Posicao {cur_side} fechada ({cur_qty_eth} ETH)")
     else:
         log.warning(f"Erro ao fechar {cur_side}: {resp}")
 
@@ -325,15 +365,15 @@ def trading_loop():
                 status["position"] = cur_side
                 status["balance"]  = round(balance, 2)
 
-            # ── QUANTIDADE ────────────────────────────────────────
-            risk_usdt     = RISK_PCT * balance
-            qty_eth       = risk_usdt / price if price > 0 else 0
-            qty_contracts = max(int(qty_eth / CONTRACT_SIZE), 1)
+            # ── QUANTIDADE ───────────────────────────────────────────
+            # Phemex linear: orderQtyRq em ETH, minimo 0.001
+            risk_usdt = RISK_PCT * balance
+            qty_eth   = max(round(risk_usdt / price, 3), 0.001) if price > 0 else 0.001
 
             log.info(
                 f"Signal={signal} | Pos={cur_side}({cur_qty}) | "
                 f"EC={ec:.2f} EMA={ema:.2f} | "
-                f"Bal={balance:.2f} USDT | Qty={qty_contracts} contratos"
+                f"Bal={balance:.2f} USDT | Qty={qty_eth} ETH"
             )
 
             # ── EXECUTAR ──────────────────────────────────────────
@@ -341,9 +381,9 @@ def trading_loop():
                 if cur_side == "SHORT" and cur_qty > 0:
                     close_position("SHORT", cur_qty)
                     time.sleep(0.5)
-                resp = place_order("Buy", qty_contracts)
+                resp = place_order("Buy", qty_eth)
                 if _order_ok(resp):
-                    _record("LONG", price, qty_contracts, ec, ema, resp)
+                    _record("LONG", price, qty_eth, ec, ema, resp)
                     with _lock:
                         status["position"] = "LONG"
                 else:
@@ -353,9 +393,9 @@ def trading_loop():
                 if cur_side == "LONG" and cur_qty > 0:
                     close_position("LONG", cur_qty)
                     time.sleep(0.5)
-                resp = place_order("Sell", qty_contracts)
+                resp = place_order("Sell", qty_eth)
                 if _order_ok(resp):
-                    _record("SHORT", price, qty_contracts, ec, ema, resp)
+                    _record("SHORT", price, qty_eth, ec, ema, resp)
                     with _lock:
                         status["position"] = "SHORT"
                 else:
@@ -365,8 +405,10 @@ def trading_loop():
                 log.info(f"Mantendo {cur_side} | sem acao")
 
         except Exception as exc:
+            import traceback
             msg = str(exc)[:200]
             log.error(f"Bot error: {msg}")
+            log.error(traceback.format_exc())
             with _lock:
                 status["errors"].appendleft({
                     "time": datetime.now().strftime("%H:%M:%S"),
@@ -393,6 +435,63 @@ def _ka_worker(interval: int, name: str):
 # ─────────────────────────────────────────────────────────────
 # FLASK ROUTES
 # ─────────────────────────────────────────────────────────────
+@app.route("/test")
+def test_api():
+    """
+    Dispara imediatamente e mostra respostas brutas da API Phemex.
+    Acesse /test no browser para diagnosticar sem esperar 30 minutos.
+    """
+    results = {}
+
+    # 1) OHLCV publico via ccxt
+    try:
+        ex = build_exchange_ohlcv()
+        ohlcv = ex.fetch_ohlcv(CCXT_SYMBOL, TIMEFRAME, limit=5)
+        results["ohlcv"] = {"ok": True, "last_close": ohlcv[-1][4] if ohlcv else None}
+    except Exception as e:
+        results["ohlcv"] = {"ok": False, "error": str(e)}
+
+    # 2) GET /g-accounts/accountPositions
+    try:
+        r = phemex_get("/g-accounts/accountPositions", {"currency": "USDT"})
+        results["accountPositions"] = r
+    except Exception as e:
+        results["accountPositions"] = {"ok": False, "error": str(e)}
+
+    # 3) GET /accounts/accountPositions (endpoint inverso — para comparar)
+    try:
+        r2 = phemex_get("/accounts/accountPositions", {"currency": "USDT"})
+        results["accountPositions_inverse"] = r2
+    except Exception as e:
+        results["accountPositions_inverse"] = {"ok": False, "error": str(e)}
+
+    # 4) Testar assinatura com /g-orders/activeList (GET, sem criar ordem)
+    try:
+        r3 = phemex_get("/g-orders/activeList", {"symbol": RAW_SYMBOL})
+        results["activeOrders"] = r3
+    except Exception as e:
+        results["activeOrders"] = {"ok": False, "error": str(e)}
+
+    # 5) Mostrar exemplo de ordem que seria enviada (sem executar)
+    results["order_example"] = {
+        "method": "PUT",
+        "endpoint": "/g-orders/create",
+        "body": {
+            "symbol": RAW_SYMBOL,
+            "side": "Buy",
+            "posSide": "Long",
+            "ordType": "Market",
+            "orderQtyRq": "0.010",
+        }
+    }
+
+    results["api_key_prefix"] = API_KEY[:8] + "..." if API_KEY else "NOT SET"
+    results["secret_set"] = bool(API_SECRET)
+    results["testnet_base"] = TESTNET_BASE
+
+    return jsonify(results)
+
+
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "ts": datetime.utcnow().isoformat()})
