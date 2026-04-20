@@ -18,7 +18,6 @@ from collections import deque
 
 import numpy as np
 import requests
-import ccxt
 from flask import Flask, jsonify, render_template_string
 
 # ─────────────────────────────────────────────────────────────
@@ -44,8 +43,8 @@ PORT       = int(os.environ.get("PORT", 8080))
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 TESTNET_BASE  = "https://testnet-api.phemex.com"
-RAW_SYMBOL    = "ETHUSDT"          # Phemex raw symbol
-CCXT_SYMBOL   = "ETH/USDT:USDT"   # ccxt symbol (apenas para OHLCV)
+PROD_BASE     = "https://api.phemex.com"   # para OHLCV publico (testnet retorna 500)
+RAW_SYMBOL    = "ETHUSDT"
 TIMEFRAME     = "30m"
 RISK_PCT      = 0.01
 SL_TICKS      = 2000
@@ -234,20 +233,28 @@ def close_position(cur_side: str, cur_qty_eth: float):
 
 
 # ─────────────────────────────────────────────────────────────
-# ccxt — somente para OHLCV publico (sem autenticacao)
+# OHLCV — API publica de producao (sem auth, testnet retorna 500)
 # ─────────────────────────────────────────────────────────────
-def build_exchange_ohlcv():
-    ex = ccxt.phemex({
-        "enableRateLimit": True,
-        "options":         {"defaultType": "swap"},
-        "urls": {
-            "api": {
-                "public":  "https://testnet-api.phemex.com",
-                "private": "https://testnet-api.phemex.com",
-            }
-        },
-    })
-    return ex
+def fetch_ohlcv(limit: int = 121) -> list:
+    """
+    Busca velas 30m do ETHUSDT direto da API publica do Phemex.
+    Usa producao (api.phemex.com) — dados de mercado sao identicos
+    ao testnet e o endpoint publico funciona sem auth.
+    Retorna lista de closes (float), mais antigo primeiro.
+    """
+    resolution = 1800  # 30 minutos em segundos
+    url    = f"{PROD_BASE}/md/v2/kline/last"
+    params = {"symbol": RAW_SYMBOL, "resolution": resolution, "limit": limit}
+    resp   = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    # Resposta: {"code":0,"data":{"rows":[[ts,interval,last,open,high,low,close,vol,turnover],...]}}
+    rows = data["data"]["rows"]
+    # rows ordenadas da mais antiga para a mais nova
+    # indice 6 = close price (em formato inteiro escalado por 10000)
+    closes = [float(row[6]) / 10000.0 for row in rows]
+    log.info(f"OHLCV: {len(closes)} closes, ultimo={closes[-1]:.2f}")
+    return closes
 
 
 # ─────────────────────────────────────────────────────────────
@@ -331,17 +338,15 @@ def trading_loop():
     status["running"] = True
     log.info("Trading loop iniciado — aguardando proximo candle 30m")
 
-    ex = build_exchange_ohlcv()
-
     while True:
         wait = seconds_to_next_30m()
         log.info(f"Proximo candle em {wait:.0f}s")
         time.sleep(wait)
 
         try:
-            # ── OHLCV via ccxt publico ─────────────────────────────
-            ohlcv  = ex.fetch_ohlcv(CCXT_SYMBOL, TIMEFRAME, limit=121)
-            closes = [c[4] for c in ohlcv[:-1]]
+            # ── OHLCV direto da API publica Phemex (producao) ─────
+            # Busca 121 velas e descarta a ultima (candle atual em andamento)
+            closes = fetch_ohlcv(limit=122)[:-1]
             price  = float(closes[-1])
 
             # ── AZLEMA ────────────────────────────────────────────
@@ -443,11 +448,10 @@ def test_api():
     """
     results = {}
 
-    # 1) OHLCV publico via ccxt
+    # 1) OHLCV publico direto (producao)
     try:
-        ex = build_exchange_ohlcv()
-        ohlcv = ex.fetch_ohlcv(CCXT_SYMBOL, TIMEFRAME, limit=5)
-        results["ohlcv"] = {"ok": True, "last_close": ohlcv[-1][4] if ohlcv else None}
+        closes = fetch_ohlcv(limit=5)
+        results["ohlcv"] = {"ok": True, "last_close": closes[-1], "count": len(closes)}
     except Exception as e:
         results["ohlcv"] = {"ok": False, "error": str(e)}
 
