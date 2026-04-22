@@ -206,12 +206,15 @@ def close_position(cur_side: str, cur_qty: int):
 
 
 # ─────────────────────────────────────────────────────────────
-# OHLCV — REST direto no testnet com retry e fallback de endpoint
+# OHLCV — Dados da MAINNET (Producao) com fallback para Testnet
 # ─────────────────────────────────────────────────────────────
-# Dois endpoints para OHLCV 30m — o segundo e usado se o primeiro falhar
+# Mainnet e mais estavel para OHLCV. Ordens continuam indo para o Testnet.
+MAINNET_BASE = "https://api.phemex.com"
+
 _OHLCV_ENDPOINTS = [
+    f"{MAINNET_BASE}/md/v2/kline/last?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+    f"{MAINNET_BASE}/md/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
     f"{TESTNET_BASE}/md/v2/kline/last?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
-    f"{TESTNET_BASE}/md/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
 ]
 _OHLCV_RETRIES  = 3
 _OHLCV_BACKOFF  = 3   # segundos entre tentativas
