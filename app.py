@@ -206,26 +206,77 @@ def close_position(cur_side: str, cur_qty: int):
 
 
 # ─────────────────────────────────────────────────────────────
-# OHLCV — REST direto no testnet (sem ccxt, sem ambiguidade de URL)
+# OHLCV — REST direto no testnet com retry e fallback de endpoint
 # ─────────────────────────────────────────────────────────────
+# Dois endpoints para OHLCV 30m — o segundo e usado se o primeiro falhar
+_OHLCV_ENDPOINTS = [
+    f"{TESTNET_BASE}/md/v2/kline/last?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+    f"{TESTNET_BASE}/md/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+]
+_OHLCV_RETRIES  = 3
+_OHLCV_BACKOFF  = 3   # segundos entre tentativas
+
+
+def _parse_ohlcv_rows(data: dict) -> list:
+    """Extrai linhas OHLCV independente do formato de resposta."""
+    inner = data.get("data") or data
+    rows  = inner.get("rows") or inner.get("klines") or []
+    if not rows:
+        raise ValueError(f"OHLCV sem rows: {data}")
+    # Formato padrao Phemex: [ts, interval, last, open, high, low, close, vol, turnover]
+    # Indices:                  0      1       2     3     4    5     6     7       8
+    return [[r[0], r[3], r[4], r[5], r[6], r[7]] for r in rows]
+
+
 def fetch_ohlcv(limit: int = 122) -> list:
     """
-    Retorna lista de closes via endpoint publico do testnet Phemex.
-    resolution=1800 = 30 minutos.
+    Busca candles 30m do testnet Phemex.
+    - Tenta ate _OHLCV_RETRIES vezes por endpoint
+    - Faz backoff exponencial entre tentativas
+    - Tenta endpoint alternativo se o principal falhar todas as tentativas
+    - Lanca OHLCVError (subclasse de Exception) se tudo falhar
     """
-    url = (
-        f"{TESTNET_BASE}/md/v2/kline/last"
-        f"?symbol={RAW_SYMBOL}&resolution=1800&limit={limit}"
+    last_exc = None
+
+    for ep_idx, endpoint_tpl in enumerate(_OHLCV_ENDPOINTS):
+        url = endpoint_tpl.format(limit=limit)
+
+        for attempt in range(1, _OHLCV_RETRIES + 1):
+            try:
+                log.info(f"OHLCV ep={ep_idx+1} tentativa={attempt} url={url}")
+                resp = requests.get(url, timeout=15)
+
+                # 5xx = instabilidade do testnet — vale tentar de novo
+                if resp.status_code >= 500:
+                    raise requests.HTTPError(
+                        f"{resp.status_code} Server Error", response=resp
+                    )
+
+                resp.raise_for_status()
+                candles = _parse_ohlcv_rows(resp.json())
+                log.info(f"OHLCV ok: {len(candles)} barras (ep={ep_idx+1} tentativa={attempt})")
+                return candles
+
+            except (requests.HTTPError,
+                    requests.Timeout,
+                    requests.ConnectionError,
+                    ValueError) as exc:
+                last_exc = exc
+                wait = _OHLCV_BACKOFF * attempt   # 3s, 6s, 9s
+                log.warning(
+                    f"OHLCV falhou ep={ep_idx+1} tentativa={attempt}/{_OHLCV_RETRIES}: "
+                    f"{exc} — aguardando {wait}s"
+                )
+                if attempt < _OHLCV_RETRIES:
+                    time.sleep(wait)
+
+        log.warning(f"OHLCV endpoint {ep_idx+1} esgotado, tentando proximo...")
+
+    # Todos os endpoints e tentativas falharam
+    raise RuntimeError(
+        f"OHLCV falhou em todos os endpoints apos {_OHLCV_RETRIES} tentativas. "
+        f"Ultimo erro: {last_exc}"
     )
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    # Estrutura: {"data":{"rows":[[ts, interval, last, open, high, low, close, volume, turnover], ...]}}
-    rows = (data.get("data") or {}).get("rows") or []
-    if not rows:
-        raise ValueError(f"OHLCV vazio: {data}")
-    # close esta no indice 6
-    return [[r[0], r[3], r[4], r[5], r[6], r[7]] for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -316,10 +367,21 @@ def trading_loop():
 
         try:
             # ── OHLCV direto no testnet ────────────────────────────
-            # limit=122: 121 barras fechadas + 1 barra atual (descartada)
-            candles = fetch_ohlcv(limit=122)
-            closes  = [c[4] for c in candles[:-1]]   # descarta barra atual
-            price   = float(closes[-1])
+            # fetch_ohlcv ja faz retry+backoff+fallback de endpoint
+            # Se tudo falhar lanca RuntimeError — pulamos este ciclo
+            try:
+                candles = fetch_ohlcv(limit=122)
+            except RuntimeError as ohlcv_err:
+                log.error(f"OHLCV indisponivel, pulando ciclo: {ohlcv_err}")
+                with _lock:
+                    status["errors"].appendleft({
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "msg":  f"OHLCV falhou (testnet instavel): {str(ohlcv_err)[:120]}",
+                    })
+                continue
+
+            closes = [c[4] for c in candles[:-1]]   # descarta barra atual
+            price  = float(closes[-1])
 
             # ── AZLEMA ────────────────────────────────────────────
             ec, ema, err_pct = azlema(closes)
