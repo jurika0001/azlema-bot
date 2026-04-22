@@ -43,14 +43,15 @@ PORT       = int(os.environ.get("PORT", 8080))
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 TESTNET_BASE  = "https://testnet-api.phemex.com"
-PROD_BASE     = "https://api.phemex.com"   # para OHLCV publico (testnet retorna 500)
-RAW_SYMBOL    = "ETHUSDT"
+RAW_SYMBOL    = "ETHUSDT"          # Phemex raw symbol
 TIMEFRAME     = "30m"
 RISK_PCT      = 0.01
 SL_TICKS      = 2000
 GAIN_LIMIT    = 50
 PERIOD        = 20
 THRESHOLD     = 0.0
+# ETHUSDT perp no Phemex: 1 contrato = 0.001 ETH
+CONTRACT_SIZE = 0.001
 
 # ─────────────────────────────────────────────────────────────
 # SHARED STATE
@@ -124,28 +125,12 @@ def phemex_post(path: str, body: dict) -> dict:
     return data
 
 
-def phemex_put(path: str, body: dict) -> dict:
-    """PUT com body JSON — usado em /g-orders/create."""
-    body_str = json.dumps(body, separators=(",", ":"))
-    hdrs     = _phemex_headers(path, "", body_str)
-    log.info(f"PUT {path} body={body_str}")
-    resp     = requests.put(
-        TESTNET_BASE + path,
-        headers=hdrs,
-        data=body_str,
-        timeout=10,
-    )
-    data = resp.json()
-    log.info(f"PUT {path} -> {data}")
-    return data
-
-
 # ─────────────────────────────────────────────────────────────
 # PHEMEX HELPERS
 # ─────────────────────────────────────────────────────────────
 def get_balance_and_position():
     """
-    Retorna (balance_usdt, cur_side, cur_qty_eth).
+    Retorna (balance_usdt, cur_side, cur_qty_contracts).
     cur_side: 'LONG' | 'SHORT' | 'FLAT'
     """
     data = phemex_get("/g-accounts/accountPositions", {"currency": "USDT"})
@@ -174,87 +159,73 @@ def get_balance_and_position():
         balance = 1000.0  # fallback para testnet sem saldo listado
 
     cur_side = "FLAT"
-    cur_qty  = 0.0
+    cur_qty  = 0
     for p in positions:
         sym = p.get("symbol") or ""
         if sym == RAW_SYMBOL:
-            log.info(f"Posicao encontrada: {p}")
-            # Linear API usa sizeRq (string ETH) ou size (int contratos)
-            size_rq  = float(p.get("sizeRq") or p.get("size") or 0)
-            if size_rq > 0:
+            size = int(p.get("size") or 0)
+            if size > 0:
                 side_raw = p.get("side") or ""
                 cur_side = "LONG" if side_raw == "Buy" else "SHORT"
-                cur_qty  = size_rq
+                cur_qty  = size
+            log.info(f"Posicao encontrada: {p}")
     return balance, cur_side, cur_qty
 
 
-def place_order(side: str, qty_eth: float, reduce_only: bool = False) -> dict:
+def place_order(side: str, qty_contracts: int, reduce_only: bool = False) -> dict:
     """
-    Phemex linear perpetual (ETHUSDT):
-      - Endpoint: PUT /g-orders/create
-      - orderQtyRq: string, quantidade em ETH (ex: "0.01")
-      - posSide: "Long" para Buy, "Short" para Sell
-      - ordType: "Market"
+    side: 'Buy' | 'Sell'
+    qty_contracts: numero inteiro de contratos
     """
-    pos_side = "Long" if side == "Buy" else "Short"
-    # Arredondar para 3 casas decimais (tick size ETHUSDT = 0.001)
-    qty_str  = f"{float(qty_eth):.3f}"
     body = {
-        "symbol":      RAW_SYMBOL,
-        "clOrdID":     uuid.uuid4().hex[:16],
-        "side":        side,
-        "posSide":     pos_side,
-        "ordType":     "Market",
-        "orderQtyRq":  qty_str,
+        "symbol":    RAW_SYMBOL,
+        "clOrdID":   uuid.uuid4().hex[:16],
+        "side":      side,
+        "orderType": "Market",
+        "orderQty":  qty_contracts,
     }
     if reduce_only:
         body["reduceOnly"] = True
-    log.info(f"Enviando ordem PUT /g-orders/create : {body}")
-    resp = phemex_put("/g-orders/create", body)
+    log.info(f"Enviando ordem: {body}")
+    resp = phemex_post("/g-orders", body)
     log.info(f"Resposta ordem: {resp}")
     if resp.get("code") != 0:
-        log.error(
-            f"ERRO ordem {side}: "
-            f"code={resp.get('code') or (resp.get('error') or {}).get('code')} "
-            f"msg={resp.get('msg') or (resp.get('error') or {}).get('message')}"
-        )
+        log.error(f"ERRO ordem {side}: code={resp.get('code') or (resp.get('error') or {}).get('code')} msg={resp.get('msg') or (resp.get('error') or {}).get('message')}")
     return resp
 
 
-def close_position(cur_side: str, cur_qty_eth: float):
-    if cur_qty_eth <= 0:
+def close_position(cur_side: str, cur_qty: int):
+    if cur_qty <= 0:
         return
     close_side = "Sell" if cur_side == "LONG" else "Buy"
-    resp = place_order(close_side, cur_qty_eth, reduce_only=True)
-    if _order_ok(resp):
-        log.info(f"Posicao {cur_side} fechada ({cur_qty_eth} ETH)")
+    resp = place_order(close_side, cur_qty, reduce_only=True)
+    if resp.get("code") == 0:
+        log.info(f"Posicao {cur_side} fechada ({cur_qty} contratos)")
     else:
         log.warning(f"Erro ao fechar {cur_side}: {resp}")
 
 
 # ─────────────────────────────────────────────────────────────
-# OHLCV — API publica de producao (sem auth, testnet retorna 500)
+# OHLCV — REST direto no testnet (sem ccxt, sem ambiguidade de URL)
 # ─────────────────────────────────────────────────────────────
-def fetch_ohlcv(limit: int = 121) -> list:
+def fetch_ohlcv(limit: int = 122) -> list:
     """
-    Busca velas 30m do ETHUSDT direto da API publica do Phemex.
-    Usa producao (api.phemex.com) — dados de mercado sao identicos
-    ao testnet e o endpoint publico funciona sem auth.
-    Retorna lista de closes (float), mais antigo primeiro.
+    Retorna lista de closes via endpoint publico do testnet Phemex.
+    resolution=1800 = 30 minutos.
     """
-    resolution = 1800  # 30 minutos em segundos
-    url    = f"{PROD_BASE}/md/v2/kline/last"
-    params = {"symbol": RAW_SYMBOL, "resolution": resolution, "limit": limit}
-    resp   = requests.get(url, params=params, timeout=10)
+    url = (
+        f"{TESTNET_BASE}/md/v2/kline/last"
+        f"?symbol={RAW_SYMBOL}&resolution=1800&limit={limit}"
+    )
+    resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    # Resposta: {"code":0,"data":{"rows":[[ts,interval,last,open,high,low,close,vol,turnover],...]}}
-    rows = data["data"]["rows"]
-    # rows ordenadas da mais antiga para a mais nova
-    # indice 6 = close price (em formato inteiro escalado por 10000)
-    closes = [float(row[6]) / 10000.0 for row in rows]
-    log.info(f"OHLCV: {len(closes)} closes, ultimo={closes[-1]:.2f}")
-    return closes
+    # Estrutura: {"data":{"rows":[[ts, interval, last, open, high, low, close, volume, turnover], ...]}}
+    rows = (data.get("data") or {}).get("rows") or []
+    if not rows:
+        raise ValueError(f"OHLCV vazio: {data}")
+    # close esta no indice 6
+    return [[r[0], r[3], r[4], r[5], r[6], r[7]] for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -344,10 +315,11 @@ def trading_loop():
         time.sleep(wait)
 
         try:
-            # ── OHLCV direto da API publica Phemex (producao) ─────
-            # Busca 121 velas e descarta a ultima (candle atual em andamento)
-            closes = fetch_ohlcv(limit=122)[:-1]
-            price  = float(closes[-1])
+            # ── OHLCV direto no testnet ────────────────────────────
+            # limit=122: 121 barras fechadas + 1 barra atual (descartada)
+            candles = fetch_ohlcv(limit=122)
+            closes  = [c[4] for c in candles[:-1]]   # descarta barra atual
+            price   = float(closes[-1])
 
             # ── AZLEMA ────────────────────────────────────────────
             ec, ema, err_pct = azlema(closes)
@@ -370,15 +342,15 @@ def trading_loop():
                 status["position"] = cur_side
                 status["balance"]  = round(balance, 2)
 
-            # ── QUANTIDADE ───────────────────────────────────────────
-            # Phemex linear: orderQtyRq em ETH, minimo 0.001
-            risk_usdt = RISK_PCT * balance
-            qty_eth   = max(round(risk_usdt / price, 3), 0.001) if price > 0 else 0.001
+            # ── QUANTIDADE ────────────────────────────────────────
+            risk_usdt     = RISK_PCT * balance
+            qty_eth       = risk_usdt / price if price > 0 else 0
+            qty_contracts = max(int(qty_eth / CONTRACT_SIZE), 1)
 
             log.info(
                 f"Signal={signal} | Pos={cur_side}({cur_qty}) | "
                 f"EC={ec:.2f} EMA={ema:.2f} | "
-                f"Bal={balance:.2f} USDT | Qty={qty_eth} ETH"
+                f"Bal={balance:.2f} USDT | Qty={qty_contracts} contratos"
             )
 
             # ── EXECUTAR ──────────────────────────────────────────
@@ -386,9 +358,9 @@ def trading_loop():
                 if cur_side == "SHORT" and cur_qty > 0:
                     close_position("SHORT", cur_qty)
                     time.sleep(0.5)
-                resp = place_order("Buy", qty_eth)
+                resp = place_order("Buy", qty_contracts)
                 if _order_ok(resp):
-                    _record("LONG", price, qty_eth, ec, ema, resp)
+                    _record("LONG", price, qty_contracts, ec, ema, resp)
                     with _lock:
                         status["position"] = "LONG"
                 else:
@@ -398,9 +370,9 @@ def trading_loop():
                 if cur_side == "LONG" and cur_qty > 0:
                     close_position("LONG", cur_qty)
                     time.sleep(0.5)
-                resp = place_order("Sell", qty_eth)
+                resp = place_order("Sell", qty_contracts)
                 if _order_ok(resp):
-                    _record("SHORT", price, qty_eth, ec, ema, resp)
+                    _record("SHORT", price, qty_contracts, ec, ema, resp)
                     with _lock:
                         status["position"] = "SHORT"
                 else:
@@ -448,10 +420,10 @@ def test_api():
     """
     results = {}
 
-    # 1) OHLCV publico direto (producao)
+    # 1) OHLCV direto no testnet
     try:
-        closes = fetch_ohlcv(limit=5)
-        results["ohlcv"] = {"ok": True, "last_close": closes[-1], "count": len(closes)}
+        candles = fetch_ohlcv(limit=5)
+        results["ohlcv"] = {"ok": True, "last_close": candles[-1][4] if candles else None, "bars": len(candles)}
     except Exception as e:
         results["ohlcv"] = {"ok": False, "error": str(e)}
 
@@ -475,19 +447,6 @@ def test_api():
         results["activeOrders"] = r3
     except Exception as e:
         results["activeOrders"] = {"ok": False, "error": str(e)}
-
-    # 5) Mostrar exemplo de ordem que seria enviada (sem executar)
-    results["order_example"] = {
-        "method": "PUT",
-        "endpoint": "/g-orders/create",
-        "body": {
-            "symbol": RAW_SYMBOL,
-            "side": "Buy",
-            "posSide": "Long",
-            "ordType": "Market",
-            "orderQtyRq": "0.010",
-        }
-    }
 
     results["api_key_prefix"] = API_KEY[:8] + "..." if API_KEY else "NOT SET"
     results["secret_set"] = bool(API_SECRET)
