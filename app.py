@@ -209,35 +209,19 @@ def close_position(cur_side: str, cur_qty: int):
 # OHLCV — Dados com Fallback Indestrutivel (Phemex + Binance)
 # ─────────────────────────────────────────────────────────────
 _OHLCV_ENDPOINTS = [
-    # 1. Phemex Mainnet (V2 List — endpoint corrigido)
-    f"https://api.phemex.com/md/v2/kline/list?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
-    # 2. Phemex Mainnet (V1 padrao)
-    f"https://api.phemex.com/md/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
-    # 3. Binance — bala de prata caso a Phemex caia
-    f"https://api.binance.com/api/v3/klines?symbol={RAW_SYMBOL}&interval=30m&limit={{limit}}",
+    # 1. Phemex Mainnet — endpoint Linear Futures (correto para ETHUSDT)
+    f"https://api.phemex.com/public/linear/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+    # 2. Phemex Testnet — fallback
+    f"{TESTNET_BASE}/public/linear/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
 ]
 _OHLCV_RETRIES = 3
-_OHLCV_BACKOFF = 3   # segundos entre tentativas
-
-
-def _parse_ohlcv_rows(data) -> list:
-    """Extrai linhas OHLCV suportando formato Phemex e Binance."""
-    # Lista direta = formato Binance: [ts_open, open, high, low, close, vol, ...]
-    if isinstance(data, list):
-        return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in data]
-    # Dicionario = formato Phemex
-    inner = data.get("data") or data
-    rows  = inner.get("rows") or inner.get("klines") or []
-    if not rows:
-        raise ValueError(f"OHLCV sem rows: {data}")
-    # Phemex: [ts, interval, last, open, high, low, close, vol, turnover]
-    return [[r[0], r[3], r[4], r[5], r[6], r[7]] for r in rows]
+_OHLCV_BACKOFF = 3
 
 
 def fetch_ohlcv(limit: int = 122) -> list:
     """
-    Busca candles 30m com retry, backoff e fallback automatico.
-    User-Agent de browser para evitar bloqueio 500/403 do Cloudflare.
+    Busca candles 30m via endpoint Linear Futures da Phemex.
+    Retry automatico + fallback para testnet.
     """
     last_exc = None
     headers  = {
@@ -253,14 +237,19 @@ def fetch_ohlcv(limit: int = 122) -> list:
                 log.info(f"OHLCV ep={ep_idx+1} tentativa={attempt} url={url}")
                 resp = requests.get(url, headers=headers, timeout=15)
 
-                if resp.status_code >= 500:
-                    raise requests.HTTPError(
-                        f"{resp.status_code} Server Error", response=resp
-                    )
+                if resp.status_code != 200:
+                    log.warning(f"OHLCV ep={ep_idx+1} status={resp.status_code}")
+                    raise requests.HTTPError(f"{resp.status_code}", response=resp)
 
-                resp.raise_for_status()
-                candles = _parse_ohlcv_rows(resp.json())
-                log.info(f"OHLCV ok: {len(candles)} barras (ep={ep_idx+1})")
+                data = resp.json()
+                # Phemex linear kline: {"data": {"klines": [[ts, interval, last, open, high, low, close, vol, turnover], ...]}}
+                rows = (data.get("data") or {}).get("klines") or []
+
+                if not rows:
+                    raise ValueError(f"OHLCV klines vazio: {str(data)[:200]}")
+
+                candles = [[r[0], r[3], r[4], r[5], r[6], r[7]] for r in rows]
+                log.info(f"OHLCV ok: {len(candles)} barras (ep={ep_idx+1} tentativa={attempt})")
                 return candles
 
             except (requests.HTTPError, requests.Timeout,
