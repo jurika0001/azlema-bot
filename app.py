@@ -206,40 +206,44 @@ def close_position(cur_side: str, cur_qty: int):
 
 
 # ─────────────────────────────────────────────────────────────
-# OHLCV — Dados da MAINNET (Producao) com fallback para Testnet
+# OHLCV — Dados com Fallback Indestrutivel (Phemex + Binance)
 # ─────────────────────────────────────────────────────────────
-# Mainnet e mais estavel para OHLCV. Ordens continuam indo para o Testnet.
-MAINNET_BASE = "https://api.phemex.com"
-
 _OHLCV_ENDPOINTS = [
-    f"{MAINNET_BASE}/md/v2/kline/last?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
-    f"{MAINNET_BASE}/md/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
-    f"{TESTNET_BASE}/md/v2/kline/last?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+    # 1. Phemex Mainnet (V2 List — endpoint corrigido)
+    f"https://api.phemex.com/md/v2/kline/list?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+    # 2. Phemex Mainnet (V1 padrao)
+    f"https://api.phemex.com/md/kline?symbol={RAW_SYMBOL}&resolution=1800&limit={{limit}}",
+    # 3. Binance — bala de prata caso a Phemex caia
+    f"https://api.binance.com/api/v3/klines?symbol={RAW_SYMBOL}&interval=30m&limit={{limit}}",
 ]
-_OHLCV_RETRIES  = 3
-_OHLCV_BACKOFF  = 3   # segundos entre tentativas
+_OHLCV_RETRIES = 3
+_OHLCV_BACKOFF = 3   # segundos entre tentativas
 
 
-def _parse_ohlcv_rows(data: dict) -> list:
-    """Extrai linhas OHLCV independente do formato de resposta."""
+def _parse_ohlcv_rows(data) -> list:
+    """Extrai linhas OHLCV suportando formato Phemex e Binance."""
+    # Lista direta = formato Binance: [ts_open, open, high, low, close, vol, ...]
+    if isinstance(data, list):
+        return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in data]
+    # Dicionario = formato Phemex
     inner = data.get("data") or data
     rows  = inner.get("rows") or inner.get("klines") or []
     if not rows:
         raise ValueError(f"OHLCV sem rows: {data}")
-    # Formato padrao Phemex: [ts, interval, last, open, high, low, close, vol, turnover]
-    # Indices:                  0      1       2     3     4    5     6     7       8
+    # Phemex: [ts, interval, last, open, high, low, close, vol, turnover]
     return [[r[0], r[3], r[4], r[5], r[6], r[7]] for r in rows]
 
 
 def fetch_ohlcv(limit: int = 122) -> list:
     """
-    Busca candles 30m do testnet Phemex.
-    - Tenta ate _OHLCV_RETRIES vezes por endpoint
-    - Faz backoff exponencial entre tentativas
-    - Tenta endpoint alternativo se o principal falhar todas as tentativas
-    - Lanca OHLCVError (subclasse de Exception) se tudo falhar
+    Busca candles 30m com retry, backoff e fallback automatico.
+    User-Agent de browser para evitar bloqueio 500/403 do Cloudflare.
     """
     last_exc = None
+    headers  = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept":     "application/json",
+    }
 
     for ep_idx, endpoint_tpl in enumerate(_OHLCV_ENDPOINTS):
         url = endpoint_tpl.format(limit=limit)
@@ -247,9 +251,8 @@ def fetch_ohlcv(limit: int = 122) -> list:
         for attempt in range(1, _OHLCV_RETRIES + 1):
             try:
                 log.info(f"OHLCV ep={ep_idx+1} tentativa={attempt} url={url}")
-                resp = requests.get(url, timeout=15)
+                resp = requests.get(url, headers=headers, timeout=15)
 
-                # 5xx = instabilidade do testnet — vale tentar de novo
                 if resp.status_code >= 500:
                     raise requests.HTTPError(
                         f"{resp.status_code} Server Error", response=resp
@@ -257,13 +260,11 @@ def fetch_ohlcv(limit: int = 122) -> list:
 
                 resp.raise_for_status()
                 candles = _parse_ohlcv_rows(resp.json())
-                log.info(f"OHLCV ok: {len(candles)} barras (ep={ep_idx+1} tentativa={attempt})")
+                log.info(f"OHLCV ok: {len(candles)} barras (ep={ep_idx+1})")
                 return candles
 
-            except (requests.HTTPError,
-                    requests.Timeout,
-                    requests.ConnectionError,
-                    ValueError) as exc:
+            except (requests.HTTPError, requests.Timeout,
+                    requests.ConnectionError, ValueError) as exc:
                 last_exc = exc
                 wait = _OHLCV_BACKOFF * attempt   # 3s, 6s, 9s
                 log.warning(
@@ -275,11 +276,7 @@ def fetch_ohlcv(limit: int = 122) -> list:
 
         log.warning(f"OHLCV endpoint {ep_idx+1} esgotado, tentando proximo...")
 
-    # Todos os endpoints e tentativas falharam
-    raise RuntimeError(
-        f"OHLCV falhou em todos os endpoints apos {_OHLCV_RETRIES} tentativas. "
-        f"Ultimo erro: {last_exc}"
-    )
+    raise RuntimeError(f"OHLCV falhou em todos os endpoints. Ultimo erro: {last_exc}")
 
 
 # ─────────────────────────────────────────────────────────────
