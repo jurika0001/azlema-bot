@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Phemex Paper Trading Bot — Adaptive Zero Lag EMA
-- Dados reais de candles 30m da Phemex via API oficial
-- Paper trading 100% interno (saldo simulado, sem ordens reais)
-- Nenhuma ordem é enviada à exchange
+- Candles 30m buscados direto da API pública da Phemex (sem ccxt)
+- Paper trading 100% interno (sem ordens reais)
 """
 
 import os
@@ -15,12 +14,8 @@ from collections import deque
 
 import numpy as np
 import requests
-import ccxt
 from flask import Flask, jsonify, render_template_string
 
-# ─────────────────────────────────────────────────────────────
-# SETUP
-# ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -40,29 +35,65 @@ PORT       = int(os.environ.get("PORT", 8080))
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-SYMBOL          = "ETH/USDT:USDT"   # perpetual linear da Phemex
-TIMEFRAME       = "30m"
+# Phemex API pública — sem autenticação necessária para OHLCV
+PHEMEX_BASE    = "https://api.phemex.com"
+PHEMEX_SYMBOL  = "ETHUSDTPERP"   # símbolo nativo Phemex ETH USDT perpetual
+RESOLUTION     = 1800             # 30 minutos em segundos
+CANDLE_LIMIT   = 121              # 120 fechados + 1 aberto (descartamos o último)
+
 LEVERAGE        = 1
-RISK_PCT        = 0.01              # 1% do saldo por trade
-SL_TICKS        = 2000              # pontos de stop loss
-GAIN_LIMIT      = 50                # busca ±500 em passos de 0.1
+RISK_PCT        = 0.01
+SL_TICKS        = 2000
+MINTICK         = 0.01            # ETH/USDT mintick na Phemex
+GAIN_LIMIT      = 50
 PERIOD          = 20
 THRESHOLD       = 0.0
-INITIAL_BALANCE = 1000.0            # USDT simulado inicial
+INITIAL_BALANCE = 1000.0
 
 # ─────────────────────────────────────────────────────────────
-# PAPER ENGINE — saldo e posição simulados
+# PHEMEX OHLCV — chamada direta à API pública (sem ccxt)
+# Endpoint oficial: /exchange/public/md/v2/kline/last
+# Resposta rows: [timestamp, interval, last_close, open, high, low, close, volume, turnover]
+# índice 6 = close
+# ─────────────────────────────────────────────────────────────
+def fetch_closes(limit: int = CANDLE_LIMIT) -> list:
+    url    = f"{PHEMEX_BASE}/exchange/public/md/v2/kline/last"
+    params = {
+        "symbol":     PHEMEX_SYMBOL,
+        "resolution": RESOLUTION,
+        "limit":      limit,
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("code") != 0:
+        raise ValueError(f"Phemex API error: {data}")
+
+    rows = data["data"]["rows"]
+    if not rows:
+        raise ValueError("Phemex retornou rows vazio")
+
+    # rows ordenados do mais antigo ao mais recente
+    # descarta o último candle (ainda aberto)
+    closed = rows[:-1]
+    closes = [float(row[6]) for row in closed]   # índice 6 = close
+    return closes
+
+
+# ─────────────────────────────────────────────────────────────
+# PAPER ENGINE
 # ─────────────────────────────────────────────────────────────
 class PaperEngine:
     def __init__(self, initial_balance: float):
-        self.balance       = initial_balance   # USDT livre simulado
-        self.position_side = "FLAT"            # FLAT | LONG | SHORT
-        self.position_qty  = 0.0               # quantidade em contratos
+        self.balance       = initial_balance
+        self.position_side = "FLAT"
+        self.position_qty  = 0.0
         self.entry_price   = 0.0
         self.realized_pnl  = 0.0
         self._lock         = threading.Lock()
 
-    def snapshot(self):
+    def snapshot(self) -> dict:
         with self._lock:
             return {
                 "balance":       round(self.balance, 4),
@@ -81,50 +112,49 @@ class PaperEngine:
 
     def open_long(self, price: float, qty: float) -> dict:
         with self._lock:
-            # Fecha short se houver
             if self.position_side == "SHORT":
                 pnl = (self.entry_price - price) * self.position_qty
                 self.realized_pnl += pnl
                 self.balance      += pnl
-                log.info(f"Close SHORT → PnL {pnl:+.4f} USDT")
+                log.info(f"Fechando SHORT → PnL {pnl:+.4f} USDT")
             cost = price * qty / LEVERAGE
-            self.balance      -= cost
+            self.balance       = max(self.balance - cost, 0)
             self.position_side = "LONG"
             self.position_qty  = qty
             self.entry_price   = price
-            return self._trade_record("LONG", price, qty)
+            return self._record("LONG", price, qty)
 
     def open_short(self, price: float, qty: float) -> dict:
         with self._lock:
-            # Fecha long se houver
             if self.position_side == "LONG":
                 pnl = (price - self.entry_price) * self.position_qty
                 self.realized_pnl += pnl
                 self.balance      += pnl
-                log.info(f"Close LONG → PnL {pnl:+.4f} USDT")
+                log.info(f"Fechando LONG → PnL {pnl:+.4f} USDT")
             cost = price * qty / LEVERAGE
-            self.balance      -= cost
+            self.balance       = max(self.balance - cost, 0)
             self.position_side = "SHORT"
             self.position_qty  = qty
             self.entry_price   = price
-            return self._trade_record("SHORT", price, qty)
+            return self._record("SHORT", price, qty)
 
-    def _trade_record(self, side, price, qty):
+    def _record(self, side, price, qty) -> dict:
         return {
             "time":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "side":     side,
             "price":    round(price, 4),
             "qty":      round(qty, 6),
-            "entry":    round(self.entry_price, 4),
             "pnl_real": round(self.realized_pnl, 4),
             "balance":  round(self.balance, 4),
+            "ec":       0.0,
+            "ema":      0.0,
         }
 
 
 paper = PaperEngine(INITIAL_BALANCE)
 
 # ─────────────────────────────────────────────────────────────
-# SHARED STATE
+# ESTADO COMPARTILHADO
 # ─────────────────────────────────────────────────────────────
 _lock         = threading.Lock()
 trade_history = deque(maxlen=200)
@@ -141,23 +171,6 @@ status = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# PHEMEX — apenas leitura de candles (sem ordens)
-# ─────────────────────────────────────────────────────────────
-def build_exchange():
-    """
-    Conecta à Phemex real (não testnet) apenas para buscar OHLCV.
-    Nenhuma ordem é enviada.
-    """
-    ex = ccxt.phemex({
-        "apiKey":          API_KEY,
-        "secret":          API_SECRET,
-        "enableRateLimit": True,
-        "options":         {"defaultType": "swap"},
-    })
-    # SEM sandbox — dados reais de mercado
-    return ex
-
-# ─────────────────────────────────────────────────────────────
 # AZLEMA
 # ─────────────────────────────────────────────────────────────
 def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
@@ -166,8 +179,7 @@ def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
     if n < period + 10:
         return None, None, None
 
-    alpha = 2.0 / (period + 1)
-
+    alpha  = 2.0 / (period + 1)
     ema    = np.empty(n)
     ema[0] = arr[0]
     for i in range(1, n):
@@ -191,8 +203,7 @@ def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
     for i in range(1, n):
         ec[i] = alpha * (ema[i] + best_gain * (arr[i] - ec[i - 1])) + (1 - alpha) * ec[i - 1]
 
-    err_pct = 100.0 * least_error / arr[-1] if arr[-1] != 0 else 0.0
-    return float(ec[-1]), float(ema[-1]), err_pct
+    return float(ec[-1]), float(ema[-1]), float(least_error)
 
 # ─────────────────────────────────────────────────────────────
 # TIMING
@@ -208,7 +219,7 @@ def seconds_to_next_30m() -> float:
 # ─────────────────────────────────────────────────────────────
 def trading_loop():
     status["running"] = True
-    log.info("Trading loop iniciado — aguardando primeiro candle de 30m")
+    log.info("Trading loop iniciado — aguardando primeiro candle 30m")
 
     while True:
         wait = seconds_to_next_30m()
@@ -216,21 +227,16 @@ def trading_loop():
         time.sleep(wait)
 
         try:
-            ex = build_exchange()
-
-            # Busca 120 candles fechados (ignora o candle aberto atual [-1])
-            ohlcv  = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=121)
-            if not ohlcv or len(ohlcv) < 30:
-                log.warning("Candles insuficientes recebidos da Phemex")
+            closes = fetch_closes(CANDLE_LIMIT)
+            if len(closes) < PERIOD + 10:
+                log.warning(f"Candles insuficientes: {len(closes)}")
                 continue
 
-            closes = [c[4] for c in ohlcv[:-1]]   # exclui candle atual
-            price  = float(closes[-1])
+            price = closes[-1]
 
-            # AZLEMA
-            ec, ema, err_pct = azlema(closes)
+            ec, ema, least_err = azlema(closes)
             if ec is None:
-                log.warning("Barras insuficientes para AZLEMA")
+                log.warning("AZLEMA retornou None")
                 continue
 
             signal = "LONG" if ec > ema else "SHORT"
@@ -248,37 +254,22 @@ def trading_loop():
             cur_pos = snap["position_side"]
             balance = snap["balance"]
 
-            # Calcula qty baseado em risco sobre saldo simulado
-            mintick = 0.01   # ETH/USDT mintick padrão Phemex
-            try:
-                ex.load_markets()
-                raw = ex.markets.get(SYMBOL, {}).get("precision", {}).get("price")
-                if raw:
-                    mintick = 10 ** (-int(raw)) if isinstance(raw, int) else float(raw)
-            except Exception:
-                pass
-
-            sl_usdt = SL_TICKS * mintick
+            sl_usdt = SL_TICKS * MINTICK
             qty     = max(round((RISK_PCT * balance) / sl_usdt, 6), 0.001)
 
-            # Paper trade
             record = None
             if signal == "LONG" and cur_pos != "LONG":
                 record = paper.open_long(price, qty)
-                record["ec"]  = round(ec, 4)
-                record["ema"] = round(ema, 4)
-                log.info(f"PAPER LONG  {qty} @ {price}")
-
+                log.info(f"PAPER LONG  {qty} ETH @ {price}")
             elif signal == "SHORT" and cur_pos != "SHORT":
                 record = paper.open_short(price, qty)
-                record["ec"]  = round(ec, 4)
-                record["ema"] = round(ema, 4)
-                log.info(f"PAPER SHORT {qty} @ {price}")
-
+                log.info(f"PAPER SHORT {qty} ETH @ {price}")
             else:
                 log.info(f"Hold {cur_pos} | EC={ec:.4f} EMA={ema:.4f} price={price}")
 
             if record:
+                record["ec"]  = round(ec, 4)
+                record["ema"] = round(ema, 4)
                 with _lock:
                     trade_history.appendleft(record)
 
@@ -290,10 +281,10 @@ def trading_loop():
                     "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
                     "msg":  msg,
                 })
-            time.sleep(30)   # back-off em caso de erro
+            time.sleep(30)
 
 # ─────────────────────────────────────────────────────────────
-# INTERNAL KEEPALIVE — 3 threads: 8s / 15s / 23s
+# KEEPALIVE INTERNO — 8s / 15s / 23s
 # ─────────────────────────────────────────────────────────────
 def _ka_worker(interval: int, name: str):
     time.sleep(interval + 3)
@@ -327,25 +318,15 @@ def health():
 
 @app.route("/")
 def dashboard():
-    snap = paper.snapshot()
+    snap   = paper.snapshot()
+    unreal = round(paper.unrealized_pnl(status["last_price"]), 4)
     with _lock:
         s_copy = dict(status)
         s_copy["errors"] = list(status["errors"])
         trades = list(trade_history)
         ka     = list(ka_log)
-
-    # P&L não realizado
-    unreal = round(paper.unrealized_pnl(status["last_price"]), 4)
-    equity = round(snap["balance"] + max(unreal, 0), 4)
-
     return render_template_string(
-        _HTML,
-        s=s_copy,
-        p=snap,
-        unreal=unreal,
-        equity=equity,
-        trades=trades,
-        ka=ka,
+        _HTML, s=s_copy, p=snap, unreal=unreal, trades=trades, ka=ka
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -362,56 +343,51 @@ _HTML = """<!DOCTYPE html>
 <style>
   body{background:#0d1117;color:#e6edf3;font-family:system-ui,sans-serif}
   .card{background:#161b22;border:1px solid #30363d;border-radius:8px}
-  .bl{background:#238636;color:#fff}.bs{background:#da3633;color:#fff}
-  .bf{background:#444c56;color:#fff}
+  .bl{background:#238636;color:#fff}.bs{background:#da3633;color:#fff}.bf{background:#444c56;color:#fff}
   .bp{color:#3fb950}.bn{color:#f85149}.bz{color:#8b949e}
   th{color:#8b949e;font-size:.73rem;text-transform:uppercase;font-weight:500;border-color:#30363d!important}
   td{font-size:.82rem;border-color:#21262d!important;vertical-align:middle}
   .ka{font-size:.73rem;color:#8b949e;font-family:monospace;line-height:1.8}
   .er{font-size:.73rem;color:#f85149;font-family:monospace;line-height:1.8}
-  .badge-pill{border-radius:20px;padding:.25em .75em}
-  .table-dark{--bs-table-bg:#161b22;--bs-table-hover-bg:#1c2128}
   .mono{font-family:monospace}
+  .table-dark{--bs-table-bg:#161b22;--bs-table-hover-bg:#1c2128}
 </style>
 </head>
 <body>
 <div class="container-fluid py-3 px-4">
-
-  <!-- Header -->
   <div class="d-flex align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 me-2">⚡ AZLEMA Paper Bot</h5>
-    <span class="badge {{'bg-success' if s.running else 'bg-danger'}} badge-pill">
+    <span class="badge {{'bg-success' if s.running else 'bg-danger'}} rounded-pill">
       {{'● RUNNING' if s.running else '○ STOPPED'}}</span>
-    <span class="badge bg-secondary badge-pill">Phemex · ETH/USDT · 30m · 1×</span>
-    <span class="badge bg-secondary badge-pill">Paper Trading</span>
-    <small class="text-secondary ms-auto">auto-refresh 30s | last: {{s.last_check}}</small>
+    <span class="badge bg-secondary rounded-pill">Phemex · ETHUSDTPERP · 30m · 1×</span>
+    <span class="badge bg-info text-dark rounded-pill">Paper Trading</span>
+    <small class="text-secondary ms-auto">auto-refresh 30s · {{s.last_check}}</small>
   </div>
 
-  <!-- Stats row -->
   <div class="row g-2 mb-3">
     {% set pos_cls = 'bl' if p.position_side=='LONG' else ('bs' if p.position_side=='SHORT' else 'bf') %}
     {% set sig_cls = 'bl' if s.signal=='LONG' else ('bs' if s.signal=='SHORT' else 'bf') %}
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Position</div>
-        <span class="badge {{pos_cls}} fs-6 badge-pill">{{p.position_side}}</span>
+        <div class="text-secondary small mb-1">Posição</div>
+        <span class="badge {{pos_cls}} fs-6 rounded-pill">{{p.position_side}}</span>
       </div>
     </div>
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Signal</div>
-        <span class="badge {{sig_cls}} fs-6 badge-pill">{{s.signal}}</span>
+        <div class="text-secondary small mb-1">Sinal</div>
+        <span class="badge {{sig_cls}} fs-6 rounded-pill">{{s.signal}}</span>
       </div>
     </div>
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Balance (sim)</div>
+        <div class="text-secondary small mb-1">Saldo simulado</div>
         <div class="fw-bold mono">${{p.balance}}</div>
       </div>
     </div>
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Realized P&L</div>
+        <div class="text-secondary small mb-1">P&L Realizado</div>
         <div class="fw-bold mono {{'bp' if p.realized_pnl >= 0 else 'bn'}}">
           {{'+' if p.realized_pnl >= 0 else ''}}${{p.realized_pnl}}
         </div>
@@ -419,45 +395,42 @@ _HTML = """<!DOCTYPE html>
     </div>
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Unrealized P&L</div>
-        <div class="fw-bold mono {{'bp' if unreal >= 0 else ('bn' if unreal < 0 else 'bz')}}">
+        <div class="text-secondary small mb-1">P&L Não realizado</div>
+        <div class="fw-bold mono {{'bp' if unreal > 0 else ('bn' if unreal < 0 else 'bz')}}">
           {{'+' if unreal > 0 else ''}}${{unreal}}
         </div>
       </div>
     </div>
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Last Price</div>
+        <div class="text-secondary small mb-1">Último Preço</div>
         <div class="fw-bold mono">${{s.last_price}}</div>
-        <div class="text-secondary" style="font-size:.7rem">
-          EC {{s.ec}} / EMA {{s.ema}}
-        </div>
+        <div class="text-secondary" style="font-size:.7rem">EC {{s.ec}} / EMA {{s.ema}}</div>
       </div>
     </div>
   </div>
 
   <div class="row g-3">
-    <!-- Trade history -->
     <div class="col-lg-8">
       <div class="card p-3">
         <div class="d-flex align-items-center mb-3">
-          <h6 class="text-secondary mb-0">Trade History</h6>
+          <h6 class="text-secondary mb-0">Histórico de Trades</h6>
           <span class="badge bg-secondary ms-2">{{trades|length}}</span>
-          <small class="text-secondary ms-auto">simulado — sem ordens reais</small>
+          <small class="text-secondary ms-auto fst-italic">simulado · sem ordens reais</small>
         </div>
         {% if trades %}
         <div style="max-height:480px;overflow-y:auto">
         <table class="table table-dark table-hover table-sm mb-0">
           <thead><tr>
-            <th>Time (UTC)</th><th>Side</th><th>Price</th>
-            <th>Qty</th><th>EC</th><th>EMA</th>
-            <th>Realized P&L</th><th>Balance</th>
+            <th>Hora (UTC)</th><th>Lado</th><th>Preço</th>
+            <th>Qty (ETH)</th><th>EC</th><th>EMA</th>
+            <th>P&L Real.</th><th>Saldo</th>
           </tr></thead>
           <tbody>
           {% for t in trades %}
           <tr>
             <td class="mono" style="font-size:.72rem">{{t.time}}</td>
-            <td><span class="badge {{'bl' if t.side=='LONG' else 'bs'}} badge-pill">{{t.side}}</span></td>
+            <td><span class="badge {{'bl' if t.side=='LONG' else 'bs'}} rounded-pill">{{t.side}}</span></td>
             <td class="mono">${{t.price}}</td>
             <td class="mono">{{t.qty}}</td>
             <td class="mono">{{t.ec}}</td>
@@ -474,26 +447,18 @@ _HTML = """<!DOCTYPE html>
         {% else %}
         <div class="text-center py-5">
           <div class="text-secondary mb-2" style="font-size:2rem">⏳</div>
-          <div class="text-secondary">Aguardando primeiro fechamento de candle 30m...</div>
+          <div class="text-secondary">Aguardando fechamento do candle de 30m...</div>
           <div class="text-secondary small mt-1">
-            Candles buscados direto da Phemex em tempo real
+            Dados recebidos de <strong>api.phemex.com</strong> (ETHUSDTPERP)
           </div>
         </div>
         {% endif %}
       </div>
     </div>
 
-    <!-- Side panel -->
     <div class="col-lg-4">
       <div class="card p-3 mb-3">
-        <h6 class="text-secondary mb-2">Keepalive interno</h6>
-        <div class="text-secondary small mb-2">8s · 15s · 23s</div>
-        {% for k in ka %}<div class="ka">{{k}}</div>
-        {% else %}<div class="text-secondary small">Iniciando...</div>{% endfor %}
-      </div>
-
-      <div class="card p-3 mb-3">
-        <h6 class="text-secondary mb-2">Posição atual</h6>
+        <h6 class="text-secondary mb-1">Posição Atual</h6>
         <table class="table table-dark table-sm mb-0">
           <tr><td class="text-secondary">Lado</td>
               <td class="text-end mono">{{p.position_side}}</td></tr>
@@ -506,11 +471,16 @@ _HTML = """<!DOCTYPE html>
         </table>
       </div>
 
+      <div class="card p-3 mb-3">
+        <h6 class="text-secondary mb-2">Keepalive interno (8s · 15s · 23s)</h6>
+        {% for k in ka %}<div class="ka">{{k}}</div>
+        {% else %}<div class="text-secondary small">Iniciando...</div>{% endfor %}
+      </div>
+
       {% if s.errors %}
       <div class="card p-3">
         <h6 class="text-danger mb-2">Erros recentes</h6>
-        {% for e in s.errors %}
-        <div class="er">[{{e.time}}] {{e.msg}}</div>{% endfor %}
+        {% for e in s.errors %}<div class="er">[{{e.time}}] {{e.msg}}</div>{% endfor %}
       </div>{% endif %}
     </div>
   </div>
@@ -529,9 +499,7 @@ def _start_background():
         return
     _started = True
     for interval, name in [(8, "KA-8s"), (15, "KA-15s"), (23, "KA-23s")]:
-        threading.Thread(
-            target=_ka_worker, args=(interval, name), daemon=True
-        ).start()
+        threading.Thread(target=_ka_worker, args=(interval, name), daemon=True).start()
     threading.Thread(target=trading_loop, daemon=True).start()
     log.info("Threads iniciadas: trading + 3x keepalive")
 
