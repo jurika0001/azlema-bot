@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Phemex Paper Trading Bot — Adaptive Zero Lag EMA
-- Candles 30m buscados direto da API pública da Phemex (sem ccxt)
-- Paper trading 100% interno (sem ordens reais)
+- Candles 30m via API pública da Phemex (symbol correto: ETHUSDT)
+- Paper trading 100% interno, sem ordens reais
 """
 
 import os
@@ -35,25 +35,24 @@ PORT       = int(os.environ.get("PORT", 8080))
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-# Phemex API pública — sem autenticação necessária para OHLCV
-PHEMEX_BASE    = "https://api.phemex.com"
-PHEMEX_SYMBOL  = "ETHUSDTPERP"   # símbolo nativo Phemex ETH USDT perpetual
-RESOLUTION     = 1800             # 30 minutos em segundos
-CANDLE_LIMIT   = 121              # 120 fechados + 1 aberto (descartamos o último)
+PHEMEX_BASE     = "https://api.phemex.com"
+PHEMEX_SYMBOL   = "ETHUSDT"   # ← símbolo correto Phemex linear perpetual
+RESOLUTION      = 1800        # 30 min em segundos
+CANDLE_LIMIT    = 121         # 120 fechados + 1 aberto (descartamos o último)
 
 LEVERAGE        = 1
 RISK_PCT        = 0.01
 SL_TICKS        = 2000
-MINTICK         = 0.01            # ETH/USDT mintick na Phemex
+MINTICK         = 0.01
 GAIN_LIMIT      = 50
 PERIOD          = 20
 THRESHOLD       = 0.0
 INITIAL_BALANCE = 1000.0
 
 # ─────────────────────────────────────────────────────────────
-# PHEMEX OHLCV — chamada direta à API pública (sem ccxt)
-# Endpoint oficial: /exchange/public/md/v2/kline/last
-# Resposta rows: [timestamp, interval, last_close, open, high, low, close, volume, turnover]
+# FETCH CANDLES — API pública Phemex Hedged Perpetual
+# GET /exchange/public/md/v2/kline/last
+# rows: [timestamp, interval, last_close, open, high, low, close, volume, turnover]
 # índice 6 = close
 # ─────────────────────────────────────────────────────────────
 def fetch_closes(limit: int = CANDLE_LIMIT) -> list:
@@ -63,26 +62,30 @@ def fetch_closes(limit: int = CANDLE_LIMIT) -> list:
         "resolution": RESOLUTION,
         "limit":      limit,
     }
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
+    headers = {"Content-Type": "application/json"}
+    resp    = requests.get(url, params=params, headers=headers, timeout=10)
+
+    if resp.status_code != 200:
+        raise ValueError(
+            f"Phemex HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+
     data = resp.json()
-
     if data.get("code") != 0:
-        raise ValueError(f"Phemex API error: {data}")
+        raise ValueError(f"Phemex API error code {data.get('code')}: {data}")
 
-    rows = data["data"]["rows"]
+    rows = data.get("data", {}).get("rows", [])
     if not rows:
         raise ValueError("Phemex retornou rows vazio")
 
-    # rows ordenados do mais antigo ao mais recente
-    # descarta o último candle (ainda aberto)
+    # descarta o último (candle aberto ainda em formação)
     closed = rows[:-1]
-    closes = [float(row[6]) for row in closed]   # índice 6 = close
+    closes = [float(row[6]) for row in closed]
     return closes
 
 
 # ─────────────────────────────────────────────────────────────
-# PAPER ENGINE
+# PAPER ENGINE — saldo e posição 100% simulados
 # ─────────────────────────────────────────────────────────────
 class PaperEngine:
     def __init__(self, initial_balance: float):
@@ -174,8 +177,8 @@ status = {
 # AZLEMA
 # ─────────────────────────────────────────────────────────────
 def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
-    arr = np.array(closes, dtype=np.float64)
-    n   = len(arr)
+    arr    = np.array(closes, dtype=np.float64)
+    n      = len(arr)
     if n < period + 10:
         return None, None, None
 
@@ -188,9 +191,9 @@ def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
     best_gain   = 0.0
     least_error = 1e18
     for g_int in range(-gain_limit * 10, gain_limit * 10 + 1):
-        g    = g_int / 10.0
-        ec   = np.empty(n)
-        ec[0]= arr[0]
+        g     = g_int / 10.0
+        ec    = np.empty(n)
+        ec[0] = arr[0]
         for i in range(1, n):
             ec[i] = alpha * (ema[i] + g * (arr[i] - ec[i - 1])) + (1 - alpha) * ec[i - 1]
         err = abs(arr[-1] - ec[-1])
@@ -205,14 +208,16 @@ def azlema(closes: list, period: int = PERIOD, gain_limit: int = GAIN_LIMIT):
 
     return float(ec[-1]), float(ema[-1]), float(least_error)
 
+
 # ─────────────────────────────────────────────────────────────
-# TIMING
+# TIMING — aguarda próximo fechamento de candle 30m
 # ─────────────────────────────────────────────────────────────
 def seconds_to_next_30m() -> float:
     now  = datetime.now(timezone.utc)
     secs = now.minute * 60 + now.second + now.microsecond / 1e6
     wait = (1800 - secs) if secs < 1800 else (3600 - secs)
     return max(wait + 5, 1)
+
 
 # ─────────────────────────────────────────────────────────────
 # TRADING LOOP
@@ -283,6 +288,7 @@ def trading_loop():
                 })
             time.sleep(30)
 
+
 # ─────────────────────────────────────────────────────────────
 # KEEPALIVE INTERNO — 8s / 15s / 23s
 # ─────────────────────────────────────────────────────────────
@@ -298,12 +304,14 @@ def _ka_worker(interval: int, name: str):
         with _lock:
             ka_log.appendleft(msg)
 
+
 # ─────────────────────────────────────────────────────────────
 # FLASK ROUTES
 # ─────────────────────────────────────────────────────────────
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "ts": datetime.utcnow().isoformat()})
+
 
 @app.route("/health")
 def health():
@@ -316,18 +324,20 @@ def health():
         "balance":  snap["balance"],
     })
 
+
 @app.route("/")
 def dashboard():
     snap   = paper.snapshot()
     unreal = round(paper.unrealized_pnl(status["last_price"]), 4)
     with _lock:
-        s_copy = dict(status)
+        s_copy         = dict(status)
         s_copy["errors"] = list(status["errors"])
-        trades = list(trade_history)
-        ka     = list(ka_log)
+        trades         = list(trade_history)
+        ka             = list(ka_log)
     return render_template_string(
         _HTML, s=s_copy, p=snap, unreal=unreal, trades=trades, ka=ka
     )
+
 
 # ─────────────────────────────────────────────────────────────
 # DASHBOARD HTML
@@ -355,11 +365,12 @@ _HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container-fluid py-3 px-4">
+
   <div class="d-flex align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 me-2">⚡ AZLEMA Paper Bot</h5>
     <span class="badge {{'bg-success' if s.running else 'bg-danger'}} rounded-pill">
       {{'● RUNNING' if s.running else '○ STOPPED'}}</span>
-    <span class="badge bg-secondary rounded-pill">Phemex · ETHUSDTPERP · 30m · 1×</span>
+    <span class="badge bg-secondary rounded-pill">Phemex · ETHUSDT · 30m · 1×</span>
     <span class="badge bg-info text-dark rounded-pill">Paper Trading</span>
     <small class="text-secondary ms-auto">auto-refresh 30s · {{s.last_check}}</small>
   </div>
@@ -367,6 +378,7 @@ _HTML = """<!DOCTYPE html>
   <div class="row g-2 mb-3">
     {% set pos_cls = 'bl' if p.position_side=='LONG' else ('bs' if p.position_side=='SHORT' else 'bf') %}
     {% set sig_cls = 'bl' if s.signal=='LONG' else ('bs' if s.signal=='SHORT' else 'bf') %}
+
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
         <div class="text-secondary small mb-1">Posição</div>
@@ -449,7 +461,7 @@ _HTML = """<!DOCTYPE html>
           <div class="text-secondary mb-2" style="font-size:2rem">⏳</div>
           <div class="text-secondary">Aguardando fechamento do candle de 30m...</div>
           <div class="text-secondary small mt-1">
-            Dados recebidos de <strong>api.phemex.com</strong> (ETHUSDTPERP)
+            Dados de <strong>api.phemex.com</strong> · ETHUSDT linear perpetual
           </div>
         </div>
         {% endif %}
@@ -458,7 +470,7 @@ _HTML = """<!DOCTYPE html>
 
     <div class="col-lg-4">
       <div class="card p-3 mb-3">
-        <h6 class="text-secondary mb-1">Posição Atual</h6>
+        <h6 class="text-secondary mb-2">Posição Atual</h6>
         <table class="table table-dark table-sm mb-0">
           <tr><td class="text-secondary">Lado</td>
               <td class="text-end mono">{{p.position_side}}</td></tr>
@@ -481,17 +493,20 @@ _HTML = """<!DOCTYPE html>
       <div class="card p-3">
         <h6 class="text-danger mb-2">Erros recentes</h6>
         {% for e in s.errors %}<div class="er">[{{e.time}}] {{e.msg}}</div>{% endfor %}
-      </div>{% endif %}
+      </div>
+      {% endif %}
     </div>
   </div>
 </div>
 </body>
 </html>"""
 
+
 # ─────────────────────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────────────────────
 _started = False
+
 
 def _start_background():
     global _started
@@ -499,9 +514,12 @@ def _start_background():
         return
     _started = True
     for interval, name in [(8, "KA-8s"), (15, "KA-15s"), (23, "KA-23s")]:
-        threading.Thread(target=_ka_worker, args=(interval, name), daemon=True).start()
+        threading.Thread(
+            target=_ka_worker, args=(interval, name), daemon=True
+        ).start()
     threading.Thread(target=trading_loop, daemon=True).start()
     log.info("Threads iniciadas: trading + 3x keepalive")
+
 
 _start_background()
 
