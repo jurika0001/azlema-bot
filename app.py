@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Phemex Paper Trading Bot — Adaptive Zero Lag EMA
-- Tenta múltiplos endpoints/símbolos com fallback automático
+- Endpoints corretos: /md/v2/kline/last e /md/v2/kline (sem /exchange/public/)
 - Paper trading 100% interno, sem ordens reais
 """
 
@@ -36,8 +36,8 @@ PORT       = int(os.environ.get("PORT", 8080))
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 PHEMEX_BASE     = "https://api.phemex.com"
-RESOLUTION      = 1800    # 30 min
-CANDLE_LIMIT    = 121
+RESOLUTION      = 1800    # 30 min em segundos
+CANDLE_LIMIT    = 121     # 120 fechados + 1 aberto
 
 LEVERAGE        = 1
 RISK_PCT        = 0.01
@@ -45,30 +45,23 @@ SL_TICKS        = 2000
 MINTICK         = 0.01
 GAIN_LIMIT      = 50
 PERIOD          = 20
-THRESHOLD       = 0.0
 INITIAL_BALANCE = 1000.0
 
 # ─────────────────────────────────────────────────────────────
-# FETCH CANDLES — tenta todos os endpoints/símbolos conhecidos
-# Phemex tem dois sistemas distintos:
-#   • Hedged Perpetual (USDT-M): /md/v2/kline/last  symbol=ETHUSDT
-#   • Contract (Inverse):        /md/v2/kline        symbol=ETHUSD
-# Fallback adicional: endpoint sem /last
+# TENTATIVAS DE ENDPOINT — paths SEM /exchange/public/
+# Fonte: ccxt/phemex.py (código oficial)
+#
+# Hedged Perpetual USDT-M → /md/v2/kline/last  symbol=ETHUSDT  (preço real)
+# Contract Inverse         → /md/v2/kline       symbol=ETHUSD   (preço Ep ×1e-4)
 # ─────────────────────────────────────────────────────────────
-
-# Lista de tentativas em ordem de prioridade
 _KLINE_ATTEMPTS = [
-    # (endpoint, symbol, price_scale)
-    # Hedged Perpetual USDT-M — preço real em USD
-    ("/exchange/public/md/v2/kline/last", "ETHUSDT",  1.0),
-    # Sem /last — mesmo contrato
-    ("/exchange/public/md/v2/kline",      "ETHUSDT",  1.0),
-    # Inverse contract (preço em Ep = preço × 10000)
-    ("/exchange/public/md/v2/kline/last", "ETHUSD",   1e-4),
-    ("/exchange/public/md/v2/kline",      "ETHUSD",   1e-4),
+    ("/md/v2/kline/last", "ETHUSDT", 1.0   ),   # USDT linear perpetual ← mais provável
+    ("/md/v2/kline",      "ETHUSDT", 1.0   ),   # mesmo contrato, endpoint alternativo
+    ("/md/v2/kline/last", "ETHUSD",  1e-4  ),   # inverse (priceEp ÷ 10000)
+    ("/md/v2/kline",      "ETHUSD",  1e-4  ),   # inverse alternativo
 ]
 
-_active_attempt = None   # guarda qual combinação funcionou
+_active_attempt = None
 
 
 def _try_fetch(endpoint: str, symbol: str, scale: float, limit: int) -> list:
@@ -88,7 +81,7 @@ def _try_fetch(endpoint: str, symbol: str, scale: float, limit: int) -> list:
     if not rows:
         raise ValueError("rows vazio")
 
-    closed = rows[:-1]                         # descarta candle aberto
+    closed = rows[:-1]                          # descarta candle aberto
     closes = [float(row[6]) * scale for row in closed]
     return closes
 
@@ -96,30 +89,30 @@ def _try_fetch(endpoint: str, symbol: str, scale: float, limit: int) -> list:
 def fetch_closes(limit: int = CANDLE_LIMIT) -> list:
     global _active_attempt
 
-    # Se já temos uma combinação funcionando, tenta ela primeiro
+    # Tenta o endpoint que funcionou antes
     if _active_attempt:
         ep, sym, scale = _active_attempt
         try:
             closes = _try_fetch(ep, sym, scale, limit)
-            log.info(f"Candles OK via {sym}{ep} ({len(closes)} barras)")
+            log.info(f"Candles OK: {sym}{ep} ({len(closes)} barras)")
             return closes
         except Exception as e:
-            log.warning(f"Tentativa anterior falhou ({sym}): {e} — resetando")
+            log.warning(f"Endpoint anterior falhou ({sym}{ep}): {e} — resetando")
             _active_attempt = None
 
-    # Testa todas as combinações até uma funcionar
+    # Descobre qual endpoint funciona
     last_err = None
     for ep, sym, scale in _KLINE_ATTEMPTS:
         try:
             closes = _try_fetch(ep, sym, scale, limit)
             _active_attempt = (ep, sym, scale)
-            log.info(f"Endpoint ativo definido: {sym}{ep}")
+            log.info(f"Endpoint ativo: {sym}{ep}")
             return closes
         except Exception as e:
             last_err = e
             log.warning(f"Falhou {sym}{ep}: {e}")
 
-    raise ValueError(f"Todos os endpoints falharam. Último erro: {last_err}")
+    raise ValueError(f"Todos os endpoints falharam. Último: {last_err}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -202,14 +195,14 @@ trade_history = deque(maxlen=200)
 ka_log        = deque(maxlen=40)
 
 status = {
-    "running":      False,
-    "signal":       "—",
-    "ec":           0.0,
-    "ema":          0.0,
-    "last_price":   0.0,
-    "last_check":   "—",
-    "active_feed":  "descobrindo...",
-    "errors":       deque(maxlen=10),
+    "running":     False,
+    "signal":      "—",
+    "ec":          0.0,
+    "ema":         0.0,
+    "last_price":  0.0,
+    "last_check":  "—",
+    "active_feed": "descobrindo...",
+    "errors":      deque(maxlen=10),
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -273,7 +266,6 @@ def trading_loop():
         try:
             closes = fetch_closes(CANDLE_LIMIT)
 
-            # Atualiza qual feed está ativo no status
             if _active_attempt:
                 _, sym, _ = _active_attempt
                 with _lock:
@@ -284,7 +276,6 @@ def trading_loop():
                 continue
 
             price = closes[-1]
-
             ec, ema, _ = azlema(closes)
             if ec is None:
                 log.warning("AZLEMA retornou None")
@@ -317,9 +308,7 @@ def trading_loop():
                 record = paper.open_short(price, qty)
                 log.info(f"PAPER SHORT {qty} ETH @ {price}")
             else:
-                log.info(
-                    f"Hold {cur_pos} | EC={ec:.4f} EMA={ema:.4f} price={price}"
-                )
+                log.info(f"Hold {cur_pos} | EC={ec:.4f} EMA={ema:.4f} price={price}")
 
             if record:
                 record["ec"]  = round(ec, 4)
@@ -377,7 +366,7 @@ def health():
 
 @app.route("/test-api")
 def test_api():
-    """Testa todos os endpoints e mostra resposta bruta — use para debug."""
+    """Testa todos os 4 endpoints e mostra resposta bruta — use para debug."""
     results = []
     for ep, sym, scale in _KLINE_ATTEMPTS:
         url    = f"{PHEMEX_BASE}{ep}"
@@ -385,22 +374,24 @@ def test_api():
         try:
             r    = requests.get(url, params=params, timeout=8)
             body = r.json()
+            rows = (body.get("data") or {}).get("rows", [])
             results.append({
-                "endpoint": ep,
-                "symbol":   sym,
-                "scale":    scale,
-                "status":   r.status_code,
-                "code":     body.get("code"),
-                "msg":      body.get("msg"),
-                "rows_n":   len((body.get("data") or {}).get("rows", [])),
-                "sample":   ((body.get("data") or {}).get("rows") or [None])[0],
+                "url":     r.url,
+                "symbol":  sym,
+                "scale":   scale,
+                "status":  r.status_code,
+                "code":    body.get("code"),
+                "msg":     body.get("msg"),
+                "rows_n":  len(rows),
+                "sample":  rows[0] if rows else None,
+                "close_0": round(float(rows[0][6]) * scale, 4) if rows else None,
             })
         except Exception as e:
-            results.append({
-                "endpoint": ep, "symbol": sym,
-                "error": str(e)
-            })
-    return jsonify({"attempts": results, "active": _active_attempt})
+            results.append({"url": f"{PHEMEX_BASE}{ep}", "symbol": sym, "error": str(e)})
+    return jsonify({
+        "active_attempt": str(_active_attempt),
+        "attempts":       results,
+    })
 
 
 @app.route("/")
@@ -427,17 +418,13 @@ _HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
 <title>AZLEMA Paper Bot — Phemex</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
-      rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
   body{background:#0d1117;color:#e6edf3;font-family:system-ui,sans-serif}
   .card{background:#161b22;border:1px solid #30363d;border-radius:8px}
-  .bl{background:#238636;color:#fff}
-  .bs{background:#da3633;color:#fff}
-  .bf{background:#444c56;color:#fff}
+  .bl{background:#238636;color:#fff}.bs{background:#da3633;color:#fff}.bf{background:#444c56;color:#fff}
   .bp{color:#3fb950}.bn{color:#f85149}.bz{color:#8b949e}
-  th{color:#8b949e;font-size:.73rem;text-transform:uppercase;font-weight:500;
-     border-color:#30363d!important}
+  th{color:#8b949e;font-size:.73rem;text-transform:uppercase;font-weight:500;border-color:#30363d!important}
   td{font-size:.82rem;border-color:#21262d!important;vertical-align:middle}
   .ka{font-size:.73rem;color:#8b949e;font-family:monospace;line-height:1.8}
   .er{font-size:.73rem;color:#f85149;font-family:monospace;line-height:1.8}
@@ -448,26 +435,18 @@ _HTML = """<!DOCTYPE html>
 <body>
 <div class="container-fluid py-3 px-4">
 
-  <!-- Header -->
   <div class="d-flex align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 me-2">⚡ AZLEMA Paper Bot</h5>
     <span class="badge {{'bg-success' if s.running else 'bg-danger'}} rounded-pill">
       {{'● RUNNING' if s.running else '○ STOPPED'}}</span>
-    <span class="badge bg-secondary rounded-pill">
-      Phemex · {{s.active_feed}} · 30m · 1×</span>
+    <span class="badge bg-secondary rounded-pill">Phemex · {{s.active_feed}} · 30m · 1×</span>
     <span class="badge bg-info text-dark rounded-pill">Paper Trading</span>
-    <small class="text-secondary ms-auto">
-      auto-refresh 30s · {{s.last_check}}
-    </small>
+    <small class="text-secondary ms-auto">auto-refresh 30s · {{s.last_check}}</small>
   </div>
 
-  <!-- Stats -->
   <div class="row g-2 mb-3">
-    {% set pos_cls = 'bl' if p.position_side=='LONG'
-                     else ('bs' if p.position_side=='SHORT' else 'bf') %}
-    {% set sig_cls = 'bl' if s.signal=='LONG'
-                     else ('bs' if s.signal=='SHORT' else 'bf') %}
-
+    {% set pos_cls = 'bl' if p.position_side=='LONG' else ('bs' if p.position_side=='SHORT' else 'bf') %}
+    {% set sig_cls = 'bl' if s.signal=='LONG' else ('bs' if s.signal=='SHORT' else 'bf') %}
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
         <div class="text-secondary small mb-1">Posição</div>
@@ -506,15 +485,12 @@ _HTML = """<!DOCTYPE html>
       <div class="card p-3 text-center h-100">
         <div class="text-secondary small mb-1">Último Preço</div>
         <div class="fw-bold mono">${{s.last_price}}</div>
-        <div class="text-secondary" style="font-size:.7rem">
-          EC {{s.ec}} / EMA {{s.ema}}
-        </div>
+        <div class="text-secondary" style="font-size:.7rem">EC {{s.ec}} / EMA {{s.ema}}</div>
       </div>
     </div>
   </div>
 
   <div class="row g-3">
-    <!-- Trades -->
     <div class="col-lg-8">
       <div class="card p-3">
         <div class="d-flex align-items-center mb-3">
@@ -536,11 +512,7 @@ _HTML = """<!DOCTYPE html>
           {% for t in trades %}
           <tr>
             <td class="mono" style="font-size:.72rem">{{t.time}}</td>
-            <td>
-              <span class="badge {{'bl' if t.side=='LONG' else 'bs'}} rounded-pill">
-                {{t.side}}
-              </span>
-            </td>
+            <td><span class="badge {{'bl' if t.side=='LONG' else 'bs'}} rounded-pill">{{t.side}}</span></td>
             <td class="mono">${{t.price}}</td>
             <td class="mono">{{t.qty}}</td>
             <td class="mono">{{t.ec}}</td>
@@ -557,15 +529,11 @@ _HTML = """<!DOCTYPE html>
         {% else %}
         <div class="text-center py-5">
           <div class="text-secondary mb-2" style="font-size:2rem">⏳</div>
-          <div class="text-secondary">
-            Aguardando fechamento do candle de 30m...
-          </div>
+          <div class="text-secondary">Aguardando fechamento do candle de 30m...</div>
           <div class="text-secondary small mt-1">
-            Dados de <strong>api.phemex.com</strong>
-            · feed ativo: <strong>{{s.active_feed}}</strong>
+            Feed ativo: <strong>{{s.active_feed}}</strong>
           </div>
-          <a href="/test-api" target="_blank"
-             class="btn btn-outline-info btn-sm mt-3">
+          <a href="/test-api" target="_blank" class="btn btn-outline-info btn-sm mt-3">
             🔍 Verificar endpoints da Phemex
           </a>
         </div>
@@ -573,7 +541,6 @@ _HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Side panel -->
     <div class="col-lg-4">
       <div class="card p-3 mb-3">
         <h6 class="text-secondary mb-2">Posição Atual</h6>
@@ -590,22 +557,15 @@ _HTML = """<!DOCTYPE html>
       </div>
 
       <div class="card p-3 mb-3">
-        <h6 class="text-secondary mb-2">
-          Keepalive interno (8s · 15s · 23s)
-        </h6>
-        {% for k in ka %}
-          <div class="ka">{{k}}</div>
-        {% else %}
-          <div class="text-secondary small">Iniciando...</div>
-        {% endfor %}
+        <h6 class="text-secondary mb-2">Keepalive interno (8s · 15s · 23s)</h6>
+        {% for k in ka %}<div class="ka">{{k}}</div>
+        {% else %}<div class="text-secondary small">Iniciando...</div>{% endfor %}
       </div>
 
       {% if s.errors %}
       <div class="card p-3">
         <h6 class="text-danger mb-2">Erros recentes</h6>
-        {% for e in s.errors %}
-          <div class="er">[{{e.time}}] {{e.msg}}</div>
-        {% endfor %}
+        {% for e in s.errors %}<div class="er">[{{e.time}}] {{e.msg}}</div>{% endfor %}
       </div>
       {% endif %}
     </div>
