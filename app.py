@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Phemex Paper Trading Bot — Adaptive Zero Lag EMA
-- Posição aberta SEMPRE visível no topo do histórico
-- Trades persistidas em disco (trades.json + state.json)
-- Executa no startup e a cada candle 30m
+- Histórico sempre visível (bug do template corrigido)
+- Trades + estado persistidos em disco
 """
 
 import os
@@ -213,45 +212,52 @@ class PaperEngine:
 
     def _rec(self, side: str, price: float, qty: float) -> dict:
         return {
-            "time":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "side":     side,
-            "price":    round(price, 4),
-            "qty":      round(qty, 6),
-            "pnl_real": round(self.realized_pnl, 4),
-            "balance":  round(self.balance, 4),
-            "ec":       0.0,
-            "ema":      0.0,
-            "open":     True,   # posição ainda aberta
+            "time":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "side":        side,
+            "price":       round(price, 4),
+            "qty":         round(qty, 6),
+            "close_price": None,
+            "close_time":  None,
+            "pnl_trade":   None,   # P&L desta trade individual (calculado ao fechar)
+            "pnl_real":    round(self.realized_pnl, 4),
+            "balance":     round(self.balance, 4),
+            "ec":          0.0,
+            "ema":         0.0,
+            "status":      "ABERTA",
         }
 
 
 paper = PaperEngine()
 
 # ─────────────────────────────────────────────────────────────
-# HISTÓRICO — carrega do disco
+# HISTÓRICO
 # ─────────────────────────────────────────────────────────────
-_lock         = threading.Lock()
+_lock = threading.Lock()
+
 _raw_trades   = _load_json(TRADES_FILE, [])
 trade_history = deque(_raw_trades, maxlen=500)
-log.info(f"Trades carregados do disco: {len(trade_history)}")
+log.info(f"Trades carregadas do disco: {len(trade_history)}")
 
-# Se posição aberta mas histórico vazio → cria registro sintético
-snap0 = paper.snapshot()
-if snap0["position_side"] != "FLAT" and len(trade_history) == 0:
-    synthetic = {
-        "time":     "—",
-        "side":     snap0["position_side"],
-        "price":    snap0["entry_price"],
-        "qty":      snap0["position_qty"],
-        "pnl_real": snap0["realized_pnl"],
-        "balance":  snap0["balance"],
-        "ec":       0.0,
-        "ema":      0.0,
-        "open":     True,
-        "note":     "restaurado do disco",
+# Se restaurou posição mas histórico está vazio → cria registro sintético
+_snap0 = paper.snapshot()
+if _snap0["position_side"] != "FLAT" and len(trade_history) == 0:
+    _synth = {
+        "time":        "desconhecido (restaurado)",
+        "side":        _snap0["position_side"],
+        "price":       _snap0["entry_price"],
+        "qty":         _snap0["position_qty"],
+        "close_price": None,
+        "close_time":  None,
+        "pnl_trade":   None,
+        "pnl_real":    _snap0["realized_pnl"],
+        "balance":     _snap0["balance"],
+        "ec":          0.0,
+        "ema":         0.0,
+        "status":      "ABERTA",
     }
-    trade_history.appendleft(synthetic)
-    log.info(f"Registro sintético criado para posição {snap0['position_side']} restaurada")
+    trade_history.appendleft(_synth)
+    _save_json(TRADES_FILE, list(trade_history))
+    log.info(f"Registro sintético criado: {_snap0['position_side']} @ {_snap0['entry_price']}")
 
 ka_log = deque(maxlen=40)
 
@@ -265,7 +271,6 @@ status = {
     "active_feed": "inicializando...",
     "errors":      deque(maxlen=10),
 }
-
 
 # ─────────────────────────────────────────────────────────────
 # AZLEMA
@@ -292,7 +297,6 @@ def azlema(closes: list):
     for i in range(1, n):
         ec[i] = alpha * (ema[i] + bg * (arr[i] - ec[i-1])) + (1-alpha)*ec[i-1]
     return float(ec[-1]), float(ema[-1])
-
 
 # ─────────────────────────────────────────────────────────────
 # ESTRATÉGIA
@@ -347,25 +351,30 @@ def run_strategy(label: str = "candle") -> dict:
             log.info(f"[{label}] PAPER SHORT {qty} ETH @ {price}")
 
         else:
-            log.info(
-                f"[{label}] Hold {cur_pos} | "
-                f"EC={ec:.2f} EMA={ema:.2f} p={price}"
-            )
+            log.info(f"[{label}] Hold {cur_pos} | EC={ec:.2f} EMA={ema:.2f} p={price}")
 
-        # Marca a trade anterior como fechada quando abre nova posição
         if record:
-            record["ec"]   = round(ec, 4)
-            record["ema"]  = round(ema, 4)
-            record["open"] = True
+            record["ec"]  = round(ec, 4)
+            record["ema"] = round(ema, 4)
+
             with _lock:
-                # Fecha a trade anterior (primeira da lista)
+                # Fecha a trade anterior (topo da lista) e calcula P&L individual
                 if trade_history:
                     prev = dict(trade_history[0])
-                    prev["open"]       = False
-                    prev["close_time"] = datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%d %H:%M:%S")
-                    prev["close_price"] = round(price, 4)
-                    trade_history[0]   = prev
+                    if prev.get("status") == "ABERTA":
+                        entry = float(prev.get("price") or 0)
+                        qty_p = float(prev.get("qty")   or 0)
+                        if prev["side"] == "LONG":
+                            pnl_t = (price - entry) * qty_p
+                        else:
+                            pnl_t = (entry - price) * qty_p
+                        prev["status"]      = "FECHADA"
+                        prev["close_price"] = round(price, 4)
+                        prev["close_time"]  = datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M:%S")
+                        prev["pnl_trade"]   = round(pnl_t, 4)
+                        trade_history[0]    = prev
+
                 trade_history.appendleft(record)
                 _save_json(TRADES_FILE, list(trade_history))
 
@@ -391,7 +400,6 @@ def run_strategy(label: str = "candle") -> dict:
     finally:
         _strat_lock.release()
 
-
 # ─────────────────────────────────────────────────────────────
 # TIMING
 # ─────────────────────────────────────────────────────────────
@@ -401,15 +409,14 @@ def seconds_to_next_30m() -> float:
     wait = (1800 - secs) if secs < 1800 else (3600 - secs)
     return max(wait + 5, 1)
 
-
 # ─────────────────────────────────────────────────────────────
 # TRADING LOOP
 # ─────────────────────────────────────────────────────────────
 def trading_loop():
     status["running"] = True
-    log.info("Startup: aguardando 5s para Flask subir...")
+    log.info("Startup: aguardando 5s...")
     time.sleep(5)
-    log.info("Startup: executando estratégia agora...")
+    log.info("Startup: executando estratégia...")
     run_strategy("startup")
     while True:
         wait = seconds_to_next_30m()
@@ -417,9 +424,8 @@ def trading_loop():
         time.sleep(wait)
         run_strategy("candle")
 
-
 # ─────────────────────────────────────────────────────────────
-# KEEPALIVE — 8s / 15s / 23s
+# KEEPALIVE
 # ─────────────────────────────────────────────────────────────
 def _ka_worker(interval: int, name: str):
     time.sleep(interval + 3)
@@ -433,14 +439,12 @@ def _ka_worker(interval: int, name: str):
         with _lock:
             ka_log.appendleft(msg)
 
-
 # ─────────────────────────────────────────────────────────────
 # FLASK
 # ─────────────────────────────────────────────────────────────
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "ts": datetime.utcnow().isoformat()})
-
 
 @app.route("/health")
 def health():
@@ -456,11 +460,9 @@ def health():
         "trades":      len(trade_history),
     })
 
-
 @app.route("/run-now", methods=["GET", "POST"])
 def run_now():
     return jsonify(run_strategy("manual"))
-
 
 @app.route("/reset", methods=["GET", "POST"])
 def reset():
@@ -474,26 +476,25 @@ def reset():
         paper._persist()
     trade_history = deque(maxlen=500)
     _save_json(TRADES_FILE, [])
-    log.info("Estado resetado manualmente")
+    log.info("Reset manual")
     return jsonify({"status": "ok", "msg": "Resetado. Saldo: $1000"})
-
 
 @app.route("/test-api")
 def test_api():
     results = []
     for att in _ATTEMPTS:
         try:
-            r      = requests.get(att["url"], params=att["params"], timeout=10)
-            body   = r.json()
-            rows   = (body.get("data") or {}).get("rows", [])
-            sample = rows[0] if rows else None
+            r    = requests.get(att["url"], params=att["params"], timeout=10)
+            body = r.json()
+            rows = (body.get("data") or {}).get("rows", [])
+            s    = rows[0] if rows else None
             results.append({
                 "label":  att["label"],
                 "url":    r.url,
                 "status": r.status_code,
                 "code":   body.get("code"),
                 "rows":   len(rows),
-                "close":  round(float(sample[6]) * att["scale"], 2) if sample else None,
+                "close":  round(float(s[6]) * att["scale"], 2) if s else None,
             })
         except Exception as e:
             results.append({"label": att["label"], "error": str(e)})
@@ -502,37 +503,28 @@ def test_api():
         "results": results,
     })
 
-
 @app.route("/")
 def dashboard():
     snap   = paper.snapshot()
-    price  = status["last_price"]
+    price  = status["last_price"] or 0.0
     unreal = round(paper.unrealized_pnl(price), 4)
     equity = round(snap["balance"] + unreal, 4)
-
-    # Calcula P&L não realizado da posição aberta para exibir na tabela
-    open_unreal = unreal if snap["position_side"] != "FLAT" else 0.0
-
     with _lock:
         s_copy           = dict(status)
         s_copy["errors"] = list(status["errors"])
-        trades           = list(trade_history)
+        trades           = list(trade_history)   # lista simples de dicts
         ka               = list(ka_log)
-
     return render_template_string(
         _HTML,
         s=s_copy, p=snap,
-        unreal=unreal, equity=equity,
-        open_unreal=open_unreal,
+        price=price, unreal=unreal, equity=equity,
         trades=trades, ka=ka,
-        price=price,
     )
 
-
 # ─────────────────────────────────────────────────────────────
-# HTML
+# HTML — template sem lógica condicional complexa no loop
 # ─────────────────────────────────────────────────────────────
-_HTML = """<!DOCTYPE html>
+_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -543,213 +535,201 @@ _HTML = """<!DOCTYPE html>
 <style>
   body  { background:#0d1117; color:#e6edf3; font-family:system-ui,sans-serif }
   .card { background:#161b22; border:1px solid #30363d; border-radius:8px }
-  .bl   { background:#238636; color:#fff }
-  .bs   { background:#da3633; color:#fff }
-  .bf   { background:#444c56; color:#fff }
+  .bl   { background:#238636!important; color:#fff!important }
+  .bs   { background:#da3633!important; color:#fff!important }
+  .bf   { background:#444c56!important; color:#fff!important }
   .bp   { color:#3fb950 } .bn { color:#f85149 } .bz { color:#8b949e }
-  th    { color:#8b949e; font-size:.73rem; text-transform:uppercase;
+  th    { color:#8b949e; font-size:.72rem; text-transform:uppercase;
           font-weight:500; border-color:#30363d!important }
-  td    { font-size:.82rem; border-color:#21262d!important; vertical-align:middle }
-  .ka   { font-size:.73rem; color:#8b949e; font-family:monospace; line-height:1.8 }
-  .er   { font-size:.73rem; color:#f85149; font-family:monospace; line-height:1.8 }
+  td    { font-size:.81rem; border-color:#21262d!important; vertical-align:middle }
+  .ka   { font-size:.72rem; color:#8b949e; font-family:monospace; line-height:1.8 }
+  .er   { font-size:.72rem; color:#f85149; font-family:monospace; line-height:1.8 }
   .mono { font-family:monospace }
   .table-dark { --bs-table-bg:#161b22; --bs-table-hover-bg:#1c2128 }
-  /* linha da posição aberta — destaque suave */
-  .row-open td { background:rgba(35,134,54,.12)!important }
-  .row-open.short td { background:rgba(218,54,51,.10)!important }
+  .tr-open-long  td { background:rgba(35,134,54,.15)!important }
+  .tr-open-short td { background:rgba(218,54,51,.13)!important }
 </style>
 </head>
 <body>
 <div class="container-fluid py-3 px-4">
 
-  <!-- Header -->
   <div class="d-flex align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 me-2">⚡ AZLEMA Paper Bot</h5>
-    <span class="badge {{'bg-success' if s.running else 'bg-danger'}} rounded-pill">
-      {{'● RUNNING' if s.running else '○ STOPPED'}}</span>
+    <span class="badge {{ 'bg-success' if s.running else 'bg-danger' }} rounded-pill">
+      {{ '● RUNNING' if s.running else '○ STOPPED' }}</span>
     <span class="badge bg-secondary rounded-pill">Phemex · 30m · 1×</span>
     <span class="badge bg-info text-dark rounded-pill">Paper Trading</span>
-    <small class="text-secondary ms-auto">auto-refresh 15s · {{s.last_check}}</small>
+    <small class="text-secondary ms-auto">refresh 15s · {{ s.last_check }}</small>
   </div>
 
-  <!-- Stats row -->
+  <!-- ── Stats ── -->
   {% set pc = 'bl' if p.position_side=='LONG' else ('bs' if p.position_side=='SHORT' else 'bf') %}
   {% set sc = 'bl' if s.signal=='LONG'        else ('bs' if s.signal=='SHORT'        else 'bf') %}
-  <div class="row g-2 mb-3">
 
+  <div class="row g-2 mb-3">
     <div class="col-6 col-sm-4 col-md-2">
       <div class="card p-3 text-center h-100">
         <div class="text-secondary small mb-1">Posição</div>
-        <span class="badge {{pc}} fs-6 rounded-pill">{{p.position_side}}</span>
+        <span class="badge {{ pc }} fs-6 rounded-pill">{{ p.position_side }}</span>
         {% if p.position_side != 'FLAT' %}
-        <div class="text-secondary mt-1" style="font-size:.65rem">
-          {{p.position_qty}} ETH @ ${{p.entry_price}}
+        <div class="text-secondary mt-1" style="font-size:.64rem">
+          {{ p.position_qty }} ETH @ ${{ p.entry_price }}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    <div class="col-6 col-sm-4 col-md-2">
+      <div class="card p-3 text-center h-100">
+        <div class="text-secondary small mb-1">Sinal</div>
+        <span class="badge {{ sc }} fs-6 rounded-pill">{{ s.signal }}</span>
+        <div class="text-secondary mt-1" style="font-size:.64rem">
+          EC {{ s.ec }} · EMA {{ s.ema }}
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-sm-4 col-md-2">
+      <div class="card p-3 text-center h-100">
+        <div class="text-secondary small mb-1">Saldo</div>
+        <div class="fw-bold mono">${{ p.balance }}</div>
+        <div class="text-secondary" style="font-size:.64rem">equity ${{ equity }}</div>
+      </div>
+    </div>
+    <div class="col-6 col-sm-4 col-md-2">
+      <div class="card p-3 text-center h-100">
+        <div class="text-secondary small mb-1">P&L Realizado</div>
+        <div class="fw-bold mono {{ 'bp' if p.realized_pnl >= 0 else 'bn' }}">
+          {{ '+' if p.realized_pnl >= 0 else '' }}${{ p.realized_pnl }}
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-sm-4 col-md-2">
+      <div class="card p-3 text-center h-100">
+        <div class="text-secondary small mb-1">P&L Não Real.</div>
+        <div class="fw-bold mono {{ 'bp' if unreal > 0 else ('bn' if unreal < 0 else 'bz') }}">
+          {{ '+' if unreal > 0 else '' }}${{ unreal }}
+        </div>
+        <div class="text-secondary" style="font-size:.64rem">preço ${{ price }}</div>
+      </div>
+    </div>
+    <div class="col-6 col-sm-4 col-md-2">
+      <div class="card p-3 text-center h-100 d-flex flex-column justify-content-center gap-2">
+        <button id="run-btn" class="btn btn-success btn-sm" onclick="runNow()">
+          ▶ Executar agora
+        </button>
+        <a href="/test-api" target="_blank" class="btn btn-outline-secondary btn-sm">
+          🔍 Test API
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3">
+
+    <!-- ── Histórico ── -->
+    <div class="col-lg-8">
+      <div class="card p-3">
+        <div class="d-flex align-items-center mb-3 gap-2 flex-wrap">
+          <h6 class="text-secondary mb-0">Histórico de Trades</h6>
+          <span class="badge bg-secondary">{{ trades | length }}</span>
+          <small class="text-secondary">feed: <strong>{{ s.active_feed }}</strong></small>
+        </div>
+
+        {% if trades %}
+        <div style="max-height:520px;overflow-y:auto">
+          <table class="table table-dark table-hover table-sm mb-0">
+            <thead>
+              <tr>
+                <th>Hora abertura</th>
+                <th>Lado</th>
+                <th>Entry $</th>
+                <th>Qty ETH</th>
+                <th>EC</th>
+                <th>EMA</th>
+                <th>Fechou $</th>
+                <th>P&L trade</th>
+                <th>P&L acum.</th>
+                <th>Saldo</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {# ── itera todas as trades sem pular nenhuma ── #}
+              {% for t in trades %}
+              {% set is_open   = (t.status == 'ABERTA') %}
+              {% set is_long   = (t.side == 'LONG') %}
+              {% set row_class = ('tr-open-long' if is_long else 'tr-open-short') if is_open else '' %}
+              <tr class="{{ row_class }}">
+                <td class="mono" style="font-size:.7rem">{{ t.time }}</td>
+                <td>
+                  <span class="badge {{ 'bl' if is_long else 'bs' }} rounded-pill">
+                    {{ t.side }}
+                  </span>
+                </td>
+                <td class="mono">${{ t.price }}</td>
+                <td class="mono">{{ t.qty }}</td>
+                <td class="mono">{{ t.ec }}</td>
+                <td class="mono">{{ t.ema }}</td>
+                <td class="mono">
+                  {% if t.close_price %}
+                    ${{ t.close_price }}
+                  {% else %}
+                    <span class="text-secondary">—</span>
+                  {% endif %}
+                </td>
+                <td class="mono">
+                  {% if t.pnl_trade is not none and t.pnl_trade != None %}
+                    <span class="{{ 'bp' if t.pnl_trade >= 0 else 'bn' }}">
+                      {{ '+' if t.pnl_trade >= 0 else '' }}${{ t.pnl_trade }}
+                    </span>
+                  {% else %}
+                    {% if is_open and price and t.price %}
+                      {% set upnl = ((price - t.price) * t.qty) if is_long else ((t.price - price) * t.qty) %}
+                      <span class="{{ 'bp' if upnl >= 0 else 'bn' }}">
+                        {{ '+' if upnl >= 0 else '' }}${{ "%.4f"|format(upnl) }}
+                        <small class="text-secondary">(aberta)</small>
+                      </span>
+                    {% else %}
+                      <span class="text-secondary">—</span>
+                    {% endif %}
+                  {% endif %}
+                </td>
+                <td class="mono {{ 'bp' if t.pnl_real >= 0 else 'bn' }}">
+                  {{ '+' if t.pnl_real >= 0 else '' }}${{ t.pnl_real }}
+                </td>
+                <td class="mono">${{ t.balance }}</td>
+                <td>
+                  {% if is_open %}
+                    <span class="badge bg-warning text-dark" style="font-size:.62rem">
+                      ● ABERTA
+                    </span>
+                  {% else %}
+                    <span class="badge bg-secondary" style="font-size:.62rem">fechada</span>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        {% else %}
+        <div class="text-center py-5">
+          <div class="mb-2" style="font-size:2.5rem">📊</div>
+          <div class="text-secondary mb-3">
+            Nenhuma trade ainda — o bot analisa a cada 30 minutos.
+          </div>
+          <button class="btn btn-success btn-sm me-2" onclick="runNow()">
+            ▶ Executar agora
+          </button>
+          <a href="/test-api" target="_blank" class="btn btn-outline-info btn-sm">
+            🔍 Verificar endpoints
+          </a>
         </div>
         {% endif %}
       </div>
     </div>
 
-    <div class="col-6 col-sm-4 col-md-2">
-      <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Sinal</div>
-        <span class="badge {{sc}} fs-6 rounded-pill">{{s.signal}}</span>
-        <div class="text-secondary mt-1" style="font-size:.65rem">
-          EC {{s.ec}} · EMA {{s.ema}}
-        </div>
-      </div>
-    </div>
-
-    <div class="col-6 col-sm-4 col-md-2">
-      <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">Saldo</div>
-        <div class="fw-bold mono">${{p.balance}}</div>
-        <div class="text-secondary" style="font-size:.65rem">equity ${{equity}}</div>
-      </div>
-    </div>
-
-    <div class="col-6 col-sm-4 col-md-2">
-      <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">P&L Realizado</div>
-        <div class="fw-bold mono {{'bp' if p.realized_pnl>=0 else 'bn'}}">
-          {{'+' if p.realized_pnl>=0 else ''}}${{p.realized_pnl}}
-        </div>
-      </div>
-    </div>
-
-    <div class="col-6 col-sm-4 col-md-2">
-      <div class="card p-3 text-center h-100">
-        <div class="text-secondary small mb-1">P&L Não Real.</div>
-        <div class="fw-bold mono {{'bp' if unreal>0 else ('bn' if unreal<0 else 'bz')}}">
-          {{'+' if unreal>0 else ''}}${{unreal}}
-        </div>
-        <div class="text-secondary" style="font-size:.65rem">preço ${{price}}</div>
-      </div>
-    </div>
-
-    <div class="col-6 col-sm-4 col-md-2">
-      <div class="card p-3 text-center h-100 d-flex flex-column justify-content-center gap-2">
-        <button id="run-btn" class="btn btn-success btn-sm w-100"
-                onclick="runNow()">▶ Executar agora</button>
-        <a href="/test-api" target="_blank"
-           class="btn btn-outline-secondary btn-sm w-100">🔍 Test API</a>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- Main content -->
-  <div class="row g-3">
-
-    <!-- Histórico -->
-    <div class="col-lg-8">
-      <div class="card p-3">
-        <div class="d-flex align-items-center mb-3 flex-wrap gap-2">
-          <h6 class="text-secondary mb-0">Histórico de Trades</h6>
-          <span class="badge bg-secondary">{{trades|length}}</span>
-          <small class="text-secondary">· feed: <strong>{{s.active_feed}}</strong></small>
-        </div>
-
-        <div style="max-height:520px; overflow-y:auto">
-        <table class="table table-dark table-hover table-sm mb-0">
-          <thead><tr>
-            <th>Hora (UTC)</th>
-            <th>Lado</th>
-            <th>Entry $</th>
-            <th>Qty ETH</th>
-            <th>EC</th>
-            <th>EMA</th>
-            <th>Fechou em $</th>
-            <th>P&L Real.</th>
-            <th>Saldo</th>
-            <th>Status</th>
-          </tr></thead>
-          <tbody>
-
-          {# Linha especial da posição aberta no topo #}
-          {% if p.position_side != 'FLAT' %}
-          <tr class="row-open {{'short' if p.position_side=='SHORT' else ''}}">
-            <td class="mono" style="font-size:.7rem">
-              {{trades[0].time if trades else '—'}}
-            </td>
-            <td>
-              <span class="badge {{pc}} rounded-pill">{{p.position_side}}</span>
-            </td>
-            <td class="mono">${{p.entry_price}}</td>
-            <td class="mono">{{p.position_qty}}</td>
-            <td class="mono">{{trades[0].ec if trades else s.ec}}</td>
-            <td class="mono">{{trades[0].ema if trades else s.ema}}</td>
-            <td class="mono text-secondary">em aberto</td>
-            <td class="mono {{'bp' if open_unreal>=0 else 'bn'}}">
-              {{'+' if open_unreal>=0 else ''}}${{open_unreal}}
-              <small class="text-secondary">(não real.)</small>
-            </td>
-            <td class="mono">${{p.balance}}</td>
-            <td>
-              <span class="badge bg-warning text-dark" style="font-size:.65rem">
-                ● ABERTA
-              </span>
-            </td>
-          </tr>
-          {% endif %}
-
-          {# Trades fechadas / anteriores #}
-          {% for t in trades %}
-          {% set is_open = t.get('open', False) if t is mapping else False %}
-          {% if not (loop.first and p.position_side != 'FLAT') %}
-          <tr>
-            <td class="mono" style="font-size:.7rem">{{t.time}}</td>
-            <td>
-              <span class="badge {{'bl' if t.side=='LONG' else 'bs'}} rounded-pill">
-                {{t.side}}
-              </span>
-            </td>
-            <td class="mono">${{t.price}}</td>
-            <td class="mono">{{t.qty}}</td>
-            <td class="mono">{{t.ec}}</td>
-            <td class="mono">{{t.ema}}</td>
-            <td class="mono">
-              {% if t.get('close_price') %}
-                ${{t.close_price}}
-              {% else %}
-                <span class="text-secondary">—</span>
-              {% endif %}
-            </td>
-            <td class="mono {{'bp' if t.pnl_real>=0 else 'bn'}}">
-              {{'+' if t.pnl_real>=0 else ''}}${{t.pnl_real}}
-            </td>
-            <td class="mono">${{t.balance}}</td>
-            <td>
-              {% if t.get('note') %}
-              <span class="badge bg-secondary" style="font-size:.62rem">
-                {{t.note}}
-              </span>
-              {% elif t.get('close_price') %}
-              <span class="badge bg-secondary" style="font-size:.62rem">fechada</span>
-              {% else %}
-              <span class="badge bg-secondary" style="font-size:.62rem">hist.</span>
-              {% endif %}
-            </td>
-          </tr>
-          {% endif %}
-          {% else %}
-
-          {# Sem trades nenhuma ainda #}
-          {% if p.position_side == 'FLAT' %}
-          <tr>
-            <td colspan="10" class="text-center text-secondary py-4">
-              Nenhuma trade ainda. Clique em "▶ Executar agora" para forçar análise.
-            </td>
-          </tr>
-          {% endif %}
-
-          {% endfor %}
-          </tbody>
-        </table>
-        </div>
-      </div>
-    </div>
-
-    <!-- Side -->
+    <!-- ── Side panel ── -->
     <div class="col-lg-4">
 
       <div class="card p-3 mb-3">
@@ -757,54 +737,64 @@ _HTML = """<!DOCTYPE html>
         <table class="table table-dark table-sm mb-0">
           <tr><td class="text-secondary">Lado</td>
               <td class="text-end">
-                <span class="badge {{pc}} rounded-pill">{{p.position_side}}</span>
+                <span class="badge {{ pc }} rounded-pill">{{ p.position_side }}</span>
               </td></tr>
           <tr><td class="text-secondary">Qty</td>
-              <td class="text-end mono">{{p.position_qty}} ETH</td></tr>
+              <td class="text-end mono">{{ p.position_qty }} ETH</td></tr>
           <tr><td class="text-secondary">Entry</td>
-              <td class="text-end mono">${{p.entry_price}}</td></tr>
+              <td class="text-end mono">${{ p.entry_price }}</td></tr>
           <tr><td class="text-secondary">Preço atual</td>
-              <td class="text-end mono">${{price}}</td></tr>
+              <td class="text-end mono">${{ price }}</td></tr>
           <tr><td class="text-secondary">P&L não real.</td>
-              <td class="text-end mono {{'bp' if unreal>0 else ('bn' if unreal<0 else 'bz')}}">
-                {{'+' if unreal>0 else ''}}${{unreal}}</td></tr>
+              <td class="text-end mono {{ 'bp' if unreal > 0 else ('bn' if unreal < 0 else 'bz') }}">
+                {{ '+' if unreal > 0 else '' }}${{ unreal }}
+              </td></tr>
           <tr><td class="text-secondary">P&L realizado</td>
-              <td class="text-end mono {{'bp' if p.realized_pnl>=0 else 'bn'}}">
-                {{'+' if p.realized_pnl>=0 else ''}}${{p.realized_pnl}}</td></tr>
+              <td class="text-end mono {{ 'bp' if p.realized_pnl >= 0 else 'bn' }}">
+                {{ '+' if p.realized_pnl >= 0 else '' }}${{ p.realized_pnl }}
+              </td></tr>
           <tr><td class="text-secondary">Saldo livre</td>
-              <td class="text-end mono">${{p.balance}}</td></tr>
-          <tr><td class="text-secondary">Equity</td>
-              <td class="text-end mono fw-bold">${{equity}}</td></tr>
+              <td class="text-end mono">${{ p.balance }}</td></tr>
+          <tr><td class="text-secondary fw-bold">Equity</td>
+              <td class="text-end mono fw-bold">${{ equity }}</td></tr>
         </table>
       </div>
 
       <div class="card p-3 mb-3">
         <h6 class="text-secondary mb-2">Keepalive (8s · 15s · 23s)</h6>
-        {% for k in ka %}<div class="ka">{{k}}</div>
-        {% else %}<div class="text-secondary small">Iniciando...</div>{% endfor %}
+        {% for k in ka %}
+          <div class="ka">{{ k }}</div>
+        {% else %}
+          <div class="text-secondary small">Iniciando...</div>
+        {% endfor %}
       </div>
 
-      {% if s.errors %}
       <div class="card p-3 mb-3">
-        <h6 class="text-danger mb-2">Erros recentes</h6>
-        {% for e in s.errors %}<div class="er">[{{e.time}}] {{e.msg}}</div>{% endfor %}
-      </div>{% endif %}
-
-      <div class="card p-3">
         <h6 class="text-secondary mb-2">Ações</h6>
         <div class="d-flex flex-column gap-2">
           <button class="btn btn-success btn-sm" onclick="runNow()">
             ▶ Executar estratégia agora
           </button>
-          <a href="/test-api" target="_blank" class="btn btn-outline-secondary btn-sm">
+          <a href="/test-api" target="_blank"
+             class="btn btn-outline-secondary btn-sm">
             🔍 Testar endpoints API
           </a>
           <button class="btn btn-outline-danger btn-sm"
-                  onclick="if(confirm('Zerar tudo?')) resetBot()">
-            ⚠ Reset (zera saldo e trades)
+                  onclick="if(confirm('Zerar tudo? Saldo volta a $1000')) resetBot()">
+            ⚠ Reset total
           </button>
         </div>
       </div>
+
+      {% if s.errors %}
+      <div class="card p-3">
+        <h6 class="text-danger mb-2">Erros recentes</h6>
+        {% for e in s.errors %}
+          <div class="er">[{{ e.time }}] {{ e.msg }}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
     </div>
   </div>
 </div>
@@ -813,7 +803,7 @@ _HTML = """<!DOCTYPE html>
 function runNow() {
   const btn = document.getElementById('run-btn');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Executando...'; }
-  fetch('/run-now', {method:'POST'})
+  fetch('/run-now', { method: 'POST' })
     .then(r => r.json())
     .then(d => {
       if (btn) btn.textContent = '✓ ' + (d.action || d.status);
@@ -822,13 +812,11 @@ function runNow() {
     .catch(() => setTimeout(() => location.reload(), 2000));
 }
 function resetBot() {
-  fetch('/reset', {method:'POST'})
-    .then(() => location.reload());
+  fetch('/reset', { method: 'POST' }).then(() => location.reload());
 }
 </script>
 </body>
 </html>"""
-
 
 # ─────────────────────────────────────────────────────────────
 # STARTUP
