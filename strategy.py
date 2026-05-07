@@ -1,80 +1,106 @@
-"""
-Adaptive Zero Lag EMA Strategy (Python port of Pine Script v3 original)
-Uses scipy bounded minimization to find best gain — equivalent to the
-exhaustive ±GainLimit search in steps of 0.1 but runs in ~ms instead of seconds.
-"""
-
-import os
 import numpy as np
-from scipy.optimize import minimize_scalar
+import logging
 
-PERIOD    = int(os.environ.get("PERIOD",     "20"))
-GAIN_LIM  = float(os.environ.get("GAIN_LIMIT", "50.0"))  # ±50 → ±5.0 in 0.1 steps
-THRESHOLD = float(os.environ.get("THRESHOLD",  "0.0"))
+logger = logging.getLogger(__name__)
+
+PI = np.pi
+IFM_RANGE   = 50
+GAIN_LIMIT  = 900
+THRESHOLD   = 0.0
+DEF_PERIOD  = 20
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── Cosine IFM ────────────────────────────────────────────────────────────────
+def cos_ifm(closes: np.ndarray) -> np.ndarray:
+    n       = len(closes)
+    v1      = np.zeros(n)
+    s2      = np.zeros(n)
+    s3      = np.zeros(n)
+    v2      = np.zeros(n)
+    delta   = np.zeros(n)
+    len_c   = np.zeros(n)
 
-def _ema(closes: np.ndarray, alpha: float) -> np.ndarray:
-    n   = len(closes)
-    out = np.empty(n)
-    out[0] = closes[0]
+    for i in range(7, n):
+        v1[i] = closes[i] - closes[i - 7]
+    for i in range(8, n):
+        s2[i] = 0.2 * (v1[i-1] + v1[i])**2 + 0.8 * s2[i-1]
+        s3[i] = 0.2 * (v1[i-1] - v1[i])**2 + 0.8 * s3[i-1]
+        if s2[i] != 0:
+            v2[i] = np.sqrt(s3[i] / s2[i])
+        if s3[i] != 0:
+            delta[i] = 2.0 * np.arctan(v2[i])
+
+    prev = 0.0
+    for i in range(IFM_RANGE + 1, n):
+        v4, inst = 0.0, 0.0
+        for j in range(IFM_RANGE + 1):
+            if i - j >= 0:
+                v4 += delta[i - j]
+            if v4 > 2 * PI and inst == 0.0:
+                inst = float(j - 1)
+                break
+        if inst == 0.0:
+            inst = prev
+        else:
+            prev = inst
+        len_c[i] = 0.25 * inst + 0.75 * len_c[i - 1]
+    return len_c
+
+
+# ── Zero Lag EMA ──────────────────────────────────────────────────────────────
+def zlema(closes: np.ndarray, period: int) -> tuple:
+    n     = len(closes)
+    alpha = 2.0 / (period + 1)
+    ema   = np.zeros(n)
+    ec    = np.zeros(n)
+    lerr  = np.zeros(n)
+    gains = np.arange(-GAIN_LIMIT, GAIN_LIMIT + 1, dtype=np.float64) / 10.0
+
     for i in range(1, n):
-        out[i] = alpha * closes[i] + (1.0 - alpha) * out[i - 1]
-    return out
+        ema[i]   = alpha * closes[i] + (1.0 - alpha) * ema[i - 1]
+        prev_ec  = ec[i - 1]
+        trials   = alpha * (ema[i] + gains * (closes[i] - prev_ec)) + (1.0 - alpha) * prev_ec
+        errors   = np.abs(closes[i] - trials)
+        best_idx = int(np.argmin(errors))
+        ec[i]    = trials[best_idx]
+        lerr[i]  = errors[best_idx]
+
+    return ema, ec, lerr
 
 
-def _ec(closes: np.ndarray, ema: np.ndarray, alpha: float, gain: float) -> np.ndarray:
-    n   = len(closes)
-    out = np.empty(n)
-    out[0] = closes[0]
-    for i in range(1, n):
-        out[i] = (alpha * (ema[i] + gain * (closes[i] - out[i - 1]))
-                  + (1.0 - alpha) * out[i - 1])
-    return out
-
-
-# ── public API ────────────────────────────────────────────────────────────────
-
-def calculate_signal(closes: list, period: int = None,
-                     gain_limit: float = None, threshold: float = None):
+# ── Main strategy entry point ─────────────────────────────────────────────────
+def calculate(closes: list) -> dict:
     """
-    Returns (signal, ema_last, ec_last, least_error)
-    signal: 'LONG' | 'SHORT' | 'FLAT'
+    Receives list of closed-candle closes (30 m).
+    Returns { signal: 'LONG'|'SHORT'|None, ema, ec, period, least_error }
+    EC > EMA  →  LONG   (trade every candle)
+    EC < EMA  →  SHORT
     """
-    period    = period    or PERIOD
-    gain_limit= gain_limit or GAIN_LIM
-    threshold = threshold if threshold is not None else THRESHOLD
+    if len(closes) < 60:
+        return {"signal": None, "ema": None, "ec": None, "period": DEF_PERIOD}
 
-    arr = np.array(closes, dtype=np.float64)
-    n   = len(arr)
-    if n < max(period * 2, 20):
-        return "FLAT", 0.0, 0.0, 0.0
+    arr    = np.array(closes, dtype=np.float64)
+    lc     = cos_ifm(arr)
+    period = int(round(lc[-1])) if lc[-1] > 0 else DEF_PERIOD
+    period = max(2, period)
 
-    alpha = 2.0 / (period + 1.0)
-    ema   = _ema(arr, alpha)
+    ema, ec, lerr = zlema(arr, period)
 
-    # Find gain that minimises |close[-1] - EC[-1]|
-    def error(gain):
-        ec = _ec(arr, ema, alpha, gain)
-        return abs(arr[-1] - ec[-1])
+    last_ema  = float(ema[-1])
+    last_ec   = float(ec[-1])
+    last_err  = float(lerr[-1])
+    last_src  = float(arr[-1])
 
-    res        = minimize_scalar(error, bounds=(-gain_limit, gain_limit),
-                                 method="bounded",
-                                 options={"xatol": 0.05})
-    best_gain  = res.x
-    least_err  = res.fun
+    threshold_ok = (100.0 * last_err / last_src > THRESHOLD) if last_src else False
 
-    ec_arr     = _ec(arr, ema, alpha, best_gain)
-    ema_last   = float(ema[-1])
-    ec_last    = float(ec_arr[-1])
+    if not threshold_ok:
+        signal = None
+    elif last_ec > last_ema:
+        signal = "LONG"
+    elif last_ec < last_ema:
+        signal = "SHORT"
+    else:
+        signal = None
 
-    # Threshold check  (same as Pine: 100*LeastError/src > Threshold)
-    if arr[-1] > 0 and (100.0 * least_err / arr[-1]) <= threshold:
-        return "FLAT", ema_last, ec_last, least_err
-
-    if ec_last > ema_last:
-        return "LONG",  ema_last, ec_last, least_err
-    if ec_last < ema_last:
-        return "SHORT", ema_last, ec_last, least_err
-    return "FLAT", ema_last, ec_last, least_err
+    logger.info(f"[STRATEGY] period={period} ema={last_ema:.4f} ec={last_ec:.4f} signal={signal}")
+    return {"signal": signal, "ema": last_ema, "ec": last_ec, "period": period, "least_error": last_err}
