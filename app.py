@@ -1,87 +1,114 @@
-import os, time, threading, logging
+import os, time, threading, logging, requests as req
 from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 import ccxt
 import strategy as strat
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PREFERRED_SYMBOLS = [
-    "ETH/USDT:USDT",
-    "ETH/USD:ETH",
-    "ETHUSDT",
-    "ETHUSD",
-]
-TIMEFRAMES_TRY = ["30m", "30min", "1800"]
-RISK           = 0.01
-FIXED_SL       = 2000
-MAX_LOTS       = 100
-LEVERAGE       = 1
-CANDLES        = 300
-PORT           = int(os.environ.get("PORT", 10000))
+TESTNET_BASE = "https://testnet-api.phemex.com"
+RESOLUTION   = 1800          # 30 minutes in seconds
+RISK         = 0.01
+FIXED_SL     = 2000
+MAX_LOTS     = 100
+LEVERAGE     = 1
+CANDLES      = 300
+PORT         = int(os.environ.get("PORT", 10000))
 
-# ── Exchange ──────────────────────────────────────────────────────────────────
-def make_exchange():
-    ex = ccxt.phemex({
-        "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
-        "secret": os.environ.get("PHEMEX_API_SECRET", ""),
-        "options": {"defaultType": "swap"},
-        "enableRateLimit": True,
-    })
-    ex.set_sandbox_mode(True)
-    return ex
-
-exchange = make_exchange()
+# ── Exchange (ccxt — used only for orders / balance / positions) ──────────────
+exchange = ccxt.phemex({
+    "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
+    "secret": os.environ.get("PHEMEX_API_SECRET", ""),
+    "options": {"defaultType": "swap"},
+    "enableRateLimit": True,
+})
+exchange.set_sandbox_mode(True)
 
 # resolved at first start
-SYMBOL = None
-TF     = None
+SYMBOL      = None   # ccxt unified symbol   e.g. "ETH/USDT:USDT"
+SYMBOL_ID   = None   # raw Phemex symbol id  e.g. "ETHUSDT"
+PRICE_SCALE = None   # divisor for raw API prices
 
-def resolve_symbol_and_tf():
-    global SYMBOL, TF
-    try:
-        markets = exchange.load_markets()
-        logger.info(f"[INIT] {len(markets)} markets loaded from testnet")
+# ── Market init ───────────────────────────────────────────────────────────────
+def init_markets():
+    global SYMBOL, SYMBOL_ID, PRICE_SCALE
+    markets = exchange.load_markets()
+    logger.info(f"[INIT] {len(markets)} markets loaded")
 
-        for sym in PREFERRED_SYMBOLS:
-            if sym in markets:
-                SYMBOL = sym
-                logger.info(f"[INIT] Symbol → {SYMBOL}")
+    for sym in ["ETH/USDT:USDT", "ETH/USD:ETH", "ETHUSDT", "ETHUSD"]:
+        if sym in markets:
+            SYMBOL = sym
+            break
+    if not SYMBOL:
+        for k, v in markets.items():
+            if "ETH" in k and v.get("type") in ("swap", "future"):
+                SYMBOL = k
                 break
+    if not SYMBOL:
+        raise RuntimeError("No ETH perpetual market found on testnet")
 
-        if not SYMBOL:
-            for k, v in markets.items():
-                if "ETH" in k and v.get("type") in ("swap", "future"):
-                    SYMBOL = k
-                    logger.info(f"[INIT] Symbol fallback → {SYMBOL}")
-                    break
+    SYMBOL_ID = exchange.market_id(SYMBOL)
+    info      = markets[SYMBOL].get("info", {})
+    scale_exp = int(info.get("priceScale", 4))
+    PRICE_SCALE = 10 ** scale_exp
+    logger.info(f"[INIT] symbol={SYMBOL} id={SYMBOL_ID} priceScale=10^{scale_exp}={PRICE_SCALE}")
 
-        if not SYMBOL:
-            logger.error("[INIT] No ETH perpetual found on testnet")
-            return False
-
-        for tf in TIMEFRAMES_TRY:
-            try:
-                test = exchange.fetch_ohlcv(SYMBOL, tf, limit=3)
-                if test:
-                    TF = tf
-                    logger.info(f"[INIT] Timeframe → {TF}")
-                    break
-            except Exception as e:
-                logger.warning(f"[INIT] TF {tf} failed: {e}")
-
-        if not TF:
-            logger.error("[INIT] No working timeframe found")
-            return False
-
-        return True
+# ── Direct OHLCV fetch (bypasses ccxt endpoint problem) ──────────────────────
+def fetch_candles(limit: int = CANDLES) -> list:
+    """
+    Fetches 30-min OHLCV from Phemex testnet via raw HTTP.
+    Tries USDT-linear endpoint first, then inverse endpoint.
+    Returns list of [timestamp_ms, open, high, low, close, volume].
+    """
+    # ── Attempt 1: USDT linear perpetual  /md/v2/kline/list ─────────────────
+    try:
+        url = f"{TESTNET_BASE}/md/v2/kline/list"
+        r   = req.get(url, params={"symbol": SYMBOL_ID, "resolution": RESOLUTION, "limit": limit}, timeout=10)
+        d   = r.json()
+        rows = d.get("result", {}).get("rows") or d.get("data", {}).get("rows") or []
+        if rows:
+            candles = [[row[0] * 1000,
+                        row[2] / PRICE_SCALE,
+                        row[3] / PRICE_SCALE,
+                        row[4] / PRICE_SCALE,
+                        row[5] / PRICE_SCALE,
+                        row[6]] for row in rows]
+            logger.debug(f"[OHLCV] v2 OK — {len(candles)} candles")
+            return candles
     except Exception as e:
-        logger.error(f"[INIT] {e}")
-        return False
+        logger.warning(f"[OHLCV] v2 failed: {e}")
+
+    # ── Attempt 2: inverse perpetual  /md/kline ───────────────────────────────
+    try:
+        url = f"{TESTNET_BASE}/md/kline"
+        r   = req.get(url, params={"symbol": SYMBOL_ID, "resolution": RESOLUTION, "limit": limit}, timeout=10)
+        d   = r.json()
+        rows = d.get("data", {}).get("klines") or d.get("result", {}).get("rows") or []
+        if rows:
+            candles = [[row[0] * 1000,
+                        row[2] / PRICE_SCALE,
+                        row[3] / PRICE_SCALE,
+                        row[4] / PRICE_SCALE,
+                        row[5] / PRICE_SCALE,
+                        row[6]] for row in rows]
+            logger.debug(f"[OHLCV] v1 OK — {len(candles)} candles")
+            return candles
+    except Exception as e:
+        logger.warning(f"[OHLCV] v1 failed: {e}")
+
+    # ── Attempt 3: ccxt fallback ──────────────────────────────────────────────
+    try:
+        raw = exchange.fetch_ohlcv(SYMBOL, "30m", limit=limit)
+        if raw:
+            logger.debug(f"[OHLCV] ccxt fallback OK — {len(raw)} candles")
+            return raw
+    except Exception as e:
+        logger.warning(f"[OHLCV] ccxt fallback failed: {e}")
+
+    return []
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
@@ -98,7 +125,7 @@ state = {
 trade_history    = []
 _strategy_thread = None
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Trading helpers ───────────────────────────────────────────────────────────
 def get_position() -> str:
     try:
         for p in exchange.fetch_positions([SYMBOL]):
@@ -160,24 +187,26 @@ def close_pos(side: str):
 def strategy_loop():
     global state, trade_history
 
-    if not SYMBOL or not TF:
-        if not resolve_symbol_and_tf():
-            state["status"]  = "Error: symbol/TF not found on testnet"
-            state["running"] = False
-            return
+    try:
+        init_markets()
+    except Exception as e:
+        state["status"]  = f"Error: {e}"
+        state["running"] = False
+        return
 
     last_candle_ts = None
 
     while state["running"]:
         try:
-            ohlcv = exchange.fetch_ohlcv(SYMBOL, TF, limit=CANDLES)
+            ohlcv = fetch_candles()
 
             if not ohlcv or len(ohlcv) < 70:
-                logger.warning("[LOOP] Not enough candles")
+                logger.warning(f"[LOOP] Only {len(ohlcv)} candles — waiting")
                 time.sleep(20)
                 continue
 
-            last_closed = ohlcv[-2]          # last CLOSED candle
+            # Last CLOSED candle = ohlcv[-2]
+            last_closed = ohlcv[-2]
             candle_ts   = last_closed[0]
             candle_str  = datetime.fromtimestamp(
                 candle_ts / 1000, tz=timezone.utc
@@ -188,7 +217,7 @@ def strategy_loop():
                 continue
 
             last_candle_ts = candle_ts
-            closes = [c[4] for c in ohlcv[:-1]]
+            closes = [c[4] for c in ohlcv[:-1]]   # all closed candle closes
 
             result = strat.calculate(closes)
             signal = result["signal"]
@@ -261,9 +290,8 @@ def strategy_loop():
 
     state["status"] = "Stopped"
 
-# ── Keepalive (3 internal signals) ───────────────────────────────────────────
+# ── Keepalive — 3 internal signals ───────────────────────────────────────────
 def keepalive(interval: int, name: str):
-    import requests as req
     time.sleep(12)
     while True:
         try:
@@ -299,11 +327,11 @@ button{padding:10px 28px;border:none;border-radius:8px;font-size:.93rem;font-wei
 button:disabled{opacity:.35;cursor:not-allowed}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:26px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px 18px}
-.label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.lbl{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
 .val{font-size:1.2rem;font-weight:600}
 .long{color:#3fb950}.short{color:#f85149}
-.running{color:#3fb950}.stopped{color:#8b949e}.err{color:#e3b341;font-size:.85rem;word-break:break-all}
-.section-title{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px}
+.running{color:#3fb950}.stopped{color:#8b949e}.err{color:#e3b341;font-size:.82rem;word-break:break-all}
+.st{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px}
 table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:10px;overflow:hidden}
 th{background:#21262d;color:#8b949e;font-size:.75rem;text-transform:uppercase;padding:11px 14px;text-align:left}
 td{padding:10px 14px;font-size:.86rem;border-top:1px solid #21262d}
@@ -325,16 +353,16 @@ footer{text-align:center;color:#484f58;font-size:.75rem;margin:36px 0 18px}
     <button id="btn-stop"  onclick="ctrl('stop')" disabled>⏹ Stop Strategy</button>
   </div>
   <div class="cards">
-    <div class="card"><div class="label">Status</div><div class="val" id="c-status">—</div></div>
-    <div class="card"><div class="label">Signal</div><div class="val" id="c-signal">—</div></div>
-    <div class="card"><div class="label">Position</div><div class="val" id="c-pos">—</div></div>
-    <div class="card"><div class="label">EMA</div><div class="val" id="c-ema">—</div></div>
-    <div class="card"><div class="label">EC</div><div class="val" id="c-ec">—</div></div>
-    <div class="card"><div class="label">Period</div><div class="val" id="c-period">—</div></div>
-    <div class="card"><div class="label">Last Candle</div><div class="val" style="font-size:.88rem" id="c-candle">—</div></div>
-    <div class="card"><div class="label">Updated</div><div class="val" style="font-size:.82rem" id="c-upd">—</div></div>
+    <div class="card"><div class="lbl">Status</div><div class="val" id="c-status">—</div></div>
+    <div class="card"><div class="lbl">Signal</div><div class="val" id="c-signal">—</div></div>
+    <div class="card"><div class="lbl">Position</div><div class="val" id="c-pos">—</div></div>
+    <div class="card"><div class="lbl">EMA</div><div class="val" id="c-ema">—</div></div>
+    <div class="card"><div class="lbl">EC</div><div class="val" id="c-ec">—</div></div>
+    <div class="card"><div class="lbl">Period</div><div class="val" id="c-period">—</div></div>
+    <div class="card"><div class="lbl">Last Candle</div><div class="val" style="font-size:.88rem" id="c-candle">—</div></div>
+    <div class="card"><div class="lbl">Updated</div><div class="val" style="font-size:.82rem" id="c-upd">—</div></div>
   </div>
-  <div class="section-title">Trade History</div>
+  <div class="st">Trade History</div>
   <table>
     <thead><tr><th>Time</th><th>Candle</th><th>Side</th><th>Price</th><th>Qty</th><th>Order ID</th></tr></thead>
     <tbody id="tbody"><tr><td colspan="6" style="text-align:center;color:#484f58;padding:22px">No trades yet</td></tr></tbody>
@@ -350,13 +378,11 @@ setInterval(tick,1000);tick();
 function toast(msg,ok){const e=document.getElementById('toast');
   e.textContent=msg;e.style.background=ok?'#238636':'#da3633';
   e.style.display='block';setTimeout(()=>e.style.display='none',3000)}
-async function ctrl(a){const r=await fetch('/'+a,{method:'POST'});
-  const d=await r.json();toast(d.message,d.ok);fetchAll()}
+async function ctrl(a){const r=await fetch('/'+a,{method:'POST'});const d=await r.json();toast(d.message,d.ok);fetchAll()}
 async function fetchAll(){
   const[sr,hr]=await Promise.all([fetch('/status'),fetch('/history')]);
-  const s=await sr.json(),trades=await hr.json();
-  const sv=document.getElementById('c-status');
-  sv.textContent=s.status;
+  const s=await sr.json(),t=await hr.json();
+  const sv=document.getElementById('c-status');sv.textContent=s.status;
   sv.className='val '+(s.status==='Running'?'running':s.status.startsWith('Error')||s.status.startsWith('Warning')?'err':'stopped');
   const sg=document.getElementById('c-signal');sg.textContent=s.signal;
   sg.className='val '+(s.signal==='LONG'?'long':s.signal==='SHORT'?'short':'');
@@ -368,11 +394,11 @@ async function fetchAll(){
   document.getElementById('btn-start').disabled=s.running;
   document.getElementById('btn-stop').disabled=!s.running;
   const tb=document.getElementById('tbody');
-  tb.innerHTML=trades.length?trades.map(t=>`<tr>
-    <td>${t.time}</td><td>${t.candle}</td>
-    <td><span class="badge ${t.side.toLowerCase()}">${t.side}</span></td>
-    <td>${Number(t.price).toFixed(2)}</td><td>${t.qty}</td>
-    <td style="font-size:.74rem;color:#8b949e">${t.order_id}</td></tr>`).join('')
+  tb.innerHTML=t.length?t.map(r=>`<tr>
+    <td>${r.time}</td><td>${r.candle}</td>
+    <td><span class="badge ${r.side.toLowerCase()}">${r.side}</span></td>
+    <td>${Number(r.price).toFixed(2)}</td><td>${r.qty}</td>
+    <td style="font-size:.74rem;color:#8b949e">${r.order_id}</td></tr>`).join('')
     :'<tr><td colspan="6" style="text-align:center;color:#484f58;padding:22px">No trades yet</td></tr>'}
 fetchAll();setInterval(fetchAll,10000);
 </script>
