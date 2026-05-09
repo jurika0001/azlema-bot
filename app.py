@@ -10,23 +10,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-LIVE_BASE    = "https://api.phemex.com"
-TESTNET_BASE = "https://testnet-api.phemex.com"
-RESOLUTION   = 1800   # 30 min in seconds
-RISK         = 0.01
-FIXED_SL     = 2000
-MAX_LOTS     = 100
-LEVERAGE     = 1
-CANDLES      = 300
-PORT         = int(os.environ.get("PORT", 10000))
+RISK     = 0.01
+FIXED_SL = 2000
+MAX_LOTS = 100
+LEVERAGE = 1
+CANDLES  = 300
+PORT     = int(os.environ.get("PORT", 10000))
 
-# ── Exchange for OHLCV — LIVE Phemex, no auth, no sandbox ─────────────────────
+# ── live_ex  : Phemex live, no auth — used ONLY for OHLCV ─────────────────────
+# ── paper_ex : Phemex testnet, with auth — used for orders/balance/positions ──
 live_ex = ccxt.phemex({
     "options": {"defaultType": "swap"},
     "enableRateLimit": True,
 })
-
-# ── Exchange for orders — TESTNET Phemex, paper trading ───────────────────────
 paper_ex = ccxt.phemex({
     "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
     "secret": os.environ.get("PHEMEX_API_SECRET", ""),
@@ -35,135 +31,37 @@ paper_ex = ccxt.phemex({
 })
 paper_ex.set_sandbox_mode(True)
 
-SYMBOL    = None   # unified ccxt e.g. "ETH/USDT:USDT"
-SYMBOL_ID = None   # raw Phemex  e.g. "ETHUSDT"
+SYMBOL = None   # resolved at first start, e.g. "ETH/USDT:USDT"
 
 def init_markets():
-    global SYMBOL, SYMBOL_ID
-    # Load markets from both exchanges
-    live_markets  = live_ex.load_markets()
-    paper_markets = paper_ex.load_markets()
-    logger.info(f"[INIT] live={len(live_markets)} markets  "
-                f"testnet={len(paper_markets)} markets")
+    global SYMBOL
+    live_mkts  = live_ex.load_markets()
+    paper_mkts = paper_ex.load_markets()
+    logger.info(f"[INIT] live={len(live_mkts)}  testnet={len(paper_mkts)} markets")
 
-    for sym in ["ETH/USDT:USDT", "ETH/USD:ETH", "ETHUSDT", "ETHUSD"]:
-        if sym in live_markets:
+    for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
+        if sym in live_mkts:
             SYMBOL = sym
             break
     if not SYMBOL:
-        for k, v in live_markets.items():
+        for k, v in live_mkts.items():
             if "ETH" in k and v.get("type") in ("swap", "future"):
                 SYMBOL = k
                 break
     if not SYMBOL:
-        raise RuntimeError("No ETH perpetual market found on Phemex live")
+        raise RuntimeError("No ETH perpetual found on Phemex live")
+    logger.info(f"[INIT] symbol={SYMBOL}")
 
-    SYMBOL_ID = live_ex.market_id(SYMBOL)
-    logger.info(f"[INIT] symbol={SYMBOL}  id={SYMBOL_ID}")
-
-# ── OHLCV via ccxt live — correct params handled by ccxt ──────────────────────
+# ── OHLCV — ccxt live (confirmed working) ─────────────────────────────────────
 def fetch_candles(limit: int = CANDLES) -> list:
-    """
-    Attempt order:
-    1. ccxt live  fetch_ohlcv  (unified, correct params)
-    2. direct HTTP /md/v2/kline/list  limit-only
-    3. direct HTTP /md/kline          limit-only  (inverse fallback)
-    """
-    sym = SYMBOL or "ETH/USDT:USDT"
-
-    # ── 1. ccxt live ───────────────────────────────────────────────────────────
     try:
-        rows = live_ex.fetch_ohlcv(sym, "30m", limit=limit)
+        rows = live_ex.fetch_ohlcv(SYMBOL, "30m", limit=limit)
         if rows and len(rows) >= 70:
-            logger.info(f"[OHLCV] ccxt-live OK — {len(rows)} candles "
-                        f"last={rows[-1][4]:.2f}")
+            logger.info(f"[OHLCV] {len(rows)} candles  last_close={rows[-1][4]:.2f}")
             return rows
+        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles returned")
     except Exception as e:
-        logger.warning(f"[OHLCV] ccxt-live failed: {e}")
-
-    # ── 2. direct HTTP — limit only, no from/to ────────────────────────────────
-    sym_id  = SYMBOL_ID or "ETHUSDT"
-    sym_inv = sym_id.replace("USDT", "USD")   # e.g. ETHUSD for inverse fallback
-
-    for url, s_id in [
-        (f"{LIVE_BASE}/md/v2/kline/list", sym_id),
-        (f"{LIVE_BASE}/md/kline",          sym_id),
-        (f"{LIVE_BASE}/md/kline",          sym_inv),
-    ]:
-        try:
-            params = {"symbol": s_id, "resolution": RESOLUTION, "limit": limit}
-            r      = req.get(url, params=params, timeout=10)
-            logger.info(f"[OHLCV] HTTP {url} {s_id} "
-                        f"status={r.status_code} body={r.text[:100]}")
-            d = r.json()
-            if not isinstance(d, dict):
-                continue
-            # Dig for rows list
-            rows = (d.get("result") or {}).get("rows") or \
-                   (d.get("data")   or {}).get("klines") or []
-            if not isinstance(rows, list) or len(rows) < 70:
-                continue
-            # Auto-scale prices (Phemex multiplies by 10^priceScale)
-            candles = []
-            for row in rows:
-                close_raw = float(row[5])
-                scale     = 1.0
-                while close_raw > 1_000_000:
-                    close_raw /= 10.0
-                    scale     *= 10.0
-                candles.append([
-                    int(row[0]) * 1000,
-                    float(row[2]) / scale,
-                    float(row[3]) / scale,
-                    float(row[4]) / scale,
-                    float(row[5]) / scale,
-                    float(row[6]),
-                ])
-            if len(candles) >= 70:
-                logger.info(f"[OHLCV] HTTP OK {url} {s_id} "
-                            f"— {len(candles)} candles "
-                            f"last={candles[-1][4]:.2f}")
-                return candles
-        except Exception as e:
-            logger.warning(f"[OHLCV] HTTP {url} failed: {e}")
-
-    # ── 3. aligned from+to fallback ────────────────────────────────────────────
-    now     = int(time_mod.time())
-    from_ts = (now - limit * RESOLUTION) // RESOLUTION * RESOLUTION  # aligned
-    to_ts   = now // RESOLUTION * RESOLUTION
-
-    for url, s_id, keys in [
-        (f"{LIVE_BASE}/md/v2/kline/list", sym_id,  ["result", "rows"]),
-        (f"{LIVE_BASE}/md/kline",          sym_inv, ["data",   "klines"]),
-    ]:
-        try:
-            params = {"symbol": s_id, "resolution": RESOLUTION,
-                      "from": from_ts, "to": to_ts}
-            r      = req.get(url, params=params, timeout=10)
-            logger.info(f"[OHLCV] aligned {url} {s_id} "
-                        f"status={r.status_code} body={r.text[:100]}")
-            d    = r.json()
-            node = d
-            for k in keys:
-                node = node.get(k) if isinstance(node, dict) else None
-                if node is None:
-                    break
-            if isinstance(node, list) and len(node) >= 70:
-                candles = []
-                for row in node:
-                    c = float(row[5])
-                    sc = 1.0
-                    while c > 1_000_000:
-                        c /= 10.0; sc *= 10.0
-                    candles.append([int(row[0])*1000,
-                                    float(row[2])/sc, float(row[3])/sc,
-                                    float(row[4])/sc, float(row[5])/sc,
-                                    float(row[6])])
-                if len(candles) >= 70:
-                    return candles
-        except Exception as e:
-            logger.warning(f"[OHLCV] aligned fallback failed: {e}")
-
+        logger.error(f"[OHLCV] {e}")
     return []
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -254,7 +152,7 @@ def strategy_loop():
                 time_mod.sleep(20)
                 continue
 
-            last_closed = ohlcv[-2]
+            last_closed = ohlcv[-2]          # last CLOSED candle
             candle_ts   = last_closed[0]
             candle_str  = datetime.fromtimestamp(
                 candle_ts / 1000, tz=timezone.utc
@@ -387,7 +285,6 @@ tr:hover td{background:#1c2128}
 #toast{position:fixed;bottom:22px;right:22px;padding:11px 20px;border-radius:8px;
        font-size:.88rem;display:none;z-index:99;color:#fff}
 footer{text-align:center;color:#484f58;font-size:.75rem;margin:36px 0 18px}
-a{color:#58a6ff;text-decoration:none}
 </style>
 </head>
 <body>
@@ -425,9 +322,7 @@ a{color:#58a6ff;text-decoration:none}
   </table>
 </div>
 <div id="toast"></div>
-<footer>AZLEMA · Phemex Paper Testnet · 30 m · ETH/USDT · 1× Leverage
-  &nbsp;·&nbsp;<a href="/debug" target="_blank">Debug</a>
-</footer>
+<footer>AZLEMA · Phemex Paper Testnet · 30 m · ETH/USDT · 1× Leverage</footer>
 <script>
 function p(n){return String(n).padStart(2,'0')}
 function tick(){const d=new Date();document.getElementById('clock').textContent=
@@ -503,56 +398,6 @@ def stop():
         return jsonify({"ok": False, "message": "Already stopped"})
     state["running"] = False
     return jsonify({"ok": True, "message": "Strategy stopped"})
-
-@app.route("/debug")
-def debug():
-    """Raw probe of every Phemex OHLCV endpoint variant."""
-    now     = int(time_mod.time())
-    from_al = now // RESOLUTION * RESOLUTION - 5 * RESOLUTION
-    to_al   = now // RESOLUTION * RESOLUTION
-    sym     = SYMBOL_ID or "ETHUSDT"
-    out     = {}
-
-    probes = [
-        ("ccxt-live fetch_ohlcv limit=5", None, None),
-        (f"LIVE v2 {sym} limit",
-         f"{LIVE_BASE}/md/v2/kline/list",
-         {"symbol": sym,      "resolution": RESOLUTION, "limit": 5}),
-        (f"LIVE v2 {sym} from+to aligned",
-         f"{LIVE_BASE}/md/v2/kline/list",
-         {"symbol": sym,      "resolution": RESOLUTION,
-          "from": from_al, "to": to_al}),
-        (f"LIVE v1 {sym} limit",
-         f"{LIVE_BASE}/md/kline",
-         {"symbol": sym,      "resolution": RESOLUTION, "limit": 5}),
-        (f"LIVE v1 ETHUSD limit",
-         f"{LIVE_BASE}/md/kline",
-         {"symbol": "ETHUSD", "resolution": RESOLUTION, "limit": 5}),
-        (f"LIVE v1 ETHUSD from+to aligned",
-         f"{LIVE_BASE}/md/kline",
-         {"symbol": "ETHUSD", "resolution": RESOLUTION,
-          "from": from_al, "to": to_al}),
-        (f"TESTNET v2 {sym} limit",
-         f"{TESTNET_BASE}/md/v2/kline/list",
-         {"symbol": sym,      "resolution": RESOLUTION, "limit": 5}),
-    ]
-
-    for label, url, params in probes:
-        if url is None:   # ccxt probe
-            try:
-                rows = live_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", "30m", limit=5)
-                out[label] = {"ok": True, "count": len(rows),
-                              "last": rows[-1] if rows else None}
-            except Exception as e:
-                out[label] = {"error": str(e)}
-        else:
-            try:
-                r = req.get(url, params=params, timeout=8)
-                out[label] = {"http": r.status_code, "body": r.text[:300]}
-            except Exception as e:
-                out[label] = {"error": str(e)}
-
-    return jsonify(out)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
