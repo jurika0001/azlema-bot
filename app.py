@@ -14,10 +14,18 @@ RISK     = 0.01
 FIXED_SL = 2000
 MAX_LOTS = 100
 LEVERAGE = 1
-CANDLES  = 200          # Phemex linear perp kline max ≤ 200
+CANDLES  = 200
 PORT     = int(os.environ.get("PORT", 10000))
 
-# ── paper_ex first — so sandbox state mutation happens before live_ex reads it ─
+# ── live_ex  : Phemex live, no auth, no sandbox — OHLCV only ──────────────────
+# Created clean, no set_sandbox_mode, no URL override.
+# ccxt instances are independent; paper_ex sandbox does NOT affect live_ex.
+live_ex = ccxt.phemex({
+    "options": {"defaultType": "swap"},
+    "enableRateLimit": True,
+})
+
+# ── paper_ex : Phemex testnet, with auth — orders / balance / positions ───────
 paper_ex = ccxt.phemex({
     "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
     "secret": os.environ.get("PHEMEX_API_SECRET", ""),
@@ -26,28 +34,13 @@ paper_ex = ccxt.phemex({
 })
 paper_ex.set_sandbox_mode(True)
 
-# ── live_ex second — then force-reset to live URL ─────────────────────────────
-live_ex = ccxt.phemex({
-    "options": {"defaultType": "swap"},
-    "enableRateLimit": True,
-})
-try:
-    live_ex.set_sandbox_mode(False)   # undo any class-level contamination
-except Exception:
-    pass
-# Belt-and-suspenders: hard-set the live hostname
-live_ex.urls["api"]  = "https://api.phemex.com"
-
-logger.info(f"[BOOT] live_ex url={live_ex.urls.get('api')} "
-            f"paper_ex url={paper_ex.urls.get('api')}")
-
 SYMBOL = None
 
 def init_markets():
     global SYMBOL
-    live_ex.load_markets()
+    # Load only testnet markets — live markets auto-load on first fetch_ohlcv
     paper_mkts = paper_ex.load_markets()
-    logger.info(f"[INIT] live markets loaded  testnet={len(paper_mkts)}")
+    logger.info(f"[INIT] testnet={len(paper_mkts)} markets")
     for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
         if sym in paper_mkts:
             SYMBOL = sym
@@ -61,7 +54,7 @@ def init_markets():
         raise RuntimeError("No ETH perpetual found on Phemex testnet")
     logger.info(f"[INIT] symbol={SYMBOL}")
 
-# ── OHLCV — Phemex live via ccxt (limit ≤ 200) ────────────────────────────────
+# ── OHLCV — Phemex live via ccxt ──────────────────────────────────────────────
 def fetch_candles(limit: int = CANDLES) -> list:
     try:
         sym  = SYMBOL or "ETH/USDT:USDT"
@@ -69,7 +62,7 @@ def fetch_candles(limit: int = CANDLES) -> list:
         if rows and len(rows) >= 70:
             logger.info(f"[OHLCV] {len(rows)} candles  last={rows[-1][4]:.2f}")
             return rows
-        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles")
+        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles returned")
     except Exception as e:
         logger.error(f"[OHLCV] {e}")
     return []
@@ -148,6 +141,7 @@ def strategy_loop():
     try:
         init_markets()
     except Exception as e:
+        logger.error(f"[INIT] {e}")
         state["status"]  = f"Error: {e}"
         state["running"] = False
         return
