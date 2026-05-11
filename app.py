@@ -17,12 +17,15 @@ LEVERAGE = 1
 CANDLES  = 300
 PORT     = int(os.environ.get("PORT", 10000))
 
-# ── live_ex  : Phemex live, no auth — used ONLY for OHLCV ─────────────────────
-# ── paper_ex : Phemex testnet, with auth — used for orders/balance/positions ──
-live_ex = ccxt.phemex({
-    "options": {"defaultType": "swap"},
+# ── ohlcv_ex : Binance futures, no auth — candle data only ────────────────────
+# ETH/USDT prices on Binance and Phemex are virtually identical.
+# Using Binance avoids ccxt sandbox-state contamination from paper_ex.
+ohlcv_ex = ccxt.binance({
+    "options": {"defaultType": "future"},
     "enableRateLimit": True,
 })
+
+# ── paper_ex : Phemex testnet, with auth — orders / balance / positions ───────
 paper_ex = ccxt.phemex({
     "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
     "secret": os.environ.get("PHEMEX_API_SECRET", ""),
@@ -31,35 +34,33 @@ paper_ex = ccxt.phemex({
 })
 paper_ex.set_sandbox_mode(True)
 
-SYMBOL = None   # resolved at first start, e.g. "ETH/USDT:USDT"
+SYMBOL = None   # Phemex unified symbol resolved at start, e.g. "ETH/USDT:USDT"
 
 def init_markets():
     global SYMBOL
-    live_mkts  = live_ex.load_markets()
     paper_mkts = paper_ex.load_markets()
-    logger.info(f"[INIT] live={len(live_mkts)}  testnet={len(paper_mkts)} markets")
-
+    logger.info(f"[INIT] testnet={len(paper_mkts)} markets")
     for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
-        if sym in live_mkts:
+        if sym in paper_mkts:
             SYMBOL = sym
             break
     if not SYMBOL:
-        for k, v in live_mkts.items():
+        for k, v in paper_mkts.items():
             if "ETH" in k and v.get("type") in ("swap", "future"):
                 SYMBOL = k
                 break
     if not SYMBOL:
-        raise RuntimeError("No ETH perpetual found on Phemex live")
+        raise RuntimeError("No ETH perpetual found on Phemex testnet")
     logger.info(f"[INIT] symbol={SYMBOL}")
 
-# ── OHLCV — ccxt live (confirmed working) ─────────────────────────────────────
+# ── OHLCV via Binance futures (reliable, no auth, no sandbox issues) ──────────
 def fetch_candles(limit: int = CANDLES) -> list:
     try:
-        rows = live_ex.fetch_ohlcv(SYMBOL, "30m", limit=limit)
+        rows = ohlcv_ex.fetch_ohlcv("ETH/USDT", "30m", limit=limit)
         if rows and len(rows) >= 70:
             logger.info(f"[OHLCV] {len(rows)} candles  last_close={rows[-1][4]:.2f}")
             return rows
-        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles returned")
+        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles")
     except Exception as e:
         logger.error(f"[OHLCV] {e}")
     return []
@@ -74,7 +75,7 @@ state = {
 trade_history    = []
 _strategy_thread = None
 
-# ── Trading helpers (paper_ex = testnet) ───────────────────────────────────────
+# ── Trading helpers ────────────────────────────────────────────────────────────
 def get_position() -> str:
     try:
         for p in paper_ex.fetch_positions([SYMBOL]):
@@ -322,7 +323,8 @@ footer{text-align:center;color:#484f58;font-size:.75rem;margin:36px 0 18px}
   </table>
 </div>
 <div id="toast"></div>
-<footer>AZLEMA · Phemex Paper Testnet · 30 m · ETH/USDT · 1× Leverage</footer>
+<footer>AZLEMA · Phemex Paper Testnet · 30 m · ETH/USDT · 1× Leverage
+  &nbsp;·&nbsp; Candle data: Binance Futures</footer>
 <script>
 function p(n){return String(n).padStart(2,'0')}
 function tick(){const d=new Date();document.getElementById('clock').textContent=
