@@ -38,27 +38,36 @@ SYMBOL = None
 
 def init_markets():
     global SYMBOL
-    # Load only testnet markets — live markets auto-load on first fetch_ohlcv
-    paper_mkts = paper_ex.load_markets()
-    logger.info(f"[INIT] testnet={len(paper_mkts)} markets")
-    for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
-        if sym in paper_mkts:
+    # Carrega os mercados do Phemex live para OHLCV
+    live_mkts = live_ex.load_markets()
+    logger.info(f"[INIT] live={len(live_mkts)} markets")
+    # Escolha explícita e estável para ETH perp do Phemex
+    preferred = ["ETH/USDT:USDT", "ETH/USD:ETH"]
+    for sym in preferred:
+        if sym in live_mkts:
             SYMBOL = sym
             break
+    # Fallback apenas dentro do próprio Phemex, sem outro exchange
     if not SYMBOL:
-        for k, v in paper_mkts.items():
+        for k, v in live_mkts.items():
             if "ETH" in k and v.get("type") in ("swap", "future"):
                 SYMBOL = k
                 break
     if not SYMBOL:
-        raise RuntimeError("No ETH perpetual found on Phemex testnet")
+        raise RuntimeError("No ETH perpetual found on Phemex live")
+    # Também carrega testnet, pois ordens/posição/balance continuam no paper_ex do Phemex
+    paper_mkts = paper_ex.load_markets()
+    logger.info(f"[INIT] testnet={len(paper_mkts)} markets")
     logger.info(f"[INIT] symbol={SYMBOL}")
 
 # ── OHLCV — Phemex live via ccxt ──────────────────────────────────────────────
 def fetch_candles(limit: int = CANDLES) -> list:
     try:
-        sym  = SYMBOL or "ETH/USDT:USDT"
-        rows = live_ex.fetch_ohlcv(sym, "30m", limit=limit)
+        if not SYMBOL:
+            init_markets()
+        # Usa exatamente o símbolo validado no Phemex live
+        sym  = live_ex.market(SYMBOL)["symbol"]
+        rows = live_ex.fetch_ohlcv(sym, timeframe="30m", limit=limit)
         if rows and len(rows) >= 70:
             logger.info(f"[OHLCV] {len(rows)} candles  last={rows[-1][4]:.2f}")
             return rows
@@ -143,6 +152,13 @@ def strategy_loop():
     except Exception as e:
         logger.error(f"[INIT] {e}")
         state["status"]  = f"Error: {e}"
+        state["running"] = False
+        return
+
+    if SYMBOL not in live_ex.markets:
+        err = f"Invalid Phemex symbol for OHLCV: {SYMBOL}"
+        logger.error(f"[INIT] {err}")
+        state["status"]  = f"Error: {err}"
         state["running"] = False
         return
 
