@@ -26,13 +26,20 @@ live_ex = ccxt.phemex({
 })
 
 # ── paper_ex : Phemex testnet, with auth — orders / balance / positions ───────
+# URL set explicitly in constructor — set_sandbox_mode(True) not reliable in
+# ccxt 4.3.92 and can leave paper_ex pointing at the live API (→ 401).
 paper_ex = ccxt.phemex({
     "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
     "secret": os.environ.get("PHEMEX_API_SECRET", ""),
     "options": {"defaultType": "swap"},
     "enableRateLimit": True,
+    "urls": {
+        "api": {
+            "public":  "https://testnet-api.phemex.com",
+            "private": "https://testnet-api.phemex.com",
+        }
+    },
 })
-paper_ex.set_sandbox_mode(True)
 
 SYMBOL = None
 
