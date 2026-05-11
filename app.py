@@ -65,9 +65,10 @@ def fetch_candles(limit: int = CANDLES) -> list:
     try:
         if not SYMBOL:
             init_markets()
-        # Usa exatamente o símbolo validado no Phemex live
-        sym  = live_ex.market(SYMBOL)["symbol"]
-        rows = live_ex.fetch_ohlcv(sym, timeframe="30m", limit=limit)
+        sym = live_ex.market(SYMBOL)["symbol"]
+        # Use since (ms) instead of limit — avoids Phemex code:30000 on linear perp
+        since = int((time_mod.time() - limit * 1800) * 1000)
+        rows  = live_ex.fetch_ohlcv(sym, timeframe="30m", since=since, limit=limit)
         if rows and len(rows) >= 70:
             logger.info(f"[OHLCV] {len(rows)} candles  last={rows[-1][4]:.2f}")
             return rows
