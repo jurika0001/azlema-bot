@@ -1,4 +1,4 @@
-import os, time as time_mod, threading, logging
+import os, time as time_mod, threading, logging, hmac, hashlib, json as _json
 import requests as req
 from datetime import datetime, timezone
 from flask import Flask, jsonify
@@ -25,53 +25,79 @@ live_ex = ccxt.phemex({
     "enableRateLimit": True,
 })
 
-# ── paper_ex : Phemex testnet, with auth — orders / balance / positions ───────
-_api_key = (os.environ.get("PHEMEX_API_KEY") or "").strip()
-_api_sec  = (os.environ.get("PHEMEX_API_SECRET") or "").strip()
-logger.info(f"[AUTH] key={_api_key[:6]}... len_key={len(_api_key)} len_secret={len(_api_sec)}")
+# ── Phemex testnet credentials (read once, stripped) ─────────────────────────
+_TNET      = "https://testnet-api.phemex.com"
+_PAPER_KEY = (os.environ.get("PHEMEX_API_KEY")    or "").strip()
+_PAPER_SEC = (os.environ.get("PHEMEX_API_SECRET") or "").strip()
+logger.info(f"[AUTH] key={_PAPER_KEY[:6]}... len_key={len(_PAPER_KEY)} len_secret={len(_PAPER_SEC)}")
 
-paper_ex = ccxt.phemex({
-    "apiKey": _api_key,
-    "secret": _api_sec,
-    "options": {"defaultType": "swap"},
-    "enableRateLimit": True,
-})
-# set_sandbox_mode first, then patch ALL url sub-keys to testnet
-paper_ex.set_sandbox_mode(True)
-_testnet  = "https://testnet-api.phemex.com"
-_api_urls = paper_ex.urls.get("api", {})
-if isinstance(_api_urls, dict):
-    for _k in list(_api_urls.keys()):
-        paper_ex.urls["api"][_k] = _testnet
-else:
-    paper_ex.urls["api"] = _testnet
-logger.info(f"[AUTH] paper_ex api url = {paper_ex.urls.get('api')}")
+# ── Direct HMAC auth — bypasses ccxt auth bug on Phemex testnet ───────────────
+def _tnet_headers(path: str, query: str = "", body: str = "") -> dict:
+    expiry = str(int(time_mod.time()) + 60)
+    msg    = _PAPER_KEY + expiry + query + body
+    sig    = hmac.new(_PAPER_SEC.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {
+        "x-phemex-access-token":      _PAPER_KEY,
+        "x-phemex-request-expiry":    expiry,
+        "x-phemex-request-signature": sig,
+        "Content-Type": "application/json",
+    }
 
-SYMBOL = None
+def _tget(path: str, query: str = "") -> dict:
+    url = f"{_TNET}{path}" + (f"?{query}" if query else "")
+    try:
+        return req.get(url, headers=_tnet_headers(path, query), timeout=10).json()
+    except Exception as e:
+        logger.error(f"[TGET] {e}")
+        return {}
+
+def _tpost(path: str, body: dict) -> dict:
+    bs = _json.dumps(body, separators=(",", ":"))
+    try:
+        return req.post(f"{_TNET}{path}",
+                        headers=_tnet_headers(path, "", bs),
+                        data=bs, timeout=10).json()
+    except Exception as e:
+        logger.error(f"[TPOST] {e}")
+        return {}
+
+def _tput(path: str, query: str) -> dict:
+    try:
+        return req.put(f"{_TNET}{path}?{query}",
+                       headers=_tnet_headers(path, query), timeout=10).json()
+    except Exception as e:
+        logger.error(f"[TPUT] {e}")
+        return {}
+
+SYMBOL    = None   # ccxt unified, e.g. "ETH/USDT:USDT"
+SYMBOL_ID = None   # raw Phemex id, e.g. "ETHUSDT"
 
 def init_markets():
-    global SYMBOL
-    # Carrega os mercados do Phemex live para OHLCV
+    global SYMBOL, SYMBOL_ID
+    # Live markets for OHLCV symbol resolution
     live_mkts = live_ex.load_markets()
     logger.info(f"[INIT] live={len(live_mkts)} markets")
-    # Escolha explícita e estável para ETH perp do Phemex
-    preferred = ["ETH/USDT:USDT", "ETH/USD:ETH"]
-    for sym in preferred:
+    for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
         if sym in live_mkts:
-            SYMBOL = sym
+            SYMBOL    = sym
+            SYMBOL_ID = live_ex.market_id(sym)   # "ETHUSDT" or "ETHUSD"
             break
-    # Fallback apenas dentro do próprio Phemex, sem outro exchange
     if not SYMBOL:
         for k, v in live_mkts.items():
             if "ETH" in k and v.get("type") in ("swap", "future"):
-                SYMBOL = k
+                SYMBOL    = k
+                SYMBOL_ID = live_ex.market_id(k)
                 break
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex live")
-    # Também carrega testnet, pois ordens/posição/balance continuam no paper_ex do Phemex
-    paper_mkts = paper_ex.load_markets()
-    logger.info(f"[INIT] testnet={len(paper_mkts)} markets")
-    logger.info(f"[INIT] symbol={SYMBOL}")
+    # Testnet market count (public, no auth)
+    try:
+        r = req.get(f"{_TNET}/public/products", timeout=10).json()
+        n = len(r.get("data", {}).get("perpProductsV2") or [])
+        logger.info(f"[INIT] testnet perp products={n}")
+    except Exception:
+        pass
+    logger.info(f"[INIT] symbol={SYMBOL}  id={SYMBOL_ID}")
 
 # ── OHLCV — Phemex live via ccxt ──────────────────────────────────────────────
 def fetch_candles(limit: int = CANDLES) -> list:
@@ -100,32 +126,27 @@ state = {
 trade_history    = []
 _strategy_thread = None
 
-# ── Trading helpers ────────────────────────────────────────────────────────────
+# ── Trading helpers — direct HMAC to Phemex testnet ───────────────────────────
 def get_position() -> str:
-    try:
-        for p in paper_ex.fetch_positions([SYMBOL]):
-            if float(p.get("contracts") or 0) != 0:
-                return p["side"].lower()
-    except Exception as e:
-        logger.warning(f"[POS] {e}")
+    d = _tget("/g-positions/list", f"symbol={SYMBOL_ID}&limit=10")
+    if d.get("code") == 0:
+        for row in (d.get("data", {}).get("rows") or []):
+            if float(row.get("size") or 0) != 0:
+                return "long" if row.get("side") == "Buy" else "short"
+    else:
+        logger.warning(f"[POS] {d}")
     return "none"
 
 def get_balance() -> float:
-    try:
-        bal = paper_ex.fetch_balance()
-        for key in ("USDT", "USD", "BTC"):
-            v = bal.get("total", {}).get(key)
-            if v:
-                return float(v)
-    except Exception as e:
-        logger.warning(f"[BAL] {e}")
+    d = _tget("/g-accounts/accountPositions", "currency=USDT")
+    if d.get("code") == 0:
+        ev = (d.get("data", {}).get("account") or {}).get("accountBalanceEv", 0)
+        return (ev or 0) / 1e8
+    logger.warning(f"[BAL] {d}")
     return 1000.0
 
 def calc_qty(price: float, balance: float) -> float:
-    try:
-        tick = float(paper_ex.markets[SYMBOL]["precision"]["price"])
-    except Exception:
-        tick = 0.01
+    tick       = 0.01          # ETH/USDT tick size on Phemex
     sl_usdt    = FIXED_SL * tick
     risk_usdt  = RISK * balance
     qty        = (risk_usdt / sl_usdt) if sl_usdt else 0.01
@@ -133,30 +154,36 @@ def calc_qty(price: float, balance: float) -> float:
     return round(min(qty, max_by_bal, MAX_LOTS), 4)
 
 def place_order(side: str, qty: float):
-    try:
-        paper_ex.set_leverage(LEVERAGE, SYMBOL)
-    except Exception:
-        pass
-    try:
-        if side == "LONG":
-            return paper_ex.create_market_buy_order(SYMBOL, qty)
-        return paper_ex.create_market_sell_order(SYMBOL, qty)
-    except Exception as e:
-        logger.error(f"[ORDER] {e}")
-        return None
+    # Set 1x leverage
+    _tput("/g-positions/leverage",
+          f"symbol={SYMBOL_ID}&leverage={LEVERAGE}&leverageEr={LEVERAGE * 10_000_000}")
+    body = {
+        "symbol":   SYMBOL_ID,
+        "side":     "Buy" if side == "LONG" else "Sell",
+        "orderQty": qty,
+        "ordType":  "Market",
+    }
+    d = _tpost("/g-orders", body)
+    if d.get("code") == 0:
+        return d.get("data") or {}
+    logger.error(f"[ORDER] {d}")
+    return None
 
 def close_pos(side: str):
-    try:
-        for p in paper_ex.fetch_positions([SYMBOL]):
-            size = float(p.get("contracts") or 0)
-            if size != 0 and p["side"].lower() == side:
-                params = {"reduceOnly": True}
-                if side == "long":
-                    paper_ex.create_market_sell_order(SYMBOL, size, params)
-                else:
-                    paper_ex.create_market_buy_order(SYMBOL, size, params)
-    except Exception as e:
-        logger.warning(f"[CLOSE] {e}")
+    d = _tget("/g-positions/list", f"symbol={SYMBOL_ID}&limit=10")
+    if d.get("code") == 0:
+        for row in (d.get("data", {}).get("rows") or []):
+            size = float(row.get("size") or 0)
+            if size != 0:
+                exp = "Buy" if side == "long" else "Sell"
+                if row.get("side") == exp:
+                    _tpost("/g-orders", {
+                        "symbol":     SYMBOL_ID,
+                        "side":       "Sell" if side == "long" else "Buy",
+                        "orderQty":   abs(size),
+                        "ordType":    "Market",
+                        "reduceOnly": True,
+                    })
 
 # ── Strategy loop ──────────────────────────────────────────────────────────────
 def strategy_loop():
@@ -166,13 +193,6 @@ def strategy_loop():
     except Exception as e:
         logger.error(f"[INIT] {e}")
         state["status"]  = f"Error: {e}"
-        state["running"] = False
-        return
-
-    if SYMBOL not in live_ex.markets:
-        err = f"Invalid Phemex symbol for OHLCV: {SYMBOL}"
-        logger.error(f"[INIT] {err}")
-        state["status"]  = f"Error: {err}"
         state["running"] = False
         return
 
