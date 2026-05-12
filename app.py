@@ -26,20 +26,26 @@ live_ex = ccxt.phemex({
 })
 
 # ── paper_ex : Phemex testnet, with auth — orders / balance / positions ───────
-# URL set explicitly in constructor — set_sandbox_mode(True) not reliable in
-# ccxt 4.3.92 and can leave paper_ex pointing at the live API (→ 401).
+_api_key = (os.environ.get("PHEMEX_API_KEY") or "").strip()
+_api_sec  = (os.environ.get("PHEMEX_API_SECRET") or "").strip()
+logger.info(f"[AUTH] key={_api_key[:6]}... len_key={len(_api_key)} len_secret={len(_api_sec)}")
+
 paper_ex = ccxt.phemex({
-    "apiKey": os.environ.get("PHEMEX_API_KEY", ""),
-    "secret": os.environ.get("PHEMEX_API_SECRET", ""),
+    "apiKey": _api_key,
+    "secret": _api_sec,
     "options": {"defaultType": "swap"},
     "enableRateLimit": True,
-    "urls": {
-        "api": {
-            "public":  "https://testnet-api.phemex.com",
-            "private": "https://testnet-api.phemex.com",
-        }
-    },
 })
+# set_sandbox_mode first, then patch ALL url sub-keys to testnet
+paper_ex.set_sandbox_mode(True)
+_testnet  = "https://testnet-api.phemex.com"
+_api_urls = paper_ex.urls.get("api", {})
+if isinstance(_api_urls, dict):
+    for _k in list(_api_urls.keys()):
+        paper_ex.urls["api"][_k] = _testnet
+else:
+    paper_ex.urls["api"] = _testnet
+logger.info(f"[AUTH] paper_ex api url = {paper_ex.urls.get('api')}")
 
 SYMBOL = None
 
