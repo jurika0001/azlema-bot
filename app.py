@@ -453,5 +453,24 @@ def stop():
     state["running"] = False
     return jsonify({"ok": True, "message": "Strategy stopped"})
 
+@app.route("/test-auth")
+def test_auth():
+    """Visit /test-auth to verify the Phemex testnet API key is working."""
+    key_info = {
+        "key_prefix": _PAPER_KEY[:8] + "..." if _PAPER_KEY else "EMPTY",
+        "key_len":    len(_PAPER_KEY),
+        "secret_len": len(_PAPER_SEC),
+    }
+    results = {}
+    for label, path, query in [
+        ("balance_USDT",  "/g-accounts/accountPositions", "currency=USDT"),
+        ("positions_ETH", "/g-positions/list",
+         f"symbol={SYMBOL_ID or 'ETHUSDT'}&limit=1"),
+        ("balance_USD",   "/accounts/accountPositions",   "currency=USD"),
+    ]:
+        d = _tget(path, query)
+        results[label] = {"code": d.get("code"), "msg": d.get("msg", "")}
+    return jsonify({"key_info": key_info, "testnet_responses": results})
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
