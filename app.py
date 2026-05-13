@@ -1,4 +1,4 @@
-import os, time as time_mod, threading, logging, hmac, hashlib, json as _json
+import os, time as time_mod, threading, logging
 import requests as req
 from datetime import datetime, timezone
 from flask import Flask, jsonify
@@ -10,180 +10,122 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-RISK     = 0.01
-FIXED_SL = 2000
-MAX_LOTS = 100
-LEVERAGE = 1
-CANDLES  = 200
-PORT     = int(os.environ.get("PORT", 10000))
+RISK            = 0.01       # 1% risk per trade
+FIXED_SL        = 2000       # stop-loss in ticks
+MAX_LOTS        = 100
+LEVERAGE        = 1
+CANDLES         = 200
+PAPER_START_BAL = 10_000.0   # virtual starting balance in USDT
+PORT            = int(os.environ.get("PORT", 10000))
 
-# ── live_ex  : Phemex live, no auth, no sandbox — OHLCV only ──────────────────
-# Created clean, no set_sandbox_mode, no URL override.
-# ccxt instances are independent; paper_ex sandbox does NOT affect live_ex.
+# ── live_ex : Phemex live, no auth — OHLCV only ───────────────────────────────
 live_ex = ccxt.phemex({
     "options": {"defaultType": "swap"},
     "enableRateLimit": True,
 })
 
-# ── Phemex testnet credentials (read once, stripped) ─────────────────────────
-_TNET      = "https://testnet-api.phemex.com"
-_PAPER_KEY = (os.environ.get("PHEMEX_API_KEY")    or "").strip()
-_PAPER_SEC = (os.environ.get("PHEMEX_API_SECRET") or "").strip()
-logger.info(f"[AUTH] key={_PAPER_KEY[:6]}... len_key={len(_PAPER_KEY)} len_secret={len(_PAPER_SEC)}")
-
-# ── Direct HMAC auth — bypasses ccxt auth bug on Phemex testnet ───────────────
-def _tnet_headers(path: str, query: str = "", body: str = "") -> dict:
-    expiry = str(int(time_mod.time()) + 60)
-    msg    = _PAPER_KEY + expiry + query + body
-    sig    = hmac.new(_PAPER_SEC.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return {
-        "x-phemex-access-token":      _PAPER_KEY,
-        "x-phemex-request-expiry":    expiry,
-        "x-phemex-request-signature": sig,
-        "Content-Type": "application/json",
-    }
-
-def _tget(path: str, query: str = "") -> dict:
-    url = f"{_TNET}{path}" + (f"?{query}" if query else "")
-    try:
-        return req.get(url, headers=_tnet_headers(path, query), timeout=10).json()
-    except Exception as e:
-        logger.error(f"[TGET] {e}")
-        return {}
-
-def _tpost(path: str, body: dict) -> dict:
-    bs = _json.dumps(body, separators=(",", ":"))
-    try:
-        return req.post(f"{_TNET}{path}",
-                        headers=_tnet_headers(path, "", bs),
-                        data=bs, timeout=10).json()
-    except Exception as e:
-        logger.error(f"[TPOST] {e}")
-        return {}
-
-def _tput(path: str, query: str) -> dict:
-    try:
-        return req.put(f"{_TNET}{path}?{query}",
-                       headers=_tnet_headers(path, query), timeout=10).json()
-    except Exception as e:
-        logger.error(f"[TPUT] {e}")
-        return {}
-
-SYMBOL    = None   # ccxt unified, e.g. "ETH/USDT:USDT"
-SYMBOL_ID = None   # raw Phemex id, e.g. "ETHUSDT"
+SYMBOL = None   # resolved at first start, e.g. "ETH/USDT:USDT"
 
 def init_markets():
-    global SYMBOL, SYMBOL_ID
-    # Live markets for OHLCV symbol resolution
-    live_mkts = live_ex.load_markets()
-    logger.info(f"[INIT] live={len(live_mkts)} markets")
+    global SYMBOL
+    mkts = live_ex.load_markets()
+    logger.info(f"[INIT] {len(mkts)} live markets loaded")
     for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
-        if sym in live_mkts:
-            SYMBOL    = sym
-            SYMBOL_ID = live_ex.market_id(sym)   # "ETHUSDT" or "ETHUSD"
+        if sym in mkts:
+            SYMBOL = sym
             break
     if not SYMBOL:
-        for k, v in live_mkts.items():
+        for k, v in mkts.items():
             if "ETH" in k and v.get("type") in ("swap", "future"):
-                SYMBOL    = k
-                SYMBOL_ID = live_ex.market_id(k)
+                SYMBOL = k
                 break
     if not SYMBOL:
-        raise RuntimeError("No ETH perpetual found on Phemex live")
-    # Testnet market count (public, no auth)
-    try:
-        r = req.get(f"{_TNET}/public/products", timeout=10).json()
-        n = len(r.get("data", {}).get("perpProductsV2") or [])
-        logger.info(f"[INIT] testnet perp products={n}")
-    except Exception:
-        pass
-    logger.info(f"[INIT] symbol={SYMBOL}  id={SYMBOL_ID}")
+        raise RuntimeError("No ETH perpetual found on Phemex")
+    logger.info(f"[INIT] symbol={SYMBOL}")
 
 # ── OHLCV — Phemex live via ccxt ──────────────────────────────────────────────
 def fetch_candles(limit: int = CANDLES) -> list:
     try:
-        if not SYMBOL:
-            init_markets()
-        sym = live_ex.market(SYMBOL)["symbol"]
-        # Use since (ms) instead of limit — avoids Phemex code:30000 on linear perp
+        sym   = SYMBOL or "ETH/USDT:USDT"
         since = int((time_mod.time() - limit * 1800) * 1000)
         rows  = live_ex.fetch_ohlcv(sym, timeframe="30m", since=since, limit=limit)
         if rows and len(rows) >= 70:
             logger.info(f"[OHLCV] {len(rows)} candles  last={rows[-1][4]:.2f}")
             return rows
-        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles returned")
+        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles")
     except Exception as e:
         logger.error(f"[OHLCV] {e}")
     return []
 
-# ── Shared state ───────────────────────────────────────────────────────────────
-state = {
-    "running": False, "status": "Stopped",
-    "signal": "—", "position": "None",
-    "ema": "—", "ec": "—", "period": "—",
-    "last_candle": "—", "updated": "—",
+# ── Internal paper trading state ───────────────────────────────────────────────
+paper = {
+    "balance":     PAPER_START_BAL,
+    "side":        "none",    # "long" | "short" | "none"
+    "entry_price": 0.0,
+    "qty":         0.0,
+    "unrealized":  0.0,
+    "total_pnl":   0.0,
 }
-trade_history    = []
-_strategy_thread = None
 
-# ── Trading helpers — direct HMAC to Phemex testnet ───────────────────────────
-def get_position() -> str:
-    d = _tget("/g-positions/list", f"symbol={SYMBOL_ID}&limit=10")
-    if d.get("code") == 0:
-        for row in (d.get("data", {}).get("rows") or []):
-            if float(row.get("size") or 0) != 0:
-                return "long" if row.get("side") == "Buy" else "short"
-    else:
-        logger.warning(f"[POS] {d}")
-    return "none"
+def _current_pnl(cur_price: float) -> float:
+    if paper["side"] == "none" or paper["entry_price"] == 0:
+        return 0.0
+    diff = cur_price - paper["entry_price"]
+    return diff * paper["qty"] if paper["side"] == "long" else -diff * paper["qty"]
 
-def get_balance() -> float:
-    d = _tget("/g-accounts/accountPositions", "currency=USDT")
-    if d.get("code") == 0:
-        ev = (d.get("data", {}).get("account") or {}).get("accountBalanceEv", 0)
-        return (ev or 0) / 1e8
-    logger.warning(f"[BAL] {d}")
-    return 1000.0
+def paper_get_position() -> str:
+    return paper["side"]
 
-def calc_qty(price: float, balance: float) -> float:
-    tick       = 0.01          # ETH/USDT tick size on Phemex
+def paper_get_balance() -> float:
+    return paper["balance"]
+
+def paper_calc_qty(price: float, balance: float) -> float:
+    tick       = 0.01
     sl_usdt    = FIXED_SL * tick
     risk_usdt  = RISK * balance
     qty        = (risk_usdt / sl_usdt) if sl_usdt else 0.01
     max_by_bal = (balance * 0.95 / price) if price else qty
     return round(min(qty, max_by_bal, MAX_LOTS), 4)
 
-def place_order(side: str, qty: float):
-    # Set 1x leverage
-    _tput("/g-positions/leverage",
-          f"symbol={SYMBOL_ID}&leverage={LEVERAGE}&leverageEr={LEVERAGE * 10_000_000}")
-    body = {
-        "symbol":   SYMBOL_ID,
-        "side":     "Buy" if side == "LONG" else "Sell",
-        "orderQty": qty,
-        "ordType":  "Market",
-    }
-    d = _tpost("/g-orders", body)
-    if d.get("code") == 0:
-        return d.get("data") or {}
-    logger.error(f"[ORDER] {d}")
-    return None
+def paper_place_order(side: str, qty: float, price: float) -> dict:
+    paper["side"]        = "long" if side == "LONG" else "short"
+    paper["entry_price"] = price
+    paper["qty"]         = qty
+    paper["unrealized"]  = 0.0
+    order_id = f"SIM-{int(time_mod.time())}"
+    logger.info(f"[PAPER] {side} {qty} @ {price:.2f}  id={order_id}")
+    return {"id": order_id, "average": price, "amount": qty}
 
-def close_pos(side: str):
-    d = _tget("/g-positions/list", f"symbol={SYMBOL_ID}&limit=10")
-    if d.get("code") == 0:
-        for row in (d.get("data", {}).get("rows") or []):
-            size = float(row.get("size") or 0)
-            if size != 0:
-                exp = "Buy" if side == "long" else "Sell"
-                if row.get("side") == exp:
-                    _tpost("/g-orders", {
-                        "symbol":     SYMBOL_ID,
-                        "side":       "Sell" if side == "long" else "Buy",
-                        "orderQty":   abs(size),
-                        "ordType":    "Market",
-                        "reduceOnly": True,
-                    })
+def paper_close_pos(cur_price: float):
+    if paper["side"] == "none":
+        return
+    pnl = _current_pnl(cur_price)
+    paper["balance"]    += pnl
+    paper["total_pnl"]  += pnl
+    paper["unrealized"]  = 0.0
+    logger.info(f"[PAPER] closed {paper['side']} @ {cur_price:.2f}  "
+                f"pnl={pnl:+.2f}  balance={paper['balance']:.2f}")
+    paper["side"]        = "none"
+    paper["entry_price"] = 0.0
+    paper["qty"]         = 0.0
+
+# ── Shared state ───────────────────────────────────────────────────────────────
+state = {
+    "running":    False,
+    "status":     "Stopped",
+    "signal":     "—",
+    "position":   "None",
+    "ema":        "—",
+    "ec":         "—",
+    "period":     "—",
+    "last_candle":"—",
+    "updated":    "—",
+    "balance":    f"{PAPER_START_BAL:.2f}",
+    "total_pnl":  "0.00",
+    "unrealized": "0.00",
+}
+trade_history    = []
+_strategy_thread = None
 
 # ── Strategy loop ──────────────────────────────────────────────────────────────
 def strategy_loop():
@@ -211,8 +153,13 @@ def strategy_loop():
             candle_str  = datetime.fromtimestamp(
                 candle_ts / 1000, tz=timezone.utc
             ).strftime("%Y-%m-%d %H:%M UTC")
+            cur_price   = float(last_closed[4])
+
+            # Update unrealized PnL every cycle
+            paper["unrealized"] = _current_pnl(cur_price)
 
             if candle_ts == last_candle_ts:
+                state["unrealized"] = f"{paper['unrealized']:+.2f}"
                 time_mod.sleep(15)
                 continue
 
@@ -229,55 +176,50 @@ def strategy_loop():
                 "last_candle": candle_str,
                 "updated":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "status":      "Running",
+                "position":    paper["side"],
+                "balance":     f"{paper['balance']:.2f}",
+                "total_pnl":   f"{paper['total_pnl']:+.2f}",
+                "unrealized":  f"{paper['unrealized']:+.2f}",
             })
 
             if not signal:
                 time_mod.sleep(15)
                 continue
 
-            cur_pos   = get_position()
-            state["position"] = cur_pos
-            balance   = get_balance()
-            cur_price = float(last_closed[4])
-            qty       = calc_qty(cur_price, balance)
+            cur_pos = paper_get_position()
+            balance = paper_get_balance()
+            qty     = paper_calc_qty(cur_price, balance)
 
             if signal == "LONG" and cur_pos != "long":
                 if cur_pos == "short":
-                    close_pos("short")
-                order = place_order("LONG", qty)
-                if order:
-                    trade_history.insert(0, {
-                        "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "candle":   candle_str, "side": "LONG",
-                        "price":    order.get("average") or order.get("price") or cur_price,
-                        "qty":      qty, "order_id": order.get("id", "N/A"),
-                    })
-                    state["position"] = "long"
-                    logger.info(f"[TRADE] LONG qty={qty} @ {cur_price}")
+                    paper_close_pos(cur_price)
+                order = paper_place_order("LONG", qty, cur_price)
+                trade_history.insert(0, {
+                    "time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "candle":    candle_str,
+                    "side":      "LONG",
+                    "price":     cur_price,
+                    "qty":       qty,
+                    "order_id":  order["id"],
+                    "balance":   f"{paper['balance']:.2f}",
+                })
+                state["position"] = "long"
 
             elif signal == "SHORT" and cur_pos != "short":
                 if cur_pos == "long":
-                    close_pos("long")
-                order = place_order("SHORT", qty)
-                if order:
-                    trade_history.insert(0, {
-                        "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "candle":   candle_str, "side": "SHORT",
-                        "price":    order.get("average") or order.get("price") or cur_price,
-                        "qty":      qty, "order_id": order.get("id", "N/A"),
-                    })
-                    state["position"] = "short"
-                    logger.info(f"[TRADE] SHORT qty={qty} @ {cur_price}")
+                    paper_close_pos(cur_price)
+                order = paper_place_order("SHORT", qty, cur_price)
+                trade_history.insert(0, {
+                    "time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "candle":    candle_str,
+                    "side":      "SHORT",
+                    "price":     cur_price,
+                    "qty":       qty,
+                    "order_id":  order["id"],
+                    "balance":   f"{paper['balance']:.2f}",
+                })
+                state["position"] = "short"
 
-        except ccxt.AuthenticationError as e:
-            logger.error(f"[AUTH] {e}")
-            state["status"]  = "Error: invalid API keys"
-            state["running"] = False
-            break
-        except ccxt.NetworkError as e:
-            logger.warning(f"[NET] {e}")
-            state["status"] = "Warning: network error, retrying…"
-            time_mod.sleep(30)
         except Exception as e:
             logger.error(f"[LOOP] {e}")
             state["status"] = f"Error: {str(e)[:80]}"
@@ -320,13 +262,14 @@ button{padding:10px 28px;border:none;border-radius:8px;font-size:.93rem;font-wei
 #btn-start{background:#238636;color:#fff}#btn-start:hover:not(:disabled){background:#2ea043}
 #btn-stop{background:#da3633;color:#fff}#btn-stop:hover:not(:disabled){background:#f85149}
 button:disabled{opacity:.35;cursor:not-allowed}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:26px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:26px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px 18px}
 .lbl{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
-.val{font-size:1.2rem;font-weight:600}
+.val{font-size:1.15rem;font-weight:600}
 .long{color:#3fb950}.short{color:#f85149}
 .running{color:#3fb950}.stopped{color:#8b949e}
 .err{color:#e3b341;font-size:.78rem;word-break:break-all;line-height:1.4}
+.pos{color:#e3b341}.neg{color:#f85149}
 .st{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px}
 table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;
       border-radius:10px;overflow:hidden}
@@ -343,7 +286,7 @@ footer{text-align:center;color:#484f58;font-size:.75rem;margin:36px 0 18px}
 </head>
 <body>
 <header>
-  <h1>⚡ AZLEMA Bot — Phemex Paper Trading</h1>
+  <h1>⚡ AZLEMA Bot — Paper Trading</h1>
   <span id="clock"></span>
 </header>
 <div class="container">
@@ -355,28 +298,31 @@ footer{text-align:center;color:#484f58;font-size:.75rem;margin:36px 0 18px}
     <div class="card"><div class="lbl">Status</div><div class="val" id="c-status">—</div></div>
     <div class="card"><div class="lbl">Signal</div><div class="val" id="c-signal">—</div></div>
     <div class="card"><div class="lbl">Position</div><div class="val" id="c-pos">—</div></div>
+    <div class="card"><div class="lbl">Balance (USDT)</div><div class="val" id="c-balance">—</div></div>
+    <div class="card"><div class="lbl">Total PnL</div><div class="val" id="c-pnl">—</div></div>
+    <div class="card"><div class="lbl">Unrealized</div><div class="val" id="c-unreal">—</div></div>
     <div class="card"><div class="lbl">EMA</div><div class="val" id="c-ema">—</div></div>
     <div class="card"><div class="lbl">EC</div><div class="val" id="c-ec">—</div></div>
     <div class="card"><div class="lbl">Period</div><div class="val" id="c-period">—</div></div>
     <div class="card"><div class="lbl">Last Candle</div>
-      <div class="val" style="font-size:.88rem" id="c-candle">—</div></div>
+      <div class="val" style="font-size:.82rem" id="c-candle">—</div></div>
     <div class="card"><div class="lbl">Updated</div>
-      <div class="val" style="font-size:.82rem" id="c-upd">—</div></div>
+      <div class="val" style="font-size:.78rem" id="c-upd">—</div></div>
   </div>
   <div class="st">Trade History</div>
   <table>
     <thead>
       <tr><th>Time</th><th>Candle</th><th>Side</th>
-          <th>Price</th><th>Qty</th><th>Order ID</th></tr>
+          <th>Price</th><th>Qty</th><th>Balance</th><th>Order ID</th></tr>
     </thead>
     <tbody id="tbody">
-      <tr><td colspan="6" style="text-align:center;color:#484f58;padding:22px">
+      <tr><td colspan="7" style="text-align:center;color:#484f58;padding:22px">
         No trades yet</td></tr>
     </tbody>
   </table>
 </div>
 <div id="toast"></div>
-<footer>AZLEMA · Phemex Paper Testnet · 30 m · ETH/USDT · 1× Leverage</footer>
+<footer>AZLEMA · Paper Trading Interno · 30 m · ETH/USDT · Preços Phemex Live</footer>
 <script>
 function p(n){return String(n).padStart(2,'0')}
 function tick(){const d=new Date();document.getElementById('clock').textContent=
@@ -386,6 +332,7 @@ setInterval(tick,1000);tick();
 function toast(msg,ok){const e=document.getElementById('toast');
   e.textContent=msg;e.style.background=ok?'#238636':'#da3633';
   e.style.display='block';setTimeout(()=>e.style.display='none',3000)}
+function pnlClass(v){const n=parseFloat(v);return n>0?'val pos':n<0?'val neg':'val'}
 async function ctrl(a){
   const r=await fetch('/'+a,{method:'POST'});
   const d=await r.json();toast(d.message,d.ok);fetchAll()}
@@ -394,12 +341,16 @@ async function fetchAll(){
   const s=await sr.json(),t=await hr.json();
   const sv=document.getElementById('c-status');sv.textContent=s.status;
   sv.className='val '+(s.status==='Running'?'running':
-    (s.status.startsWith('Error')||s.status.startsWith('Warning')||
-     s.status.startsWith('Waiting'))?'err':'stopped');
+    (s.status.startsWith('Error')||s.status.startsWith('Waiting'))?'err':'stopped');
   const sg=document.getElementById('c-signal');sg.textContent=s.signal;
   sg.className='val '+(s.signal==='LONG'?'long':s.signal==='SHORT'?'short':'');
   const ps=document.getElementById('c-pos');ps.textContent=s.position;
   ps.className='val '+(s.position==='long'?'long':s.position==='short'?'short':'');
+  document.getElementById('c-balance').textContent='$'+s.balance;
+  const pnl=document.getElementById('c-pnl');
+  pnl.textContent='$'+s.total_pnl;pnl.className=pnlClass(s.total_pnl);
+  const unr=document.getElementById('c-unreal');
+  unr.textContent='$'+s.unrealized;unr.className=pnlClass(s.unrealized);
   ['ema','ec','period'].forEach(k=>document.getElementById('c-'+k).textContent=s[k]);
   document.getElementById('c-candle').textContent=s.last_candle;
   document.getElementById('c-upd').textContent=s.updated;
@@ -409,9 +360,10 @@ async function fetchAll(){
   tb.innerHTML=t.length?t.map(r=>`<tr>
     <td>${r.time}</td><td>${r.candle}</td>
     <td><span class="badge ${r.side.toLowerCase()}">${r.side}</span></td>
-    <td>${Number(r.price).toFixed(2)}</td><td>${r.qty}</td>
+    <td>$${Number(r.price).toFixed(2)}</td><td>${r.qty}</td>
+    <td>$${r.balance}</td>
     <td style="font-size:.74rem;color:#8b949e">${r.order_id}</td></tr>`).join('')
-    :'<tr><td colspan="6" style="text-align:center;color:#484f58;padding:22px">'
+    :'<tr><td colspan="7" style="text-align:center;color:#484f58;padding:22px">'
      +'No trades yet</td></tr>'}
 fetchAll();setInterval(fetchAll,10000);
 </script>
@@ -452,25 +404,6 @@ def stop():
         return jsonify({"ok": False, "message": "Already stopped"})
     state["running"] = False
     return jsonify({"ok": True, "message": "Strategy stopped"})
-
-@app.route("/test-auth")
-def test_auth():
-    """Visit /test-auth to verify the Phemex testnet API key is working."""
-    key_info = {
-        "key_prefix": _PAPER_KEY[:8] + "..." if _PAPER_KEY else "EMPTY",
-        "key_len":    len(_PAPER_KEY),
-        "secret_len": len(_PAPER_SEC),
-    }
-    results = {}
-    for label, path, query in [
-        ("balance_USDT",  "/g-accounts/accountPositions", "currency=USDT"),
-        ("positions_ETH", "/g-positions/list",
-         f"symbol={SYMBOL_ID or 'ETHUSDT'}&limit=1"),
-        ("balance_USD",   "/accounts/accountPositions",   "currency=USD"),
-    ]:
-        d = _tget(path, query)
-        results[label] = {"code": d.get("code"), "msg": d.get("msg", "")}
-    return jsonify({"key_info": key_info, "testnet_responses": results})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
