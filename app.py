@@ -1,4 +1,4 @@
-import os, time as time_mod, threading, logging
+import os, time as time_mod, threading, logging, json
 import requests as req
 from datetime import datetime, timezone
 from flask import Flask, jsonify
@@ -194,6 +194,24 @@ state = {
 }
 trade_history    = []
 _strategy_thread = None
+TRADES_FILE      = "trades.json"
+
+def _load_history():
+    try:
+        with open(TRADES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _save_history():
+    try:
+        with open(TRADES_FILE, "w") as f:
+            json.dump(trade_history, f)
+    except Exception as e:
+        logger.warning(f"[HISTORY] save failed: {e}")
+
+trade_history = _load_history()
+logger.info(f"[HISTORY] loaded {len(trade_history)} trades from disk")
 
 # ── Strategy loop ──────────────────────────────────────────────────────────────
 def strategy_loop():
@@ -270,6 +288,7 @@ def strategy_loop():
                     "balance":  f"{paper['balance']:.2f}",
                     "pnl":      f"{pnl:+.4f}",
                 })
+                _save_history()
 
             # ── 2. Calculate indicators ───────────────────────────────────────
             closes = [c[4] for c in ohlcv[:-1]]
@@ -312,6 +331,7 @@ def strategy_loop():
                         "balance":  f"{paper['balance']:.2f}",
                         "pnl":      "—",
                     })
+                    _save_history()
                     state["position"] = "long"
 
                 elif signal == "SHORT" and cur_pos != "short":
@@ -328,6 +348,7 @@ def strategy_loop():
                         "balance":  f"{paper['balance']:.2f}",
                         "pnl":      "—",
                     })
+                    _save_history()
                     state["position"] = "short"
 
             prev_signal = signal
