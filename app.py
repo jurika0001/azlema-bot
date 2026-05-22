@@ -224,20 +224,16 @@ def strategy_loop():
         state["running"] = False
         return
 
-    # ── Sync: compute previous-candle signal to avoid false entry on startup ──
-    # On startup we calculate the signal of candle N-1 (second-to-last closed).
-    # The loop only enters a trade when signal CHANGES — identical to Pine Script
-    # crossover/crossunder behaviour (strategy.entry same-ID = no re-entry).
+    # Compute previous-candle signal on startup — no trade until signal CHANGES
     prev_signal    = None
     last_candle_ts = None
 
     init_ohlcv = fetch_candles()
     if init_ohlcv and len(init_ohlcv) >= 72:
-        closes_prev = [c[4] for c in init_ohlcv[:-2]]   # up to candle N-1
-        prev_signal = strat.calculate(closes_prev)["signal"]
-        last_candle_ts = init_ohlcv[-2][0]               # mark candle N as seen
-        logger.info(f"[SYNC] startup prev_signal={prev_signal}  "
-                    f"(no trade until signal changes)")
+        closes_prev    = [c[4] for c in init_ohlcv[:-2]]
+        prev_signal    = strat.calculate(closes_prev)["signal"]
+        last_candle_ts = init_ohlcv[-2][0]
+        logger.info(f"[SYNC] startup prev_signal={prev_signal}")
 
     while state["running"]:
         try:
@@ -247,32 +243,56 @@ def strategy_loop():
                 time_mod.sleep(20)
                 continue
 
-            # ── Closed candle ([-2]) is what Pine Script "sees" at bar close ──
-            last_closed  = ohlcv[-2]
-            candle_ts    = last_closed[0]
-            candle_o     = float(last_closed[1])
-            candle_h     = float(last_closed[2])
-            candle_l     = float(last_closed[3])
-            candle_c     = float(last_closed[4])
-            candle_str   = datetime.fromtimestamp(
+            # Last CLOSED candle
+            last_closed = ohlcv[-2]
+            candle_ts   = last_closed[0]
+            candle_o    = float(last_closed[1])
+            candle_h    = float(last_closed[2])
+            candle_l    = float(last_closed[3])
+            candle_c    = float(last_closed[4])
+            candle_str  = datetime.fromtimestamp(
                 candle_ts / 1000, tz=timezone.utc
             ).strftime("%Y-%m-%d %H:%M UTC")
 
-            # Update unrealized every cycle (live candle price)
-            live_price          = float(ohlcv[-1][4])
-            paper["unrealized"] = _unrealized(live_price)
+            # Currently FORMING candle — open = Pine Script "next bar open" (entry price)
+            forming   = ohlcv[-1]
+            forming_o = float(forming[1])
+            forming_h = float(forming[2])
+            forming_l = float(forming[3])
+            forming_c = float(forming[4])
 
+            paper["unrealized"] = _unrealized(forming_c)
+
+            # ── SAME CANDLE: intra-candle SL/TP check every 15 s ─────────────
+            # Matches Pine Script exit-order behaviour (exits happen intra-bar)
             if candle_ts == last_candle_ts:
+                f_ex, f_px, f_rsn = _check_exits(forming_o, forming_h,
+                                                  forming_l, forming_c)
+                if f_ex:
+                    f_side = paper["side"]
+                    f_pnl  = _close_position(f_px, f_rsn)
+                    trade_history.insert(0, {
+                        "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "candle":   candle_str,
+                        "side":     f"CLOSE {f_side.upper()} ({f_rsn})",
+                        "price":    f_px,
+                        "qty":      0,
+                        "order_id": f"EXIT-{f_rsn}",
+                        "balance":  f"{paper['balance']:.2f}",
+                        "pnl":      f"{f_pnl:+.4f}",
+                    })
+                    _save_history()
                 state.update({
                     "unrealized": f"{paper['unrealized']:+.2f}",
                     "balance":    f"{paper['balance']:.2f}",
+                    "position":   paper["side"],
                 })
                 time_mod.sleep(15)
                 continue
 
             last_candle_ts = candle_ts
 
-            # ── 1. Check SL / Trailing TP on this closed candle ───────────────
+            # ── 1. SL/TP on the newly CLOSED candle ──────────────────────────
             exited, exit_price, exit_reason = _check_exits(
                 candle_o, candle_h, candle_l, candle_c)
             if exited:
@@ -290,7 +310,7 @@ def strategy_loop():
                 })
                 _save_history()
 
-            # ── 2. Calculate indicators ───────────────────────────────────────
+            # ── 2. Indicators on closed candle ────────────────────────────────
             closes = [c[4] for c in ohlcv[:-1]]
             result = strat.calculate(closes)
             signal = result["signal"]
@@ -309,23 +329,22 @@ def strategy_loop():
                 "unrealized":  f"{paper['unrealized']:+.2f}",
             })
 
-            # ── 3. Entry only when signal CHANGES (Pine crossover behaviour) ──
-            # Same as Pine Script: strategy.entry with identical ID never
-            # re-enters the same direction — only acts on EC/EMA crossovers.
+            # ── 3. Entry at forming-candle OPEN (= Pine Script "next bar open")
+            # Only enters when signal CHANGES — no re-entry in same direction
             if signal and signal != prev_signal:
                 cur_pos = paper["side"]
                 balance = paper["balance"]
-                qty     = _calc_qty(candle_c, balance)
+                qty     = _calc_qty(forming_o, balance)
 
                 if signal == "LONG" and cur_pos != "long":
                     if cur_pos == "short":
-                        _close_position(candle_c, "SIGNAL_REVERSE")
-                    order = _open_position("LONG", qty, candle_c)
+                        _close_position(forming_o, "SIGNAL_REVERSE")
+                    order = _open_position("LONG", qty, forming_o)
                     trade_history.insert(0, {
                         "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "candle":   candle_str,
                         "side":     "LONG",
-                        "price":    candle_c,
+                        "price":    forming_o,
                         "qty":      qty,
                         "order_id": order["id"],
                         "balance":  f"{paper['balance']:.2f}",
@@ -336,13 +355,13 @@ def strategy_loop():
 
                 elif signal == "SHORT" and cur_pos != "short":
                     if cur_pos == "long":
-                        _close_position(candle_c, "SIGNAL_REVERSE")
-                    order = _open_position("SHORT", qty, candle_c)
+                        _close_position(forming_o, "SIGNAL_REVERSE")
+                    order = _open_position("SHORT", qty, forming_o)
                     trade_history.insert(0, {
                         "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "candle":   candle_str,
                         "side":     "SHORT",
-                        "price":    candle_c,
+                        "price":    forming_o,
                         "qty":      qty,
                         "order_id": order["id"],
                         "balance":  f"{paper['balance']:.2f}",
