@@ -170,6 +170,51 @@ def _check_exits(candle_open: float, candle_high: float,
 
     return False, 0.0, ""
 
+def _check_exits_tick(cur_price: float):
+    """
+    Real-time SL/TP check using current market price (called every 15 s).
+    Tracks peak from entry onwards — no stale OHLC contamination.
+    Matches Pine Script strategy.exit with loss / trail_points / trail_offset.
+    """
+    if paper["side"] == "none":
+        return False, 0.0, ""
+
+    entry = paper["entry_price"]
+
+    if paper["side"] == "long":
+        sl_price = round(entry - SL_DIST, 4)
+        # Advance peak
+        if cur_price > paper["peak"]:
+            paper["peak"] = cur_price
+        peak_profit = paper["peak"] - entry
+        if peak_profit >= TP_DIST:
+            new_trail = round(paper["peak"] - TR_DIST, 4)
+            if not paper["trail_active"] or new_trail > paper["trail_stop"]:
+                paper["trail_active"] = True
+                paper["trail_stop"]   = new_trail
+        if paper["trail_active"] and cur_price <= paper["trail_stop"]:
+            return True, paper["trail_stop"], "TRAIL_TP"
+        if cur_price <= sl_price:
+            return True, sl_price, "SL"
+
+    else:  # short
+        sl_price = round(entry + SL_DIST, 4)
+        if cur_price < paper["peak"] or paper["peak"] == 0:
+            paper["peak"] = cur_price
+        peak_profit = entry - paper["peak"]
+        if peak_profit >= TP_DIST:
+            new_trail = round(paper["peak"] + TR_DIST, 4)
+            if not paper["trail_active"] or new_trail < paper["trail_stop"]:
+                paper["trail_active"] = True
+                paper["trail_stop"]   = new_trail
+        if paper["trail_active"] and cur_price >= paper["trail_stop"]:
+            return True, paper["trail_stop"], "TRAIL_TP"
+        if cur_price >= sl_price:
+            return True, sl_price, "SL"
+
+    return False, 0.0, ""
+
+
 def _calc_qty(price: float, balance: float) -> float:
     sl_usdt    = SL_DIST  # $20
     risk_usdt  = RISK * balance
@@ -256,9 +301,28 @@ def strategy_loop():
             paper["unrealized"] = _unrealized(live_price)
 
             if candle_ts == last_candle_ts:
+                # ── Real-time SL/TP check every 15 s using current price ──────
+                t_ex, t_px, t_rsn = _check_exits_tick(live_price)
+                if t_ex:
+                    t_side = paper["side"]
+                    t_pnl  = _close_position(t_px, t_rsn)
+                    trade_history.insert(0, {
+                        "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "candle":   candle_str,
+                        "side":     f"CLOSE {t_side.upper()} ({t_rsn})",
+                        "price":    t_px,
+                        "qty":      0,
+                        "order_id": f"EXIT-{t_rsn}",
+                        "balance":  f"{paper['balance']:.2f}",
+                        "pnl":      f"{t_pnl:+.4f}",
+                    })
+                    _save_history()
+                    prev_signal = None  # re-entry allowed on next candle
                 state.update({
                     "unrealized": f"{paper['unrealized']:+.2f}",
                     "balance":    f"{paper['balance']:.2f}",
+                    "position":   paper["side"],
+                    "total_pnl":  f"{paper['total_pnl']:+.2f}",
                 })
                 time_mod.sleep(15)
                 continue
