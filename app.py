@@ -172,6 +172,55 @@ def _check_sl_tp(cur_price: float):
 
     return False, 0.0, ""
 
+def _check_sl_tp_candle(candle_h: float, candle_l: float):
+    """
+    SL/TP check using a CLOSED candle's H/L.
+    Called once per new closed candle — matches TradingView broker emulator:
+    peak updated with candle high (long) or low (short),
+    then checks if candle low/high breached trail_stop or SL.
+    """
+    if paper["side"] == "none":
+        return False, 0.0, ""
+
+    entry = paper["entry_price"]
+
+    if paper["side"] == "long":
+        # Advance peak using candle HIGH (TradingView sees full bar range)
+        if candle_h > paper["peak"]:
+            paper["peak"] = candle_h
+        peak_profit = paper["peak"] - entry
+        if peak_profit >= TP_DIST:
+            new_trail = round(paper["peak"] - TR_DIST, 4)
+            if not paper["trail_active"] or new_trail > paper["trail_stop"]:
+                paper["trail_active"] = True
+                paper["trail_stop"]   = new_trail
+        # Candle LOW crossed trail stop?
+        if paper["trail_active"] and candle_l <= paper["trail_stop"]:
+            return True, paper["trail_stop"], "TRAIL_TP"
+        # Candle LOW crossed hard SL?
+        sl_price = round(entry - SL_DIST, 4)
+        if candle_l <= sl_price:
+            return True, sl_price, "SL"
+
+    else:  # short
+        # Advance peak (lowest price) using candle LOW
+        if candle_l < paper["peak"] or paper["peak"] == 0:
+            paper["peak"] = candle_l
+        peak_profit = entry - paper["peak"]
+        if peak_profit >= TP_DIST:
+            new_trail = round(paper["peak"] + TR_DIST, 4)
+            if not paper["trail_active"] or new_trail < paper["trail_stop"]:
+                paper["trail_active"] = True
+                paper["trail_stop"]   = new_trail
+        if paper["trail_active"] and candle_h >= paper["trail_stop"]:
+            return True, paper["trail_stop"], "TRAIL_TP"
+        sl_price = round(entry + SL_DIST, 4)
+        if candle_h >= sl_price:
+            return True, sl_price, "SL"
+
+    return False, 0.0, ""
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TRADE HISTORY  (persisted to disk)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -250,19 +299,18 @@ def strategy_loop():
         state["running"] = False
         return
 
-    # ── Startup sync: compute prev_signal from candle N-1 so we don't open
-    #    immediately — only enter when signal CHANGES (like Pine crossover)
-    prev_signal    = None
-    last_candle_ts = None
+    # ── Startup: mark current candle as seen, enter on the NEXT close ──────
+    # prev_signal=None ensures ANY signal on next candle triggers entry
+    prev_signal     = None
+    last_candle_ts  = None
     last_candle_str = "—"
 
     init = fetch_candles()
-    if init and len(init) >= 72:
-        prev_signal    = strat.calculate([c[4] for c in init[:-2]])["signal"]
-        last_candle_ts = init[-2][0]
-        logger.info(f"[SYNC] startup prev_signal={prev_signal}")
+    if init and len(init) >= 70:
+        last_candle_ts = init[-2][0]   # mark last closed candle as already seen
+        logger.info(f"[SYNC] startup ready — will enter on next candle close")
     else:
-        logger.warning("[SYNC] not enough candles for startup sync")
+        logger.warning("[SYNC] not enough candles for startup")
 
     while state["running"]:
         try:
@@ -321,6 +369,20 @@ def strategy_loop():
                 continue
 
             last_candle_ts = candle_ts
+
+            # ── Candle-based SL/TP (H/L of closed candle — matches TradingView)
+            candle_h = float(last_closed[2])
+            candle_l = float(last_closed[3])
+            cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(candle_h, candle_l)
+            if cl_ex and paper["side"] != "none":
+                cl_side = paper["side"]
+                cl_pnl  = _close_position(cl_px, cl_rsn)
+                _record_exit(cl_side.upper(), cl_px, cl_rsn, cl_pnl, last_candle_str)
+                prev_signal = None
+                state.update({"position": "none", "unrealized": "0.00",
+                               "balance": f"{paper['balance']:.2f}",
+                               "total_pnl": f"{paper['total_pnl']:+.2f}",
+                               "trail_stop": "—"})
 
             # Calculate signal on closed candles
             closes = [c[4] for c in ohlcv[:-1]]
