@@ -320,9 +320,17 @@ def strategy_loop():
                 time_mod.sleep(20)
                 continue
 
-            # Last closed candle = ohlcv[-2]
-            # ohlcv[-1] = currently forming candle (live price = its close)
-            last_closed = ohlcv[-2]
+            # Auto-detect whether Phemex includes the forming candle.
+            # If last bar's timestamp is inside the current 30-min window
+            # → forming candle included → use ohlcv[-2] as last closed.
+            # Otherwise → all closed → use ohlcv[-1] as last closed.
+            _TF_MS        = 30 * 60 * 1000
+            _now_ms       = int(time_mod.time() * 1000)
+            _win_start    = (_now_ms // _TF_MS) * _TF_MS
+            _has_forming  = (ohlcv[-1][0] >= _win_start)
+            last_closed   = ohlcv[-2] if _has_forming else ohlcv[-1]
+            _sig_closes   = ohlcv[:-1] if _has_forming else ohlcv
+
             candle_ts   = last_closed[0]
             candle_c    = float(last_closed[4])
             last_candle_str = datetime.fromtimestamp(
@@ -385,7 +393,7 @@ def strategy_loop():
                                "trail_stop": "—"})
 
             # Calculate signal on closed candles
-            closes = [c[4] for c in ohlcv[:-1]]
+            closes = [c[4] for c in _sig_closes]
             result = strat.calculate(closes)
             signal = result["signal"]
 
@@ -402,24 +410,27 @@ def strategy_loop():
             # prev_signal=None forces re-entry after SL/TP exit
             if signal and signal != prev_signal:
                 cur_pos = paper["side"]
-                qty     = _calc_qty(candle_c, paper["balance"])
+                qty     = _calc_qty(live_price if live_price > 0 else candle_c, paper["balance"])
+
+                # Entry at current market price (≈ next bar open)
+                entry_px = live_price if live_price > 0 else candle_c
 
                 if signal == "LONG" and cur_pos != "long":
                     if cur_pos == "short":
-                        pnl = _close_position(candle_c, "SIGNAL_REVERSE")
-                        _record_exit("SHORT", candle_c, "SIGNAL_REVERSE",
+                        pnl = _close_position(entry_px, "SIGNAL_REVERSE")
+                        _record_exit("SHORT", entry_px, "SIGNAL_REVERSE",
                                      pnl, last_candle_str)
-                    order = _open_position("LONG", qty, candle_c)
-                    _record_entry("LONG", candle_c, qty,
+                    order = _open_position("LONG", qty, entry_px)
+                    _record_entry("LONG", entry_px, qty,
                                   last_candle_str, order["id"])
 
                 elif signal == "SHORT" and cur_pos != "short":
                     if cur_pos == "long":
-                        pnl = _close_position(candle_c, "SIGNAL_REVERSE")
-                        _record_exit("LONG", candle_c, "SIGNAL_REVERSE",
+                        pnl = _close_position(entry_px, "SIGNAL_REVERSE")
+                        _record_exit("LONG", entry_px, "SIGNAL_REVERSE",
                                      pnl, last_candle_str)
-                    order = _open_position("SHORT", qty, candle_c)
-                    _record_entry("SHORT", candle_c, qty,
+                    order = _open_position("SHORT", qty, entry_px)
+                    _record_entry("SHORT", entry_px, qty,
                                   last_candle_str, order["id"])
 
             prev_signal = signal
