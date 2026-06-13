@@ -27,8 +27,19 @@ CANDLES         = 200
 PAPER_START_BAL = 10_000.0
 PORT            = int(os.environ.get("PORT", 10000))
 
-# Configurable trade fees (updated via /settings)
-fees = {"entry": 0.05, "exit": 0.05}   # % per trade side
+# Configurable trade fees (persisted to disk)
+FEES_FILE = "fees.json"
+def _load_fees():
+    try:
+        with open(FEES_FILE) as f: return json.load(f)
+    except Exception: return {"entry": 0.05, "exit": 0.05}
+def _save_fees():
+    try:
+        with open(FEES_FILE, "w") as f: json.dump(fees, f)
+    except Exception: pass
+
+fees = _load_fees()
+logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # EXCHANGE  (Phemex live — OHLCV + ticker only, no auth needed)
@@ -303,8 +314,15 @@ def strategy_loop():
 
     init = fetch_candles()
     if init and len(init) >= 70:
-        last_candle_ts = init[-2][0]
-        logger.info("[SYNC] ready — entering on next candle close")
+        # Same auto-detection as main loop — timestamps must match
+        _i_TF   = 30 * 60 * 1000
+        _i_now  = int(time_mod.time() * 1000)
+        _i_win  = (_i_now // _i_TF) * _i_TF
+        _i_form = (init[-1][0] >= _i_win)
+        _i_last = init[-2] if _i_form else init[-1]
+        last_candle_ts = _i_last[0]
+        logger.info(f"[SYNC] last_candle_ts={last_candle_ts}  "
+                    f"forming={_i_form} — waiting for next close")
 
     while state["running"]:
         try:
@@ -622,6 +640,11 @@ async function fetchAll(){
     <td>$${r.balance}</td>
     <td style="font-size:.68rem;color:#8b949e">${r.order_id}</td></tr>`).join('')
     :'<tr><td colspan="8" style="text-align:center;color:#484f58;padding:20px">Nenhuma trade ainda</td></tr>'}
+// Load saved fee values on page open
+fetch('/settings').then(r=>r.json()).then(d=>{
+  document.getElementById('fee-entry').value=d.fee_entry;
+  document.getElementById('fee-exit').value=d.fee_exit;
+});
 fetchAll();setInterval(fetchAll,10000);
 </script>
 </body>
@@ -640,6 +663,10 @@ def status(): return jsonify({**state, "running": state["running"]})
 @app.route("/history")
 def history(): return jsonify(trade_history)
 
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    return jsonify({"fee_entry": fees["entry"], "fee_exit": fees["exit"]})
+
 @app.route("/settings", methods=["POST"])
 def settings():
     data = request.get_json() or {}
@@ -647,6 +674,7 @@ def settings():
         fees["entry"] = float(data["fee_entry"])
     if "fee_exit" in data:
         fees["exit"] = float(data["fee_exit"])
+    _save_fees()
     logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
     return jsonify({"ok": True, "message": f"Fees: entrada {fees['entry']}% / saída {fees['exit']}%"})
 
