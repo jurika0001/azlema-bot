@@ -158,73 +158,81 @@ def _calc_qty(price, balance):
 # SL / TRAILING TP  — two variants
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _check_sl_tp(cur_price: float):
-    """Real-time check via ticker price (called every 15 s)."""
+    """
+    Real-time check via ticker (every 15 s).
+    NEVER updates peak — peak is only updated by closed candle H/L.
+    Only checks whether current price has crossed the pre-computed trail_stop or SL.
+    Matches TradingView calc_on_every_tick=false: peak from bars, check from ticks.
+    """
     if paper["side"] == "none":
         return False, 0.0, ""
     entry = paper["entry_price"]
     if paper["side"] == "long":
-        sl = round(entry - SL_DIST, 4)
-        if cur_price > paper["peak"]:
-            paper["peak"] = cur_price
-        pp = paper["peak"] - entry
-        if pp >= TP_DIST:
-            nt = round(paper["peak"] - TR_DIST, 4)
-            if not paper["trail_active"] or nt > paper["trail_stop"]:
-                paper["trail_active"] = True
-                paper["trail_stop"]   = nt
         if paper["trail_active"] and cur_price <= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
+        sl = round(entry - SL_DIST, 4)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
-        sl = round(entry + SL_DIST, 4)
-        if cur_price < paper["peak"] or paper["peak"] == 0:
-            paper["peak"] = cur_price
-        pp = entry - paper["peak"]
-        if pp >= TP_DIST:
-            nt = round(paper["peak"] + TR_DIST, 4)
-            if not paper["trail_active"] or nt < paper["trail_stop"]:
-                paper["trail_active"] = True
-                paper["trail_stop"]   = nt
         if paper["trail_active"] and cur_price >= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
+        sl = round(entry + SL_DIST, 4)
         if cur_price >= sl:
             return True, sl, "SL"
     return False, 0.0, ""
 
 def _check_sl_tp_candle(h: float, l: float):
-    """Candle H/L check — catches peaks missed between 15-s polls."""
+    """
+    Closed candle H/L check — matches TradingView broker emulator exactly.
+    1. Updates peak using candle HIGH (long) or LOW (short).
+    2. Activates/updates trail_stop when peak profit >= TP_DIST.
+    3. Checks if candle range crossed trail_stop or SL.
+    TradingView order of operations for a LONG bar:
+      checks LOW for SL first, then HIGH for trail activation.
+    For SHORT: checks HIGH for SL first, then LOW for trail activation.
+    """
     if paper["side"] == "none":
         return False, 0.0, ""
     entry = paper["entry_price"]
+
     if paper["side"] == "long":
+        sl = round(entry - SL_DIST, 4)
+        # Check SL first (TradingView checks worst case first)
+        if l <= sl:
+            return True, sl, "SL"
+        # Update peak with this bar's HIGH
         if h > paper["peak"]:
             paper["peak"] = h
         pp = paper["peak"] - entry
+        # Activate / advance trail stop
         if pp >= TP_DIST:
             nt = round(paper["peak"] - TR_DIST, 4)
             if not paper["trail_active"] or nt > paper["trail_stop"]:
                 paper["trail_active"] = True
                 paper["trail_stop"]   = nt
+        # Check trail stop
         if paper["trail_active"] and l <= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        sl = round(entry - SL_DIST, 4)
-        if l <= sl:
+
+    else:  # short
+        sl = round(entry + SL_DIST, 4)
+        # Check SL first
+        if h >= sl:
             return True, sl, "SL"
-    else:
+        # Update peak with this bar's LOW
         if l < paper["peak"] or paper["peak"] == 0:
             paper["peak"] = l
         pp = entry - paper["peak"]
+        # Activate / advance trail stop
         if pp >= TP_DIST:
             nt = round(paper["peak"] + TR_DIST, 4)
             if not paper["trail_active"] or nt < paper["trail_stop"]:
                 paper["trail_active"] = True
                 paper["trail_stop"]   = nt
+        # Check trail stop
         if paper["trail_active"] and h >= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        sl = round(entry + SL_DIST, 4)
-        if h >= sl:
-            return True, sl, "SL"
+
     return False, 0.0, ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -294,6 +302,22 @@ state = {
     "winrate":     "—",
 }
 
+def _resolve_candles(ohlcv):
+    """
+    Returns (last_closed, sig_closes).
+    A candle with timestamp T covers T … T+1800 s.
+    If T+1800 > now  →  still forming  →  skip it.
+    """
+    TF_MS   = 1800 * 1000
+    now_ms  = int(time_mod.time() * 1000)
+    if ohlcv[-1][0] + TF_MS > now_ms:
+        # Last bar is still forming — use second-to-last as closed
+        return ohlcv[-2], ohlcv[:-1]
+    else:
+        # All bars are closed — last bar is the most recent closed
+        return ohlcv[-1], ohlcv
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STRATEGY LOOP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -314,15 +338,11 @@ def strategy_loop():
 
     init = fetch_candles()
     if init and len(init) >= 70:
-        # Same auto-detection as main loop — timestamps must match
-        _i_TF   = 30 * 60 * 1000
-        _i_now  = int(time_mod.time() * 1000)
-        _i_win  = (_i_now // _i_TF) * _i_TF
-        _i_form = (init[-1][0] >= _i_win)
-        _i_last = init[-2] if _i_form else init[-1]
+        _i_last, _ = _resolve_candles(init)
         last_candle_ts = _i_last[0]
         logger.info(f"[SYNC] last_candle_ts={last_candle_ts}  "
-                    f"forming={_i_form} — waiting for next close")
+                    f"ts_str={datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)} "
+                    f"— waiting for next close")
 
     while state["running"]:
         try:
@@ -332,13 +352,8 @@ def strategy_loop():
                 time_mod.sleep(20)
                 continue
 
-            # Auto-detect forming candle
-            _TF_MS       = 30 * 60 * 1000
-            _now_ms      = int(time_mod.time() * 1000)
-            _win         = (_now_ms // _TF_MS) * _TF_MS
-            _has_forming = (ohlcv[-1][0] >= _win)
-            last_closed  = ohlcv[-2] if _has_forming else ohlcv[-1]
-            _sig_closes  = ohlcv[:-1] if _has_forming else ohlcv
+            # Resolve last closed candle correctly
+            last_closed, _sig_closes = _resolve_candles(ohlcv)
 
             candle_ts = last_closed[0]
             candle_c  = float(last_closed[4])
