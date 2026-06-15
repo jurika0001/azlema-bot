@@ -332,139 +332,140 @@ def strategy_loop():
         state["running"] = False
         return
 
-    prev_signal     = None
-    last_candle_ts  = None
-    last_candle_str = "—"
+    prev_signal      = None
+    last_candle_ts   = None
+    last_candle_str  = "—"
+    skip_entry       = False
+    last_ohlcv_check = 0.0   # throttle ohlcv fetching to every 15 s
 
-    init = fetch_candles()
-    if init and len(init) >= 70:
-        _i_last, _ = _resolve_candles(init)
-        last_candle_ts = _i_last[0]
-        logger.info(f"[SYNC] last_candle_ts={last_candle_ts}  "
-                    f"ts_str={datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)} "
-                    f"— waiting for next close")
+    # Startup sync
+    init_ohlcv = fetch_candles()
+    if init_ohlcv and len(init_ohlcv) >= 70:
+        _lc, _ = _resolve_candles(init_ohlcv)
+        last_candle_ts = _lc[0]
+        logger.info(f"[SYNC] locked to candle "
+                    f"{datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)}"
+                    f" — waiting for next close")
 
     while state["running"]:
         try:
-            ohlcv = fetch_candles()
-            if not ohlcv or len(ohlcv) < 70:
-                state["status"] = f"Waiting ({len(ohlcv)} candles)"
-                time_mod.sleep(20)
-                continue
-
-            # Resolve last closed candle correctly
-            last_closed, _sig_closes = _resolve_candles(ohlcv)
-
-            candle_ts = last_closed[0]
-            candle_c  = float(last_closed[4])
-            last_candle_str = datetime.fromtimestamp(
-                candle_ts / 1000, tz=timezone.utc
-            ).strftime("%Y-%m-%d %H:%M UTC")
-
-            # Live price via ticker
+            # ── 1. REAL-TIME SL/TP CHECK  (every ~1 s, ticker only) ──────────
             live_price = get_live_price()
-            if live_price == 0.0:
-                live_price = candle_c
+            if live_price > 0:
+                paper["unrealized"] = _unrealized_pct(live_price)
+                skip_entry = False
 
-            paper["unrealized"] = _unrealized_pct(live_price)
+                ex, ex_px, ex_rsn = _check_sl_tp(live_price)
+                if ex:
+                    ex_side = paper["side"]
+                    raw, pct = _close_position(ex_px, ex_rsn)
+                    _record_exit(ex_side.upper(), ex_px, ex_rsn,
+                                 raw, pct, last_candle_str)
+                    skip_entry = True
+                    state.update({
+                        "position": "none", "unrealized": "0.00",
+                        "balance":  f"{paper['balance']:.2f}",
+                        "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                        "trail_stop": "—",
+                        "winrate":  _winrate(),
+                    })
+                    logger.info(f"[EXIT] {ex_rsn} @ {ex_px:.2f}  pnl={pct:+.2f}%")
 
-            # ── REAL-TIME SL/TP (every 15 s) ──────────────────────────────────
-            skip_entry = False
-            ex, ex_px, ex_rsn = _check_sl_tp(live_price)
-            if ex:
-                ex_side = paper["side"]
-                raw, pct = _close_position(ex_px, ex_rsn)
-                _record_exit(ex_side.upper(), ex_px, ex_rsn, raw, pct, last_candle_str)
-                skip_entry = True   # don't re-open on this same candle
+                trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
+                              else ("armed" if paper["side"] != "none" else "—"))
                 state.update({
-                    "position":       "none", "unrealized": "0.00",
-                    "balance":        f"{paper['balance']:.2f}",
-                    "total_pnl_pct":  f"{paper['total_pnl_pct']:+.2f}",
-                    "trail_stop":     "—",
-                    "winrate":        _winrate(),
-                })
-
-            # State refresh every cycle
-            trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
-                          else "armed" if paper["side"] != "none" else "—")
-            state.update({
-                "position":      paper["side"],
-                "unrealized":    f"{paper['unrealized']:+.2f}",
-                "balance":       f"{paper['balance']:.2f}",
-                "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                "trail_stop":    trail_disp,
-                "status":        "Running",
-            })
-
-            # ── NEW CANDLE ─────────────────────────────────────────────────────
-            if candle_ts == last_candle_ts:
-                time_mod.sleep(15)
-                continue
-
-            last_candle_ts = candle_ts
-
-            # Candle H/L check (catches peaks missed between polls)
-            cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
-                float(last_closed[2]), float(last_closed[3]))
-            if cl_ex and paper["side"] != "none":
-                cl_side = paper["side"]
-                raw, pct = _close_position(cl_px, cl_rsn)
-                _record_exit(cl_side.upper(), cl_px, cl_rsn, raw, pct, last_candle_str)
-                skip_entry = True
-                state.update({
-                    "position":      "none", "unrealized": "0.00",
+                    "unrealized":    f"{paper['unrealized']:+.2f}",
                     "balance":       f"{paper['balance']:.2f}",
                     "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                    "trail_stop":    "—",
-                    "winrate":       _winrate(),
+                    "trail_stop":    trail_disp,
+                    "position":      paper["side"],
+                    "status":        "Running",
                 })
 
-            # Signal calculation
-            closes = [c[4] for c in _sig_closes]
-            result = strat.calculate(closes)
-            signal = result["signal"]
+            # ── 2. CANDLE CHECK  (every 15 s, full OHLCV) ────────────────────
+            now = time_mod.time()
+            if now - last_ohlcv_check >= 15:
+                last_ohlcv_check = now
+                ohlcv = fetch_candles()
 
-            state.update({
-                "signal":      signal or "—",
-                "ema":         f"{result['ema']:.4f}" if result["ema"] else "—",
-                "ec":          f"{result['ec']:.4f}"  if result["ec"]  else "—",
-                "period":      str(result["period"]),
-                "last_candle": last_candle_str,
-                "updated":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "winrate":     _winrate(),
-            })
+                if ohlcv and len(ohlcv) >= 70:
+                    last_closed, sig_closes = _resolve_candles(ohlcv)
+                    candle_ts = last_closed[0]
+                    last_candle_str = datetime.fromtimestamp(
+                        candle_ts / 1000, tz=timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
 
-            # ── ENTRY (only when signal changes, never on same candle as exit) ─
-            if signal and signal != prev_signal and not skip_entry:
-                cur_pos  = paper["side"]
-                entry_px = live_price if live_price > 0 else candle_c
-                qty      = _calc_qty(entry_px, paper["balance"])
+                    if candle_ts != last_candle_ts:
+                        last_candle_ts = candle_ts
+                        skip_entry = False
 
-                if signal == "LONG" and cur_pos != "long":
-                    if cur_pos == "short":
-                        raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
-                        _record_exit("SHORT", entry_px, "SIGNAL_REVERSE",
-                                     raw, pct, last_candle_str)
-                    order = _open_position("LONG", qty, entry_px)
-                    _record_entry("LONG", entry_px, qty, last_candle_str, order["id"])
+                        # Candle H/L catches any peak missed between 1-s polls
+                        cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
+                            float(last_closed[2]), float(last_closed[3]))
+                        if cl_ex and paper["side"] != "none":
+                            cl_side = paper["side"]
+                            raw, pct = _close_position(cl_px, cl_rsn)
+                            _record_exit(cl_side.upper(), cl_px, cl_rsn,
+                                         raw, pct, last_candle_str)
+                            skip_entry = True
+                            state.update({
+                                "position": "none", "unrealized": "0.00",
+                                "balance":  f"{paper['balance']:.2f}",
+                                "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                                "trail_stop": "—",
+                                "winrate":  _winrate(),
+                            })
 
-                elif signal == "SHORT" and cur_pos != "short":
-                    if cur_pos == "long":
-                        raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
-                        _record_exit("LONG", entry_px, "SIGNAL_REVERSE",
-                                     raw, pct, last_candle_str)
-                    order = _open_position("SHORT", qty, entry_px)
-                    _record_entry("SHORT", entry_px, qty, last_candle_str, order["id"])
+                        # Signal
+                        closes = [c[4] for c in sig_closes]
+                        result = strat.calculate(closes)
+                        signal = result["signal"]
+                        state.update({
+                            "signal":      signal or "—",
+                            "ema":         f"{result['ema']:.4f}" if result["ema"] else "—",
+                            "ec":          f"{result['ec']:.4f}"  if result["ec"]  else "—",
+                            "period":      str(result["period"]),
+                            "last_candle": last_candle_str,
+                            "updated":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "winrate":     _winrate(),
+                        })
 
-            # Keep prev_signal=None if we skipped entry (forces re-eval next candle)
-            prev_signal = None if skip_entry else signal
+                        # Entry — never on the same candle as an exit
+                        if signal and signal != prev_signal and not skip_entry:
+                            entry_px = live_price if live_price > 0 else float(last_closed[4])
+                            qty      = _calc_qty(entry_px, paper["balance"])
+                            cur_pos  = paper["side"]
+
+                            if signal == "LONG" and cur_pos != "long":
+                                if cur_pos == "short":
+                                    raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
+                                    _record_exit("SHORT", entry_px, "SIGNAL_REVERSE",
+                                                 raw, pct, last_candle_str)
+                                order = _open_position("LONG", qty, entry_px)
+                                _record_entry("LONG", entry_px, qty,
+                                              last_candle_str, order["id"])
+
+                            elif signal == "SHORT" and cur_pos != "short":
+                                if cur_pos == "long":
+                                    raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
+                                    _record_exit("LONG", entry_px, "SIGNAL_REVERSE",
+                                                 raw, pct, last_candle_str)
+                                order = _open_position("SHORT", qty, entry_px)
+                                _record_entry("SHORT", entry_px, qty,
+                                              last_candle_str, order["id"])
+
+                        prev_signal = None if skip_entry else signal
+
+            # ── 3. SLEEP 1 SECOND ─────────────────────────────────────────────
+            time_mod.sleep(1)
 
         except Exception as e:
             logger.error(f"[LOOP] {e}")
             state["status"] = f"Error: {str(e)[:80]}"
-            time_mod.sleep(20)
+            time_mod.sleep(5)
 
     state["status"] = "Stopped"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # KEEPALIVE
