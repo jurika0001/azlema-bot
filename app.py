@@ -44,11 +44,17 @@ logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # EXCHANGE  (Phemex live — OHLCV + ticker only, no auth needed)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# enableRateLimit=False on a SEPARATE ohlcv-only instance — the 1-second
+# ticker poll below bypasses ccxt entirely via raw HTTP, so it is never
+# throttled by ccxt's internal rate limiter.
 live_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
-SYMBOL  = None
+SYMBOL       = None
+_PRICE_SCALE = 10000   # ETHUSDT default; auto-corrected in init_markets()
+
+_ticker_session = req.Session()
 
 def init_markets():
-    global SYMBOL
+    global SYMBOL, _PRICE_SCALE
     mkts = live_ex.load_markets()
     for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
         if sym in mkts:
@@ -59,13 +65,41 @@ def init_markets():
                 SYMBOL = k; break
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
-    logger.info(f"[INIT] symbol={SYMBOL}")
+
+    # Auto-detect Phemex price scale by comparing raw REST vs ccxt-normalised
+    try:
+        raw_r = _ticker_session.get(
+            "https://api.phemex.com/md/v2/ticker/24hr",
+            params={"symbol": "ETHUSDT"}, timeout=5).json()
+        raw   = float(raw_r.get("result", {}).get("lastPrice", 0))
+        ref   = float(live_ex.fetch_ticker(SYMBOL)["last"])
+        if raw > 0 and ref > 0:
+            ratio = round(raw / ref)
+            if ratio in (1, 10, 100, 1000, 10000, 100000):
+                _PRICE_SCALE = ratio
+    except Exception as e:
+        logger.warning(f"[SCALE] detect failed, using default 10000: {e}")
+
+    logger.info(f"[INIT] symbol={SYMBOL}  price_scale={_PRICE_SCALE}")
 
 def get_live_price() -> float:
+    """
+    True 1-second-capable price fetch — raw HTTP, bypasses ccxt rate limiter.
+    """
+    try:
+        r = _ticker_session.get(
+            "https://api.phemex.com/md/v2/ticker/24hr",
+            params={"symbol": "ETHUSDT"}, timeout=2)
+        d   = r.json()
+        raw = d.get("result", {}).get("lastPrice")
+        if raw:
+            return float(raw) / _PRICE_SCALE
+    except Exception as e:
+        logger.warning(f"[TICKER] http failed: {e}")
+    # Fallback to ccxt (rate-limited but reliable)
     try:
         return float(live_ex.fetch_ticker(SYMBOL or "ETH/USDT:USDT")["last"])
-    except Exception as e:
-        logger.warning(f"[TICKER] {e}")
+    except Exception:
         return 0.0
 
 def fetch_candles(limit=CANDLES):
