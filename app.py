@@ -42,20 +42,28 @@ fees = _load_fees()
 logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# EXCHANGE  (Phemex live — OHLCV + ticker only, no auth needed)
+# EXCHANGE  (Phemex live — OHLCV + ticker, no auth needed)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# enableRateLimit=False on a SEPARATE ohlcv-only instance — the 1-second
-# ticker poll below bypasses ccxt entirely via raw HTTP, so it is never
-# throttled by ccxt's internal rate limiter.
-live_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
-SYMBOL       = None
-_PRICE_SCALE = 10000   # ETHUSDT default; auto-corrected in init_markets()
+# live_ex   : used for OHLCV (rate-limited — fine, only polled every 15 s)
+# ticker_ex : SEPARATE instance, rate-limit disabled, used ONLY for the 1-s
+#             price poll. ccxt's own price-scale handling is battle-tested —
+#             we do NOT guess/derive the scale manually (that was the bug:
+#             a one-off guessed ratio silently drifted wrong over time and
+#             corrupted every subsequent SL/TP price).
+live_ex   = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
+ticker_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": False,
+                          "timeout": 3000})
+SYMBOL = None
 
-_ticker_session = req.Session()
+# Sanity-filter state — rejects implausible single-tick price jumps caused by
+# any transient bad read (network glitch, momentarily stale exchange cache).
+_last_good_price = 0.0
+_MAX_TICK_JUMP_PCT = 1.5   # ETH/USDT should not move >1.5% in a single second
 
 def init_markets():
-    global SYMBOL, _PRICE_SCALE
+    global SYMBOL
     mkts = live_ex.load_markets()
+    ticker_ex.load_markets()
     for sym in ["ETH/USDT:USDT", "ETH/USD:ETH"]:
         if sym in mkts:
             SYMBOL = sym; break
@@ -65,42 +73,35 @@ def init_markets():
                 SYMBOL = k; break
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
-
-    # Auto-detect Phemex price scale by comparing raw REST vs ccxt-normalised
-    try:
-        raw_r = _ticker_session.get(
-            "https://api.phemex.com/md/v2/ticker/24hr",
-            params={"symbol": "ETHUSDT"}, timeout=5).json()
-        raw   = float(raw_r.get("result", {}).get("lastPrice", 0))
-        ref   = float(live_ex.fetch_ticker(SYMBOL)["last"])
-        if raw > 0 and ref > 0:
-            ratio = round(raw / ref)
-            if ratio in (1, 10, 100, 1000, 10000, 100000):
-                _PRICE_SCALE = ratio
-    except Exception as e:
-        logger.warning(f"[SCALE] detect failed, using default 10000: {e}")
-
-    logger.info(f"[INIT] symbol={SYMBOL}  price_scale={_PRICE_SCALE}")
+    logger.info(f"[INIT] symbol={SYMBOL}")
 
 def get_live_price() -> float:
     """
-    True 1-second-capable price fetch — raw HTTP, bypasses ccxt rate limiter.
+    1-second-capable price fetch via ccxt (rate-limit disabled on this
+    dedicated instance). Uses ccxt's tested price-scale normalisation —
+    no manual scale guessing. A sanity filter rejects single-tick jumps
+    larger than _MAX_TICK_JUMP_PCT, which would indicate a corrupted read
+    rather than real ETH price movement.
     """
+    global _last_good_price
     try:
-        r = _ticker_session.get(
-            "https://api.phemex.com/md/v2/ticker/24hr",
-            params={"symbol": "ETHUSDT"}, timeout=2)
-        d   = r.json()
-        raw = d.get("result", {}).get("lastPrice")
-        if raw:
-            return float(raw) / _PRICE_SCALE
+        price = float(ticker_ex.fetch_ticker(SYMBOL or "ETH/USDT:USDT")["last"])
+        if price <= 0:
+            return _last_good_price
+
+        if _last_good_price > 0:
+            jump_pct = abs(price - _last_good_price) / _last_good_price * 100
+            if jump_pct > _MAX_TICK_JUMP_PCT:
+                logger.warning(f"[TICKER] rejected implausible jump "
+                                f"{_last_good_price:.2f} → {price:.2f} "
+                                f"({jump_pct:.2f}%) — keeping last good price")
+                return _last_good_price
+
+        _last_good_price = price
+        return price
     except Exception as e:
-        logger.warning(f"[TICKER] http failed: {e}")
-    # Fallback to ccxt (rate-limited but reliable)
-    try:
-        return float(live_ex.fetch_ticker(SYMBOL or "ETH/USDT:USDT")["last"])
-    except Exception:
-        return 0.0
+        logger.warning(f"[TICKER] {e}")
+        return _last_good_price
 
 def fetch_candles(limit=CANDLES):
     try:
