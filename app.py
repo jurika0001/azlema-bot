@@ -50,14 +50,20 @@ logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
 #             we do NOT guess/derive the scale manually (that was the bug:
 #             a one-off guessed ratio silently drifted wrong over time and
 #             corrupted every subsequent SL/TP price).
-live_ex   = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
-ticker_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": False,
-                          "timeout": 3000})
+live_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
+# ticker_ex: dedicated instance with a LIGHT custom rate limit — fast enough
+# for ~1 req/s, but still self-throttled so Phemex never bans/blocks the IP
+# (disabling rate-limit entirely caused exactly that — silent total failure).
+ticker_ex = ccxt.phemex({
+    "options": {"defaultType": "swap"},
+    "enableRateLimit": True,
+    "rateLimit": 250,     # ms between requests — safe, still ~4 req/s ceiling
+    "timeout": 6000,
+})
 SYMBOL = None
 
-# Sanity-filter state — rejects implausible single-tick price jumps caused by
-# any transient bad read (network glitch, momentarily stale exchange cache).
-_last_good_price = 0.0
+_last_good_price   = 0.0
+_ticker_fail_count = 0
 _MAX_TICK_JUMP_PCT = 1.5   # ETH/USDT should not move >1.5% in a single second
 
 def init_markets():
@@ -73,20 +79,32 @@ def init_markets():
                 SYMBOL = k; break
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
+    # Warm up ticker_ex once at init so the first loop iteration isn't 0.0
+    try:
+        warm = float(ticker_ex.fetch_ticker(SYMBOL)["last"])
+        if warm > 0:
+            global _last_good_price
+            _last_good_price = warm
+            logger.info(f"[INIT] ticker warm-up OK price={warm:.2f}")
+    except Exception as e:
+        logger.warning(f"[INIT] ticker warm-up failed: {type(e).__name__}: {e}")
     logger.info(f"[INIT] symbol={SYMBOL}")
 
 def get_live_price() -> float:
     """
-    1-second-capable price fetch via ccxt (rate-limit disabled on this
-    dedicated instance). Uses ccxt's tested price-scale normalisation —
-    no manual scale guessing. A sanity filter rejects single-tick jumps
-    larger than _MAX_TICK_JUMP_PCT, which would indicate a corrupted read
-    rather than real ETH price movement.
+    Real-time price via ccxt with a light, safe rate limit (avoids exchange
+    bans). Sanity filter rejects single-tick jumps > _MAX_TICK_JUMP_PCT,
+    which would indicate a corrupted read rather than real price movement.
+    Logs the actual exception type/message on failure so root cause is
+    visible in Render logs instead of failing silently.
     """
-    global _last_good_price
+    global _last_good_price, _ticker_fail_count
     try:
         price = float(ticker_ex.fetch_ticker(SYMBOL or "ETH/USDT:USDT")["last"])
         if price <= 0:
+            _ticker_fail_count += 1
+            if _ticker_fail_count % 10 == 1:
+                logger.warning(f"[TICKER] got non-positive price ({price})")
             return _last_good_price
 
         if _last_good_price > 0:
@@ -97,10 +115,16 @@ def get_live_price() -> float:
                                 f"({jump_pct:.2f}%) — keeping last good price")
                 return _last_good_price
 
-        _last_good_price = price
+        _last_good_price   = price
+        _ticker_fail_count  = 0
         return price
     except Exception as e:
-        logger.warning(f"[TICKER] {e}")
+        _ticker_fail_count += 1
+        # Log every failure for the first 5, then every 10th — visible in
+        # Render logs without flooding them.
+        if _ticker_fail_count <= 5 or _ticker_fail_count % 10 == 0:
+            logger.warning(f"[TICKER] fail #{_ticker_fail_count} "
+                            f"{type(e).__name__}: {e}")
         return _last_good_price
 
 def fetch_candles(limit=CANDLES):
@@ -728,6 +752,20 @@ def settings():
     _save_fees()
     logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
     return jsonify({"ok": True, "message": f"Fees: entrada {fees['entry']}% / saída {fees['exit']}%"})
+
+@app.route("/debug-ticker")
+def debug_ticker():
+    """Diagnoses the live-price feed — visit after deploy to verify it works."""
+    t0 = time_mod.time()
+    price = get_live_price()
+    elapsed_ms = round((time_mod.time() - t0) * 1000, 1)
+    return jsonify({
+        "live_price":       price,
+        "last_good_price":  _last_good_price,
+        "consecutive_fails": _ticker_fail_count,
+        "fetch_time_ms":    elapsed_ms,
+        "symbol":           SYMBOL,
+    })
 
 @app.route("/start", methods=["POST"])
 def start():
