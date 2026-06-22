@@ -28,11 +28,13 @@ SL_DIST = round(FIXED_SL     * MINTICK, 8)
 TP_DIST = round(FIXED_TP     * MINTICK, 8)
 TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
 
-# TradingView runs with calc_on_every_tick=false, so it only evaluates stops at
-# each candle CLOSE using the bar high/low. Keep this False to mirror the
-# backtest 1:1. Set True (env REALTIME_EXITS=1) only if you'd rather simulate
-# live execution, which exits intra-candle and will NOT match TradingView.
-REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "0") == "1"
+# strategy.exit places a STANDING stop+trailing order that the broker tracks
+# tick-by-tick, so it fills intra-candle (often seconds after entry) both live
+# and in the backtest — calc_on_every_tick=false only gates ENTRIES to the bar
+# close, not the exit fills. So real-time exit tracking is the faithful default.
+# The closed-candle check still runs at each bar close as a backstop using the
+# true OHLC. Set REALTIME_EXITS=0 only if you want strict bar-close-only exits.
+REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "1") == "1"
 
 RISK            = 0.01
 MAX_LOTS        = 100
@@ -259,27 +261,53 @@ def _calc_qty(price, balance):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _check_sl_tp(cur_price: float):
     """
-    Optional real-time tick check (only runs when REALTIME_EXITS=1).
-    Checks whether the live price has crossed the pre-computed trail_stop or SL.
-    Peak/trail are advanced only on closed candles, never here. NOTE: this does
-    NOT match TradingView's calc_on_every_tick=false backtest (which exits on
-    candle close); it exists purely to simulate live intra-candle execution.
+    Real-time intra-candle exit management — runs ~every second on the live
+    price. This reproduces TradingView's actual behaviour: the SL + trailing
+    stop is a standing order the broker tracks tick-by-tick, so it arms and
+    fires intra-candle (seconds after entry with these tight params) rather
+    than waiting for the bar to close.
+
+    Long  : peak = highest price seen since entry; trail arms once
+            peak - entry >= TP_DIST and then sits TR_DIST below peak.
+    Short : symmetric (peak = lowest price; trail sits TR_DIST above it).
+
+    The closed-candle check (_check_sl_tp_candle) still runs at each bar close
+    as a backstop, correcting peak/exit from the true OHLC in case a fast spike
+    fell between two 1-second samples.
     """
     if paper["side"] == "none":
         return False, 0.0, ""
     entry = paper["entry_price"]
+
     if paper["side"] == "long":
+        # advance peak + trailing stop with the live price
+        if cur_price > paper["peak"]:
+            paper["peak"] = cur_price
+        if paper["peak"] - entry >= TP_DIST:
+            nt = round(paper["peak"] - TR_DIST, 8)
+            if not paper["trail_active"] or nt > paper["trail_stop"]:
+                paper["trail_active"] = True
+                paper["trail_stop"]   = nt
+        # trail sits above the fixed SL once armed → check it first
         if paper["trail_active"] and cur_price <= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
         sl = round(entry - SL_DIST, 8)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
+        if paper["peak"] == 0 or cur_price < paper["peak"]:
+            paper["peak"] = cur_price
+        if entry - paper["peak"] >= TP_DIST:
+            nt = round(paper["peak"] + TR_DIST, 8)
+            if not paper["trail_active"] or nt < paper["trail_stop"]:
+                paper["trail_active"] = True
+                paper["trail_stop"]   = nt
         if paper["trail_active"] and cur_price >= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
         sl = round(entry + SL_DIST, 8)
         if cur_price >= sl:
             return True, sl, "SL"
+
     return False, 0.0, ""
 
 def _check_sl_tp_candle(o: float, h: float, l: float, c: float):
@@ -485,11 +513,12 @@ def strategy_loop():
 
     while state["running"]:
         try:
-            # ── 1. LIVE PRICE  (display only by default) ─────────────────────
-            # TradingView (calc_on_every_tick=false) never exits mid-candle, so
-            # by default we only refresh the unrealized-PnL display here. With
-            # REALTIME_EXITS=1 we also check stops every tick — more realistic
-            # for live execution, but it will NOT match the TradingView backtest.
+            # ── 1. LIVE PRICE + REAL-TIME EXIT TRACKING (~every second) ──────
+            # The trailing stop / SL is tracked tick-by-tick here, so trades
+            # exit intra-candle (seconds after entry) exactly like the standing
+            # exit order does live and in the backtest. Refreshes the unrealized
+            # PnL display too. (REALTIME_EXITS defaults on; set 0 for bar-close
+            # only.) The bar-close check in section 2 still runs as a backstop.
             live_price = get_live_price()
             if live_price > 0:
                 paper["unrealized"] = _unrealized_pct(live_price)
