@@ -12,27 +12,42 @@ logger = logging.getLogger(__name__)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIG  (matching Pine Script defaults)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MINTICK      = 0.01
-FIXED_SL     = 2000    # loss=2000 ticks → $20.00
-FIXED_TP     = 55      # trail_points=55 → $0.55 activation
-TRAIL_OFFSET = 15      # trail_offset=15 → $0.15 trail distance
+# ── Tick size ────────────────────────────────────────────────────────────
+# In Pine Script the SL/TP distances are measured in TICKS and multiplied by
+# syminfo.mintick. To match TradingView exactly the bot must use the SAME tick
+# size as the chart symbol. Instead of hard-coding it, init_markets() reads the
+# real value from the exchange via ccxt. This env override is only a manual
+# escape hatch if you ever confirm the chart uses a different tick.
+MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.01))   # fallback only
+FIXED_SL     = 2000    # loss=2000 ticks
+FIXED_TP     = 55      # trail_points=55 ticks → trailing-stop activation
+TRAIL_OFFSET = 15      # trail_offset=15 ticks → trailing distance
 
-SL_DIST = round(FIXED_SL    * MINTICK, 4)   # $20.00
-TP_DIST = round(FIXED_TP    * MINTICK, 4)   # $0.55
-TR_DIST = round(TRAIL_OFFSET * MINTICK, 4)  # $0.15
+# Recomputed inside init_markets() once the real mintick is known.
+SL_DIST = round(FIXED_SL     * MINTICK, 8)
+TP_DIST = round(FIXED_TP     * MINTICK, 8)
+TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
+
+# TradingView runs with calc_on_every_tick=false, so it only evaluates stops at
+# each candle CLOSE using the bar high/low. Keep this False to mirror the
+# backtest 1:1. Set True (env REALTIME_EXITS=1) only if you'd rather simulate
+# live execution, which exits intra-candle and will NOT match TradingView.
+REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "0") == "1"
 
 RISK            = 0.01
 MAX_LOTS        = 100
 CANDLES         = 200
-PAPER_START_BAL = 10_000.0
+PAPER_START_BAL = 1_000.0   # matches Pine initial_capital=1000
 PORT            = int(os.environ.get("PORT", 10000))
 
 # Configurable trade fees (persisted to disk)
 FEES_FILE = "fees.json"
 def _load_fees():
+    # Pine has commission_value=0, so default to 0 to match the TradingView
+    # backtest. Change these in the UI if you want to simulate real exchange fees.
     try:
         with open(FEES_FILE) as f: return json.load(f)
-    except Exception: return {"entry": 0.05, "exit": 0.05}
+    except Exception: return {"entry": 0.0, "exit": 0.0}
 def _save_fees():
     try:
         with open(FEES_FILE, "w") as f: json.dump(fees, f)
@@ -79,6 +94,30 @@ def init_markets():
                 SYMBOL = k; break
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
+
+    # ── Read the REAL tick size from the exchange and rebuild SL/TP/trail ──
+    # This is what makes the bot match TradingView without guessing 0.01.
+    global MINTICK, SL_DIST, TP_DIST, TR_DIST
+    if "MINTICK_OVERRIDE" in os.environ:
+        logger.info(f"[INIT] mintick OVERRIDE from env = {MINTICK}")
+    else:
+        try:
+            prec = mkts[SYMBOL]["precision"]["price"]
+            if prec:
+                prec = float(prec)
+                # ccxt usually reports tick size directly (e.g. 0.01). If it ever
+                # reports a number of decimal places (e.g. 2), convert it.
+                MINTICK = prec if prec < 1 else 10 ** (-int(prec))
+            logger.info(f"[INIT] mintick auto-detected from Phemex = {MINTICK}")
+        except Exception as e:
+            logger.warning(f"[INIT] could not read mintick ({e}); "
+                           f"using fallback {MINTICK}")
+
+    SL_DIST = round(FIXED_SL     * MINTICK, 8)
+    TP_DIST = round(FIXED_TP     * MINTICK, 8)
+    TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
+    logger.info(f"[INIT] SL=${SL_DIST}  trail-activation=${TP_DIST}  "
+                f"trail-offset=${TR_DIST}  (mintick={MINTICK})")
     # Warm up ticker_ex once at init so the first loop iteration isn't 0.0
     try:
         warm = float(ticker_ex.fetch_ticker(SYMBOL)["last"])
@@ -207,21 +246,24 @@ def _close_position(price, reason):
     return raw, pct
 
 def _calc_qty(price, balance):
-    sl_usdt    = FIXED_SL * MINTICK
-    risk_usdt  = RISK * balance
-    qty        = (risk_usdt / sl_usdt) if sl_usdt else 0.01
-    max_by_bal = (balance * 0.95 / price) if price else qty
-    return round(min(qty, max_by_bal, MAX_LOTS), 4)
+    # Pine:  lots = (risk * balance) / (fixedSL * mintick);  capped at `limit`.
+    # The Pine code does NOT cap by available balance, so neither do we — that
+    # extra cap was shrinking the size on small balances and breaking parity.
+    sl_usdt   = FIXED_SL * MINTICK
+    risk_usdt = RISK * balance
+    qty       = (risk_usdt / sl_usdt) if sl_usdt else 0.0
+    return round(min(qty, MAX_LOTS), 4)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL / TRAILING TP  — two variants
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _check_sl_tp(cur_price: float):
     """
-    Real-time check via ticker (every 15 s).
-    NEVER updates peak — peak is only updated by closed candle H/L.
-    Only checks whether current price has crossed the pre-computed trail_stop or SL.
-    Matches TradingView calc_on_every_tick=false: peak from bars, check from ticks.
+    Optional real-time tick check (only runs when REALTIME_EXITS=1).
+    Checks whether the live price has crossed the pre-computed trail_stop or SL.
+    Peak/trail are advanced only on closed candles, never here. NOTE: this does
+    NOT match TradingView's calc_on_every_tick=false backtest (which exits on
+    candle close); it exists purely to simulate live intra-candle execution.
     """
     if paper["side"] == "none":
         return False, 0.0, ""
@@ -229,68 +271,105 @@ def _check_sl_tp(cur_price: float):
     if paper["side"] == "long":
         if paper["trail_active"] and cur_price <= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        sl = round(entry - SL_DIST, 4)
+        sl = round(entry - SL_DIST, 8)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
         if paper["trail_active"] and cur_price >= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        sl = round(entry + SL_DIST, 4)
+        sl = round(entry + SL_DIST, 8)
         if cur_price >= sl:
             return True, sl, "SL"
     return False, 0.0, ""
 
-def _check_sl_tp_candle(h: float, l: float):
+def _check_sl_tp_candle(o: float, h: float, l: float, c: float):
     """
-    Closed candle H/L check — matches TradingView broker emulator exactly.
-    1. Updates peak using candle HIGH (long) or LOW (short).
-    2. Activates/updates trail_stop when peak profit >= TP_DIST.
-    3. Checks if candle range crossed trail_stop or SL.
-    TradingView order of operations for a LONG bar:
-      checks LOW for SL first, then HIGH for trail activation.
-    For SHORT: checks HIGH for SL first, then LOW for trail activation.
+    Closed-candle exit check — mirrors the TradingView broker emulator with
+    calc_on_every_tick=false (no bar magnifier).
+
+    Two things matter for parity:
+
+    1. Which stop is live. Pine generates the fixed stop (loss) AND the trailing
+       stop but only ever uses the one closest to price. So before the trail
+       arms (peak profit < trail-activation) the live stop is the fixed SL; once
+       it arms, the live stop is the trailing stop (which sits nearer to price).
+
+    2. Intra-bar order. Without a bar magnifier TradingView assumes:
+         up bar   (close >= open):  open -> low  -> high -> close
+         down bar (close <  open):  open -> high -> low  -> close
+       i.e. it processes the adverse extreme first on up bars and the favorable
+       extreme first on down bars. We replicate that ordering so SL vs trail
+       fire in the same sequence TradingView would use.
     """
     if paper["side"] == "none":
         return False, 0.0, ""
-    entry = paper["entry_price"]
+
+    entry  = paper["entry_price"]
+    is_up  = c >= o
 
     if paper["side"] == "long":
-        sl = round(entry - SL_DIST, 4)
-        # Check SL first (TradingView checks worst case first)
-        if l <= sl:
-            return True, sl, "SL"
-        # Update peak with this bar's HIGH
-        if h > paper["peak"]:
-            paper["peak"] = h
-        pp = paper["peak"] - entry
-        # Activate / advance trail stop
-        if pp >= TP_DIST:
-            nt = round(paper["peak"] - TR_DIST, 4)
-            if not paper["trail_active"] or nt > paper["trail_stop"]:
-                paper["trail_active"] = True
-                paper["trail_stop"]   = nt
-        # Check trail stop
-        if paper["trail_active"] and l <= paper["trail_stop"]:
-            return True, paper["trail_stop"], "TRAIL_TP"
+        sl = round(entry - SL_DIST, 8)
+
+        def hit_low():
+            # Check whichever stop is currently live against this bar's low.
+            if paper["trail_active"]:
+                if l <= paper["trail_stop"]:
+                    return True, paper["trail_stop"], "TRAIL_TP"
+            elif l <= sl:
+                return True, sl, "SL"
+            return False, 0.0, ""
+
+        def advance_high():
+            # Update peak with the bar high and arm/raise the trailing stop.
+            if h > paper["peak"]:
+                paper["peak"] = h
+            if paper["peak"] - entry >= TP_DIST:
+                nt = round(paper["peak"] - TR_DIST, 8)
+                if not paper["trail_active"] or nt > paper["trail_stop"]:
+                    paper["trail_active"] = True
+                    paper["trail_stop"]   = nt
+
+        if is_up:                       # open -> low -> high
+            ex = hit_low()
+            if ex[0]:
+                return ex
+            advance_high()
+        else:                           # open -> high -> low
+            advance_high()
+            ex = hit_low()
+            if ex[0]:
+                return ex
 
     else:  # short
-        sl = round(entry + SL_DIST, 4)
-        # Check SL first
-        if h >= sl:
-            return True, sl, "SL"
-        # Update peak with this bar's LOW
-        if l < paper["peak"] or paper["peak"] == 0:
-            paper["peak"] = l
-        pp = entry - paper["peak"]
-        # Activate / advance trail stop
-        if pp >= TP_DIST:
-            nt = round(paper["peak"] + TR_DIST, 4)
-            if not paper["trail_active"] or nt < paper["trail_stop"]:
-                paper["trail_active"] = True
-                paper["trail_stop"]   = nt
-        # Check trail stop
-        if paper["trail_active"] and h >= paper["trail_stop"]:
-            return True, paper["trail_stop"], "TRAIL_TP"
+        sl = round(entry + SL_DIST, 8)
+
+        def hit_high():
+            if paper["trail_active"]:
+                if h >= paper["trail_stop"]:
+                    return True, paper["trail_stop"], "TRAIL_TP"
+            elif h >= sl:
+                return True, sl, "SL"
+            return False, 0.0, ""
+
+        def advance_low():
+            if paper["peak"] == 0 or l < paper["peak"]:
+                paper["peak"] = l
+            if entry - paper["peak"] >= TP_DIST:
+                nt = round(paper["peak"] + TR_DIST, 8)
+                if not paper["trail_active"] or nt < paper["trail_stop"]:
+                    paper["trail_active"] = True
+                    paper["trail_stop"]   = nt
+
+        if is_up:                       # open -> low -> high : favorable first
+            advance_low()
+            ex = hit_high()
+            if ex[0]:
+                return ex
+        else:                           # open -> high -> low : adverse first
+            ex = hit_high()
+            if ex[0]:
+                return ex
+            advance_low()
 
     return False, 0.0, ""
 
@@ -391,10 +470,8 @@ def strategy_loop():
         state["running"] = False
         return
 
-    prev_signal      = None
     last_candle_ts   = None
     last_candle_str  = "—"
-    skip_entry       = False
     last_ohlcv_check = 0.0   # throttle ohlcv fetching to every 15 s
 
     # Startup sync
@@ -408,27 +485,30 @@ def strategy_loop():
 
     while state["running"]:
         try:
-            # ── 1. REAL-TIME SL/TP CHECK  (every ~1 s, ticker only) ──────────
+            # ── 1. LIVE PRICE  (display only by default) ─────────────────────
+            # TradingView (calc_on_every_tick=false) never exits mid-candle, so
+            # by default we only refresh the unrealized-PnL display here. With
+            # REALTIME_EXITS=1 we also check stops every tick — more realistic
+            # for live execution, but it will NOT match the TradingView backtest.
             live_price = get_live_price()
             if live_price > 0:
                 paper["unrealized"] = _unrealized_pct(live_price)
-                skip_entry = False
 
-                ex, ex_px, ex_rsn = _check_sl_tp(live_price)
-                if ex:
-                    ex_side = paper["side"]
-                    raw, pct = _close_position(ex_px, ex_rsn)
-                    _record_exit(ex_side.upper(), ex_px, ex_rsn,
-                                 raw, pct, last_candle_str)
-                    skip_entry = True
-                    state.update({
-                        "position": "none", "unrealized": "0.00",
-                        "balance":  f"{paper['balance']:.2f}",
-                        "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                        "trail_stop": "—",
-                        "winrate":  _winrate(),
-                    })
-                    logger.info(f"[EXIT] {ex_rsn} @ {ex_px:.2f}  pnl={pct:+.2f}%")
+                if REALTIME_EXITS:
+                    ex, ex_px, ex_rsn = _check_sl_tp(live_price)
+                    if ex:
+                        ex_side = paper["side"]
+                        raw, pct = _close_position(ex_px, ex_rsn)
+                        _record_exit(ex_side.upper(), ex_px, ex_rsn,
+                                     raw, pct, last_candle_str)
+                        state.update({
+                            "position": "none", "unrealized": "0.00",
+                            "balance":  f"{paper['balance']:.2f}",
+                            "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                            "trail_stop": "—",
+                            "winrate":  _winrate(),
+                        })
+                        logger.info(f"[EXIT] {ex_rsn} @ {ex_px:.2f}  pnl={pct:+.2f}%")
 
                 trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
                               else ("armed" if paper["side"] != "none" else "—"))
@@ -441,7 +521,7 @@ def strategy_loop():
                     "status":        "Running",
                 })
 
-            # ── 2. CANDLE CHECK  (every 15 s, full OHLCV) ────────────────────
+            # ── 2. CANDLE CLOSE  (every 15 s — this is where trades happen) ──
             now = time_mod.time()
             if now - last_ohlcv_check >= 15:
                 last_ohlcv_check = now
@@ -456,17 +536,18 @@ def strategy_loop():
 
                     if candle_ts != last_candle_ts:
                         last_candle_ts = candle_ts
-                        skip_entry = False
 
-                        # Candle H/L catches any peak missed between 1-s polls
+                        # (a) Process stops on the just-closed bar FIRST, like the
+                        #     TradingView broker emulator. O/H/L/C lets SL vs
+                        #     trailing fire in the correct intra-bar order.
                         cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
-                            float(last_closed[2]), float(last_closed[3]))
+                            float(last_closed[1]), float(last_closed[2]),
+                            float(last_closed[3]), float(last_closed[4]))
                         if cl_ex and paper["side"] != "none":
                             cl_side = paper["side"]
                             raw, pct = _close_position(cl_px, cl_rsn)
                             _record_exit(cl_side.upper(), cl_px, cl_rsn,
                                          raw, pct, last_candle_str)
-                            skip_entry = True
                             state.update({
                                 "position": "none", "unrealized": "0.00",
                                 "balance":  f"{paper['balance']:.2f}",
@@ -475,7 +556,7 @@ def strategy_loop():
                                 "winrate":  _winrate(),
                             })
 
-                        # Signal
+                        # (b) Recompute the signal on the closed bar.
                         closes = [c[4] for c in sig_closes]
                         result = strat.calculate(closes)
                         signal = result["signal"]
@@ -489,9 +570,16 @@ def strategy_loop():
                             "winrate":     _winrate(),
                         })
 
-                        # Entry — never on the same candle as an exit
-                        if signal and signal != prev_signal and not skip_entry:
-                            entry_px = live_price if live_price > 0 else float(last_closed[4])
+                        # (c) Entry / reversal. Pine fires strategy.entry on EVERY
+                        #     bar the condition holds, with pyramiding=1 — so the
+                        #     net rule is simply: hold the side the signal points
+                        #     to. Crucially this re-enters right after a stop if
+                        #     the condition still holds (the old prev_signal guard
+                        #     wrongly blocked that). Entry fills at the signal
+                        #     bar's close = next bar's open in 24/7 crypto (no gap),
+                        #     the price a TradingView market order would get.
+                        if signal:
+                            entry_px = float(last_closed[4])
                             qty      = _calc_qty(entry_px, paper["balance"])
                             cur_pos  = paper["side"]
 
@@ -512,8 +600,6 @@ def strategy_loop():
                                 order = _open_position("SHORT", qty, entry_px)
                                 _record_entry("SHORT", entry_px, qty,
                                               last_candle_str, order["id"])
-
-                        prev_signal = None if skip_entry else signal
 
             # ── 3. SLEEP 1 SECOND ─────────────────────────────────────────────
             time_mod.sleep(1)
@@ -610,11 +696,11 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
     <div class="fee-box">
       <div>
         <label>Fee Entrada %</label><br>
-        <input id="fee-entry" type="number" step="0.01" min="0" value="0.05">
+        <input id="fee-entry" type="number" step="0.01" min="0" value="0">
       </div>
       <div>
         <label>Fee Saída %</label><br>
-        <input id="fee-exit" type="number" step="0.01" min="0" value="0.05">
+        <input id="fee-exit" type="number" step="0.01" min="0" value="0">
       </div>
       <button id="btn-fee" onclick="saveFees()">Salvar Fees</button>
     </div>
