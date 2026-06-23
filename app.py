@@ -28,13 +28,19 @@ SL_DIST = round(FIXED_SL     * MINTICK, 8)
 TP_DIST = round(FIXED_TP     * MINTICK, 8)
 TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
 
-# strategy.exit places a STANDING stop+trailing order that the broker tracks
-# tick-by-tick, so it fills intra-candle (often seconds after entry) both live
-# and in the backtest — calc_on_every_tick=false only gates ENTRIES to the bar
-# close, not the exit fills. So real-time exit tracking is the faithful default.
-# The closed-candle check still runs at each bar close as a backstop using the
-# true OHLC. Set REALTIME_EXITS=0 only if you want strict bar-close-only exits.
-REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "1") == "1"
+# ── Exit evaluation mode ─────────────────────────────────────────────────
+# The Pine strategy uses calc_on_every_tick=false, so the backtest evaluates
+# the trailing stop ONCE PER CANDLE on the bar's OHLC: the peak follows each
+# bar's HIGH and the exit fires when a bar's LOW pulls back trail_offset below
+# the running peak. Because a 30m ETH bar spans several dollars, the trade
+# rides the trend across bars and captures ~0.3%/trade — matching the backtest.
+#
+# Tick-by-tick exits (REALTIME_EXITS=1) react to every intrabar wiggle and
+# close on the first ~$0.15 pullback, so profit collapses to ~0.03%/trade and
+# the trade never gets to run. That does NOT match the backtest. Keep this OFF
+# to reproduce the TradingView report; only set 1 if you specifically want
+# live intrabar execution and accept much smaller per-trade profit.
+REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "0") == "1"
 
 RISK            = 0.01
 MAX_LOTS        = 100
