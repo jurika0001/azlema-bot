@@ -29,18 +29,25 @@ TP_DIST = round(FIXED_TP     * MINTICK, 8)
 TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
-# The Pine strategy uses calc_on_every_tick=false, so the backtest evaluates
-# the trailing stop ONCE PER CANDLE on the bar's OHLC: the peak follows each
-# bar's HIGH and the exit fires when a bar's LOW pulls back trail_offset below
-# the running peak. Because a 30m ETH bar spans several dollars, the trade
-# rides the trend across bars and captures ~0.3%/trade — matching the backtest.
+# calc_on_every_tick=false in Pine only governs the ENTRY (evaluated at bar
+# close). The EXIT is a strategy.exit() standing order (fixed SL + trailing)
+# that the broker tracks TICK BY TICK, so it fires INTRA-CANDLE — seconds after
+# the move — not at bar close. That is what actually happened in the real
+# real-time paper-trading run this bot reproduces: fast exits that still ride a
+# clean directional move (the trail follows the extreme and only closes on a
+# trail_offset pullback). So REALTIME_EXITS defaults ON; the earlier "keep it
+# off / tick-by-tick destroys profit" note was a wrong assumption.
 #
-# Tick-by-tick exits (REALTIME_EXITS=1) react to every intrabar wiggle and
-# close on the first ~$0.15 pullback, so profit collapses to ~0.03%/trade and
-# the trade never gets to run. That does NOT match the backtest. Keep this OFF
-# to reproduce the TradingView report; only set 1 if you specifically want
-# live intrabar execution and accept much smaller per-trade profit.
-REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "0") == "1"
+# The closed-candle check (_check_sl_tp_candle) still runs at each bar close as
+# a BACKSTOP only: it self-disables once flat and corrects the peak from the
+# bar's true OHLC in case the ~1 s price poll missed a fast wick between samples.
+#
+# FIDELITY NOTE: this bot samples price via REST ~once per second, not a true
+# tick stream. For a strategy this fast (a $0.15 trail on ETH) that ~1 s
+# granularity is a real source of slippage vs the original — the same class of
+# problem as the 3 s webhook latency that hurt live execution, just smaller. A
+# websocket tick feed would close that gap.
+REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "1") == "1"
 
 RISK            = 0.01
 MAX_LOTS        = 100
@@ -520,11 +527,12 @@ def strategy_loop():
     while state["running"]:
         try:
             # ── 1. LIVE PRICE + REAL-TIME EXIT TRACKING (~every second) ──────
-            # The trailing stop / SL is tracked tick-by-tick here, so trades
-            # exit intra-candle (seconds after entry) exactly like the standing
-            # exit order does live and in the backtest. Refreshes the unrealized
-            # PnL display too. (REALTIME_EXITS defaults on; set 0 for bar-close
-            # only.) The bar-close check in section 2 still runs as a backstop.
+            # The trailing stop / SL is tracked here ~every second, so trades
+            # exit intra-candle (seconds after the move) exactly like the
+            # standing exit order did in the real-time paper-trading run.
+            # Refreshes the unrealized PnL display too. (REALTIME_EXITS defaults
+            # on; set 0 for bar-close-only.) The bar-close check in section 2
+            # still runs as a backstop.
             live_price = get_live_price()
             if live_price > 0:
                 paper["unrealized"] = _unrealized_pct(live_price)
