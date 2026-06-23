@@ -116,6 +116,8 @@ _MAX_TICK_JUMP_PCT = 1.5   # ETH/USDT should not move >1.5% in a single second
 trade_lock       = threading.Lock()
 _ws_active       = False
 _last_candle_str = "—"
+_last_price_ts   = 0.0     # time.time() of the last price update (WS or REST)
+_ws_tick_count   = 0       # how many websocket ticks have been processed
 
 def init_markets():
     global SYMBOL
@@ -553,7 +555,7 @@ def on_live_price(price: float):
     fallback). Applies the same sanity filter as get_live_price(), tracks the
     SL/trailing in real time, and refreshes the live UI fields.
     """
-    global _last_good_price
+    global _last_good_price, _last_price_ts
     if price <= 0:
         return
     if _last_good_price > 0:
@@ -561,6 +563,7 @@ def on_live_price(price: float):
         if jump > _MAX_TICK_JUMP_PCT:
             return                              # reject corrupted tick
     _last_good_price = price
+    _last_price_ts   = time_mod.time()
 
     paper["unrealized"] = _unrealized_pct(price)
     if REALTIME_EXITS:
@@ -593,7 +596,7 @@ def price_ws_loop():
         return
 
     async def run():
-        global _ws_active
+        global _ws_active, _ws_tick_count
         ws  = ccxtpro.phemex({"options": {"defaultType": "swap"},
                               "enableRateLimit": True})
         sym = SYMBOL or "ETH/USDT:USDT"
@@ -609,6 +612,7 @@ def price_ws_loop():
                         if not _ws_active:
                             logger.info("[WS] tick stream LIVE — exits now real-time")
                         _ws_active = True
+                        _ws_tick_count += 1
                         fails = 0
                         on_live_price(float(px))
                 except Exception as e:
@@ -656,22 +660,27 @@ def strategy_loop():
                     f"{datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)}"
                     f" — waiting for next close")
 
+    logger.info(f"[CFG] REALTIME_EXITS={REALTIME_EXITS}  ws_available={_HAS_WS}  "
+                f"(if REALTIME_EXITS is False, exits only happen at candle close — "
+                f"check the Render env var)")
+
     # Start the real-time websocket tick feed (delay-free exits). Daemon thread;
-    # if it can't connect, the REST poll below keeps the bot running.
+    # if it can't connect, the ~1 s REST poll below keeps managing exits.
     threading.Thread(target=price_ws_loop, daemon=True).start()
 
     while state["running"]:
         try:
             # ── 1. PRICE + REAL-TIME EXITS ───────────────────────────────────
-            # Exits are driven the instant a tick arrives by the websocket feed
-            # (price_ws_loop → on_live_price), so there is NO REST round-trip and
-            # NO 1 s sampling delay. This branch only runs as a fallback while the
-            # WS is down: a REST poll keeps the SL/trailing alive so the bot never
-            # goes blind. on_live_price() handles the sanity filter, exits and UI.
-            if not _ws_active:
-                live_price = get_live_price()
-                if live_price > 0:
-                    on_live_price(live_price)
+            # The websocket feed (price_ws_loop → on_live_price) fires exits the
+            # instant a tick arrives. This ~1 s REST poll ALWAYS runs too, as a
+            # guaranteed safety net: if the websocket silently stalls (stays
+            # "connected" but stops sending ticks), exits still happen within a
+            # second instead of freezing. Both call the same thread-safe
+            # on_live_price(); after a close, side is 'none' so the next check is
+            # a harmless no-op — there is never a double close.
+            live_price = get_live_price()
+            if live_price > 0:
+                on_live_price(live_price)
 
             # ── 2. CANDLE CLOSE  (every 15 s — this is where trades happen) ──
             now = time_mod.time()
@@ -998,16 +1007,37 @@ def settings():
 
 @app.route("/debug-ticker")
 def debug_ticker():
-    """Diagnoses the live-price feed — visit after deploy to verify it works."""
+    """
+    Diagnoses the live-price feed AND exit engine. If a position is stuck open,
+    open this: it shows whether prices are arriving (price_age_s should be small),
+    whether the websocket is delivering ticks, and where the SL/trailing sits vs
+    the current price — so you can see exactly why it has or hasn't fired.
+    """
     t0 = time_mod.time()
     price = get_live_price()
     elapsed_ms = round((time_mod.time() - t0) * 1000, 1)
+    age = round(time_mod.time() - _last_price_ts, 1) if _last_price_ts else None
     return jsonify({
-        "live_price":       price,
-        "last_good_price":  _last_good_price,
+        "live_price":        price,
+        "last_good_price":   _last_good_price,
+        "price_age_s":       age,            # seconds since any price update; small = healthy
+        "ws_available":      _HAS_WS,        # ccxt.pro imported ok
+        "ws_active":         _ws_active,     # websocket currently delivering ticks
+        "ws_tick_count":     _ws_tick_count, # total ticks seen (should keep rising)
+        "realtime_exits":    REALTIME_EXITS, # MUST be true or exits only at candle close
         "consecutive_fails": _ticker_fail_count,
-        "fetch_time_ms":    elapsed_ms,
-        "symbol":           SYMBOL,
+        "fetch_time_ms":     elapsed_ms,
+        "symbol":            SYMBOL,
+        # ── current position / why it may not have exited ──
+        "position":          paper["side"],
+        "entry_price":       paper["entry_price"],
+        "peak":              paper["peak"],
+        "trail_active":      paper["trail_active"],
+        "trail_stop":        paper["trail_stop"],
+        "sl_dist":           SL_DIST,
+        "tp_activation_dist": TP_DIST,
+        "trail_offset_dist": TR_DIST,
+        "mintick":           MINTICK,
     })
 
 @app.route("/start", methods=["POST"])
