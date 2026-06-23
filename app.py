@@ -1,9 +1,18 @@
-import os, time as time_mod, threading, logging, json
+import os, time as time_mod, threading, logging, json, asyncio
 import requests as req
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 
 import ccxt
+# ccxt.pro (bundled since ccxt 4) gives a real-time websocket tick stream.
+# Guarded so the bot still runs (on the REST fallback) if it is unavailable.
+try:
+    import ccxt.pro as ccxtpro
+    _HAS_WS = True
+except Exception as _ws_imp_err:                       # pragma: no cover
+    ccxtpro, _HAS_WS = None, False
+    logging.getLogger(__name__).warning(
+        f"[WS] ccxt.pro import failed ({_ws_imp_err}); REST polling only")
 import strategy as strat
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -95,6 +104,18 @@ SYMBOL = None
 _last_good_price   = 0.0
 _ticker_fail_count = 0
 _MAX_TICK_JUMP_PCT = 1.5   # ETH/USDT should not move >1.5% in a single second
+
+# ── Real-time concurrency ────────────────────────────────────────────────
+# trade_lock serializes EVERY mutation of the `paper` position so the
+# websocket exit thread and the main candle/entry loop can never race (double
+# close, half-applied entry, corrupted balance).
+# _ws_active is True only while the websocket tick stream is delivering prices;
+# when True the main loop stops its REST poll and lets the WS drive exits.
+# _last_candle_str mirrors the loop's candle label so WS-driven exits can tag
+# the trade history with the right candle.
+trade_lock       = threading.Lock()
+_ws_active       = False
+_last_candle_str = "—"
 
 def init_markets():
     global SYMBOL
@@ -500,8 +521,119 @@ def _resolve_candles(ohlcv):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STRATEGY LOOP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _try_realtime_exit(price: float, candle_str: str):
+    """
+    Run the tick-by-tick SL/trailing check and close the position if it fires.
+    Thread-safe: called from the websocket tick handler AND the REST fallback,
+    so all position mutation happens under trade_lock. Returns True if it closed.
+    """
+    with trade_lock:
+        if paper["side"] == "none":
+            return False
+        ex, ex_px, ex_rsn = _check_sl_tp(price)
+        if not ex:
+            return False
+        ex_side  = paper["side"]
+        raw, pct = _close_position(ex_px, ex_rsn)
+        _record_exit(ex_side.upper(), ex_px, ex_rsn, raw, pct, candle_str)
+        state.update({
+            "position": "none", "unrealized": "0.00",
+            "balance":  f"{paper['balance']:.2f}",
+            "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+            "trail_stop": "—",
+            "winrate":  _winrate(),
+        })
+        logger.info(f"[EXIT] {ex_rsn} @ {ex_px:.2f}  pnl={pct:+.2f}%")
+        return True
+
+
+def on_live_price(price: float):
+    """
+    Called on EVERY price update (each websocket tick, or each REST poll in the
+    fallback). Applies the same sanity filter as get_live_price(), tracks the
+    SL/trailing in real time, and refreshes the live UI fields.
+    """
+    global _last_good_price
+    if price <= 0:
+        return
+    if _last_good_price > 0:
+        jump = abs(price - _last_good_price) / _last_good_price * 100
+        if jump > _MAX_TICK_JUMP_PCT:
+            return                              # reject corrupted tick
+    _last_good_price = price
+
+    paper["unrealized"] = _unrealized_pct(price)
+    if REALTIME_EXITS:
+        _try_realtime_exit(price, _last_candle_str)
+
+    trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
+                  else ("armed" if paper["side"] != "none" else "—"))
+    state.update({
+        "unrealized":    f"{paper['unrealized']:+.2f}",
+        "balance":       f"{paper['balance']:.2f}",
+        "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+        "trail_stop":    trail_disp,
+        "position":      paper["side"],
+        "status":        "Running",
+    })
+
+
+def price_ws_loop():
+    """
+    Background websocket tick feed. Subscribes to Phemex's real-time ticker and
+    pushes every price into on_live_price(), so the SL/trailing exit fires the
+    instant the move happens — no REST round-trip, no 1 s sampling delay. ccxt.pro
+    normalizes the price exactly like the REST client (so we never hand-roll the
+    price scale — that was a past bug). Auto-reconnects; if the WS is down,
+    _ws_active stays False and the main loop falls back to its REST poll.
+    """
+    global _ws_active
+    if not _HAS_WS:
+        logger.warning("[WS] ccxt.pro unavailable — staying on REST polling")
+        return
+
+    async def run():
+        global _ws_active
+        ws  = ccxtpro.phemex({"options": {"defaultType": "swap"},
+                              "enableRateLimit": True})
+        sym = SYMBOL or "ETH/USDT:USDT"
+        try:
+            await ws.load_markets()
+            logger.info(f"[WS] connecting ticker stream for {sym}")
+            fails = 0
+            while state["running"]:
+                try:
+                    t  = await ws.watch_ticker(sym)
+                    px = t.get("last") or t.get("close")
+                    if px:
+                        if not _ws_active:
+                            logger.info("[WS] tick stream LIVE — exits now real-time")
+                        _ws_active = True
+                        fails = 0
+                        on_live_price(float(px))
+                except Exception as e:
+                    fails += 1
+                    _ws_active = False
+                    if fails <= 5 or fails % 20 == 0:
+                        logger.warning(f"[WS] watch fail #{fails} "
+                                       f"{type(e).__name__}: {e}")
+                    await asyncio.sleep(min(fails, 5))
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        logger.error(f"[WS] loop crashed: {type(e).__name__}: {e}")
+    finally:
+        _ws_active = False
+
+
 def strategy_loop():
-    global state, trade_history
+    global state, trade_history, _last_candle_str
 
     try:
         init_markets()
@@ -524,45 +656,22 @@ def strategy_loop():
                     f"{datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)}"
                     f" — waiting for next close")
 
+    # Start the real-time websocket tick feed (delay-free exits). Daemon thread;
+    # if it can't connect, the REST poll below keeps the bot running.
+    threading.Thread(target=price_ws_loop, daemon=True).start()
+
     while state["running"]:
         try:
-            # ── 1. LIVE PRICE + REAL-TIME EXIT TRACKING (~every second) ──────
-            # The trailing stop / SL is tracked here ~every second, so trades
-            # exit intra-candle (seconds after the move) exactly like the
-            # standing exit order did in the real-time paper-trading run.
-            # Refreshes the unrealized PnL display too. (REALTIME_EXITS defaults
-            # on; set 0 for bar-close-only.) The bar-close check in section 2
-            # still runs as a backstop.
-            live_price = get_live_price()
-            if live_price > 0:
-                paper["unrealized"] = _unrealized_pct(live_price)
-
-                if REALTIME_EXITS:
-                    ex, ex_px, ex_rsn = _check_sl_tp(live_price)
-                    if ex:
-                        ex_side = paper["side"]
-                        raw, pct = _close_position(ex_px, ex_rsn)
-                        _record_exit(ex_side.upper(), ex_px, ex_rsn,
-                                     raw, pct, last_candle_str)
-                        state.update({
-                            "position": "none", "unrealized": "0.00",
-                            "balance":  f"{paper['balance']:.2f}",
-                            "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                            "trail_stop": "—",
-                            "winrate":  _winrate(),
-                        })
-                        logger.info(f"[EXIT] {ex_rsn} @ {ex_px:.2f}  pnl={pct:+.2f}%")
-
-                trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
-                              else ("armed" if paper["side"] != "none" else "—"))
-                state.update({
-                    "unrealized":    f"{paper['unrealized']:+.2f}",
-                    "balance":       f"{paper['balance']:.2f}",
-                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                    "trail_stop":    trail_disp,
-                    "position":      paper["side"],
-                    "status":        "Running",
-                })
+            # ── 1. PRICE + REAL-TIME EXITS ───────────────────────────────────
+            # Exits are driven the instant a tick arrives by the websocket feed
+            # (price_ws_loop → on_live_price), so there is NO REST round-trip and
+            # NO 1 s sampling delay. This branch only runs as a fallback while the
+            # WS is down: a REST poll keeps the SL/trailing alive so the bot never
+            # goes blind. on_live_price() handles the sanity filter, exits and UI.
+            if not _ws_active:
+                live_price = get_live_price()
+                if live_price > 0:
+                    on_live_price(live_price)
 
             # ── 2. CANDLE CLOSE  (every 15 s — this is where trades happen) ──
             now = time_mod.time()
@@ -578,71 +687,76 @@ def strategy_loop():
                     ).strftime("%Y-%m-%d %H:%M UTC")
 
                     if candle_ts != last_candle_ts:
-                        last_candle_ts = candle_ts
+                        last_candle_ts   = candle_ts
+                        _last_candle_str = last_candle_str   # share with WS exits
 
-                        # (a) Process stops on the just-closed bar FIRST, like the
-                        #     TradingView broker emulator. O/H/L/C lets SL vs
-                        #     trailing fire in the correct intra-bar order.
-                        cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
-                            float(last_closed[1]), float(last_closed[2]),
-                            float(last_closed[3]), float(last_closed[4]))
-                        if cl_ex and paper["side"] != "none":
-                            cl_side = paper["side"]
-                            raw, pct = _close_position(cl_px, cl_rsn)
-                            _record_exit(cl_side.upper(), cl_px, cl_rsn,
-                                         raw, pct, last_candle_str)
+                        # Hold trade_lock across the whole bar transition so a
+                        # websocket-driven exit can't race the bar-close exit /
+                        # entry below (no double close, no half-applied entry).
+                        with trade_lock:
+                            # (a) Process stops on the just-closed bar FIRST, like the
+                            #     TradingView broker emulator. O/H/L/C lets SL vs
+                            #     trailing fire in the correct intra-bar order.
+                            cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
+                                float(last_closed[1]), float(last_closed[2]),
+                                float(last_closed[3]), float(last_closed[4]))
+                            if cl_ex and paper["side"] != "none":
+                                cl_side = paper["side"]
+                                raw, pct = _close_position(cl_px, cl_rsn)
+                                _record_exit(cl_side.upper(), cl_px, cl_rsn,
+                                             raw, pct, last_candle_str)
+                                state.update({
+                                    "position": "none", "unrealized": "0.00",
+                                    "balance":  f"{paper['balance']:.2f}",
+                                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                                    "trail_stop": "—",
+                                    "winrate":  _winrate(),
+                                })
+
+                            # (b) Recompute the signal on the closed bar.
+                            closes = [c[4] for c in sig_closes]
+                            result = strat.calculate(closes)
+                            signal = result["signal"]
                             state.update({
-                                "position": "none", "unrealized": "0.00",
-                                "balance":  f"{paper['balance']:.2f}",
-                                "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                                "trail_stop": "—",
-                                "winrate":  _winrate(),
+                                "signal":      signal or "—",
+                                "ema":         f"{result['ema']:.4f}" if result["ema"] else "—",
+                                "ec":          f"{result['ec']:.4f}"  if result["ec"]  else "—",
+                                "period":      str(result["period"]),
+                                "last_candle": last_candle_str,
+                                "updated":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "winrate":     _winrate(),
                             })
 
-                        # (b) Recompute the signal on the closed bar.
-                        closes = [c[4] for c in sig_closes]
-                        result = strat.calculate(closes)
-                        signal = result["signal"]
-                        state.update({
-                            "signal":      signal or "—",
-                            "ema":         f"{result['ema']:.4f}" if result["ema"] else "—",
-                            "ec":          f"{result['ec']:.4f}"  if result["ec"]  else "—",
-                            "period":      str(result["period"]),
-                            "last_candle": last_candle_str,
-                            "updated":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "winrate":     _winrate(),
-                        })
+                            # (c) Entry / reversal. Pine fires strategy.entry on EVERY
+                            #     bar the condition holds, with pyramiding=1 — so the
+                            #     net rule is simply: hold the side the signal points
+                            #     to. Crucially this re-enters right after a stop if
+                            #     the condition still holds (the old prev_signal guard
+                            #     wrongly blocked that). Entry fills at the signal
+                            #     bar's close = next bar's open in 24/7 crypto (no gap),
+                            #     the price a TradingView market order would get.
+                            if signal:
+                                entry_px = float(last_closed[4])
+                                qty      = _calc_qty(entry_px, paper["balance"])
+                                cur_pos  = paper["side"]
 
-                        # (c) Entry / reversal. Pine fires strategy.entry on EVERY
-                        #     bar the condition holds, with pyramiding=1 — so the
-                        #     net rule is simply: hold the side the signal points
-                        #     to. Crucially this re-enters right after a stop if
-                        #     the condition still holds (the old prev_signal guard
-                        #     wrongly blocked that). Entry fills at the signal
-                        #     bar's close = next bar's open in 24/7 crypto (no gap),
-                        #     the price a TradingView market order would get.
-                        if signal:
-                            entry_px = float(last_closed[4])
-                            qty      = _calc_qty(entry_px, paper["balance"])
-                            cur_pos  = paper["side"]
+                                if signal == "LONG" and cur_pos != "long":
+                                    if cur_pos == "short":
+                                        raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
+                                        _record_exit("SHORT", entry_px, "SIGNAL_REVERSE",
+                                                     raw, pct, last_candle_str)
+                                    order = _open_position("LONG", qty, entry_px)
+                                    _record_entry("LONG", entry_px, qty,
+                                                  last_candle_str, order["id"])
 
-                            if signal == "LONG" and cur_pos != "long":
-                                if cur_pos == "short":
-                                    raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
-                                    _record_exit("SHORT", entry_px, "SIGNAL_REVERSE",
-                                                 raw, pct, last_candle_str)
-                                order = _open_position("LONG", qty, entry_px)
-                                _record_entry("LONG", entry_px, qty,
-                                              last_candle_str, order["id"])
-
-                            elif signal == "SHORT" and cur_pos != "short":
-                                if cur_pos == "long":
-                                    raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
-                                    _record_exit("LONG", entry_px, "SIGNAL_REVERSE",
-                                                 raw, pct, last_candle_str)
-                                order = _open_position("SHORT", qty, entry_px)
-                                _record_entry("SHORT", entry_px, qty,
-                                              last_candle_str, order["id"])
+                                elif signal == "SHORT" and cur_pos != "short":
+                                    if cur_pos == "long":
+                                        raw, pct = _close_position(entry_px, "SIGNAL_REVERSE")
+                                        _record_exit("LONG", entry_px, "SIGNAL_REVERSE",
+                                                     raw, pct, last_candle_str)
+                                    order = _open_position("SHORT", qty, entry_px)
+                                    _record_entry("SHORT", entry_px, qty,
+                                                  last_candle_str, order["id"])
 
             # ── 3. SLEEP 1 SECOND ─────────────────────────────────────────────
             time_mod.sleep(1)
