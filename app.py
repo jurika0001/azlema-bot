@@ -38,24 +38,17 @@ TP_DIST = round(FIXED_TP     * MINTICK, 8)
 TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
-# calc_on_every_tick=false in Pine only governs the ENTRY (evaluated at bar
-# close). The EXIT is a strategy.exit() standing order (fixed SL + trailing)
-# that the broker tracks TICK BY TICK, so it fires INTRA-CANDLE — seconds after
-# the move — not at bar close. That is what actually happened in the real
-# real-time paper-trading run this bot reproduces: fast exits that still ride a
-# clean directional move (the trail follows the extreme and only closes on a
-# trail_offset pullback). So REALTIME_EXITS defaults ON; the earlier "keep it
-# off / tick-by-tick destroys profit" note was a wrong assumption.
+# CONFIRMED by the user from live runs: the strategy.exit SL + trailing is a
+# STANDING ORDER that closes the trade LIVE, intra-candle (seconds after the
+# move) — NOT at candle close. So REALTIME_EXITS defaults ON and _check_sl_tp
+# (real-time peak + trailing) is the exit engine, fed by the websocket TICK
+# stream. True ticks (not coarse 1 s samples) let it ride a clean move and only
+# close on a real trail_offset pullback, instead of dying on sampling jitter.
 #
-# The closed-candle check (_check_sl_tp_candle) still runs at each bar close as
-# a BACKSTOP only: it self-disables once flat and corrects the peak from the
-# bar's true OHLC in case the ~1 s price poll missed a fast wick between samples.
+# _check_sl_tp_candle still runs at each candle close as a BACKSTOP (corrects the
+# peak from the true OHLC if a fast wick fell between price samples).
 #
-# FIDELITY NOTE: this bot samples price via REST ~once per second, not a true
-# tick stream. For a strategy this fast (a $0.15 trail on ETH) that ~1 s
-# granularity is a real source of slippage vs the original — the same class of
-# problem as the 3 s webhook latency that hurt live execution, just smaller. A
-# websocket tick feed would close that gap.
+# Set REALTIME_EXITS=0 only if you want to force candle-close-only exits.
 REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "1") == "1"
 
 RISK            = 0.01
@@ -117,6 +110,7 @@ trade_lock       = threading.Lock()
 _ws_active       = False
 _last_candle_str = "—"
 _last_price_ts   = 0.0     # time.time() of the last price update (WS or REST)
+_last_ws_tick_ts = 0.0     # time.time() of the last WEBSOCKET tick specifically
 _ws_tick_count   = 0       # how many websocket ticks have been processed
 
 def init_markets():
@@ -393,11 +387,17 @@ def _check_sl_tp_candle(o: float, h: float, l: float, c: float):
                     paper["trail_active"] = True
                     paper["trail_stop"]   = nt
 
-        if is_up:                       # open -> low -> high
-            ex = hit_low()
+        if is_up:                       # open -> low -> high -> close
+            ex = hit_low()              # adverse leg (open->low) first
             if ex[0]:
                 return ex
-            advance_high()
+            advance_high()              # favorable leg (low->high): ride peak, arm trail
+            # retrace leg (high->close): if the price falls trail_offset below the
+            # new peak on its way to the close, the trailing stop fires in THIS
+            # same candle — this is how a winner exits at extreme ± offset on the
+            # very candle it ran (e.g. the screenshots' same-candle exits).
+            if paper["trail_active"] and c <= paper["trail_stop"]:
+                return True, paper["trail_stop"], "TRAIL_TP"
         else:                           # open -> high -> low
             advance_high()
             ex = hit_low()
@@ -429,11 +429,16 @@ def _check_sl_tp_candle(o: float, h: float, l: float, c: float):
             ex = hit_high()
             if ex[0]:
                 return ex
-        else:                           # open -> high -> low : adverse first
+        else:                           # open -> high -> low -> close : adverse first
             ex = hit_high()
             if ex[0]:
                 return ex
-            advance_low()
+            advance_low()               # favorable leg (high->low): ride peak, arm trail
+            # retrace leg (low->close): if the price rises trail_offset above the
+            # new low on its way to the close, the trailing stop fires in THIS
+            # same candle (the #976-style same-candle short exit).
+            if paper["trail_active"] and c >= paper["trail_stop"]:
+                return True, paper["trail_stop"], "TRAIL_TP"
 
     return False, 0.0, ""
 
@@ -549,13 +554,18 @@ def _try_realtime_exit(price: float, candle_str: str):
         return True
 
 
-def on_live_price(price: float):
+def on_live_price(price: float, from_ws: bool = False):
     """
-    Called on EVERY price update (each websocket tick, or each REST poll in the
-    fallback). Applies the same sanity filter as get_live_price(), tracks the
-    SL/trailing in real time, and refreshes the live UI fields.
+    Called on EVERY price update — each websocket tick (from_ws=True) or each
+    ~1 s REST poll. Tracks the SL/trailing in REAL TIME and exits intra-candle,
+    exactly like the standing strategy.exit order the user watched close live.
+
+    Exit driving: the websocket (true ticks) drives exits whenever it is healthy;
+    the coarser 1 s REST poll only drives exits when the websocket has gone
+    silent (>5 s). So normal sampling jitter never closes a trade early, but a
+    websocket stall can never freeze it either.
     """
-    global _last_good_price, _last_price_ts
+    global _last_good_price, _last_price_ts, _last_ws_tick_ts
     if price <= 0:
         return
     if _last_good_price > 0:
@@ -563,10 +573,14 @@ def on_live_price(price: float):
         if jump > _MAX_TICK_JUMP_PCT:
             return                              # reject corrupted tick
     _last_good_price = price
-    _last_price_ts   = time_mod.time()
+    now = time_mod.time()
+    _last_price_ts   = now
+    if from_ws:
+        _last_ws_tick_ts = now
 
     paper["unrealized"] = _unrealized_pct(price)
-    if REALTIME_EXITS:
+    ws_healthy = (now - _last_ws_tick_ts) < 5.0
+    if REALTIME_EXITS and (from_ws or not ws_healthy):
         _try_realtime_exit(price, _last_candle_str)
 
     trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
@@ -614,7 +628,7 @@ def price_ws_loop():
                         _ws_active = True
                         _ws_tick_count += 1
                         fails = 0
-                        on_live_price(float(px))
+                        on_live_price(float(px), from_ws=True)
                 except Exception as e:
                     fails += 1
                     _ws_active = False
