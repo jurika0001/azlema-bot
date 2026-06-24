@@ -38,17 +38,19 @@ TP_DIST = round(FIXED_TP     * MINTICK, 8)
 TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
-# CONFIRMED by the user from live runs: the strategy.exit SL + trailing is a
-# STANDING ORDER that closes the trade LIVE, intra-candle (seconds after the
-# move) — NOT at candle close. So REALTIME_EXITS defaults ON and _check_sl_tp
-# (real-time peak + trailing) is the exit engine, fed by the websocket TICK
-# stream. True ticks (not coarse 1 s samples) let it ride a clean move and only
-# close on a real trail_offset pullback, instead of dying on sampling jitter.
+# THE USER WANTS INTRA-CANDLE EXITS: the trade closes LIVE, during the candle, at
+# the real price the moment it retraces trail_offset (15 ticks) from the running
+# peak — NOT snapped to the candle's O/H/L/C extreme at candle close. ("Não fechar
+# em extremos, porque é intra-candle.")
 #
-# _check_sl_tp_candle still runs at each candle close as a BACKSTOP (corrects the
-# peak from the true OHLC if a fast wick fell between price samples).
+# So REALTIME_EXITS defaults ON and _check_sl_tp (real-time peak + trailing) owns
+# exits, fed by the websocket TICK stream. The candle-close stop check is SKIPPED
+# for exits in this mode (see section 2a), so nothing is ever closed "at the
+# extreme". The trail still ratchets up with each new live peak and only closes on
+# a real 15-tick pullback.
 #
-# Set REALTIME_EXITS=0 only if you want to force candle-close-only exits.
+# REALTIME_EXITS=0 switches to the candle model (exits at candle close from the
+# O/H/L/C). Kept ON per the user: exits must be intra-candle / live.
 REALTIME_EXITS  = os.environ.get("REALTIME_EXITS", "1") == "1"
 
 RISK            = 0.01
@@ -717,24 +719,27 @@ def strategy_loop():
                         # websocket-driven exit can't race the bar-close exit /
                         # entry below (no double close, no half-applied entry).
                         with trade_lock:
-                            # (a) Process stops on the just-closed bar FIRST, like the
-                            #     TradingView broker emulator. O/H/L/C lets SL vs
-                            #     trailing fire in the correct intra-bar order.
-                            cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
-                                float(last_closed[1]), float(last_closed[2]),
-                                float(last_closed[3]), float(last_closed[4]))
-                            if cl_ex and paper["side"] != "none":
-                                cl_side = paper["side"]
-                                raw, pct = _close_position(cl_px, cl_rsn)
-                                _record_exit(cl_side.upper(), cl_px, cl_rsn,
-                                             raw, pct, last_candle_str)
-                                state.update({
-                                    "position": "none", "unrealized": "0.00",
-                                    "balance":  f"{paper['balance']:.2f}",
-                                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                                    "trail_stop": "—",
-                                    "winrate":  _winrate(),
-                                })
+                            # (a) Candle-close stop check — ONLY in candle mode
+                            #     (REALTIME_EXITS=0). In intra-candle mode the live
+                            #     tick trailing already owns exits and the user does
+                            #     NOT want trades closed at the candle's O/H/L/C
+                            #     extreme, so this is skipped entirely.
+                            if not REALTIME_EXITS:
+                                cl_ex, cl_px, cl_rsn = _check_sl_tp_candle(
+                                    float(last_closed[1]), float(last_closed[2]),
+                                    float(last_closed[3]), float(last_closed[4]))
+                                if cl_ex and paper["side"] != "none":
+                                    cl_side = paper["side"]
+                                    raw, pct = _close_position(cl_px, cl_rsn)
+                                    _record_exit(cl_side.upper(), cl_px, cl_rsn,
+                                                 raw, pct, last_candle_str)
+                                    state.update({
+                                        "position": "none", "unrealized": "0.00",
+                                        "balance":  f"{paper['balance']:.2f}",
+                                        "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                                        "trail_stop": "—",
+                                        "winrate":  _winrate(),
+                                    })
 
                             # (b) Recompute the signal on the closed bar.
                             closes = [c[4] for c in sig_closes]
