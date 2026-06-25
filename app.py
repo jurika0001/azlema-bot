@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 # In Pine the SL/TP distances are in TICKS × syminfo.mintick. Here mintick is a
 # STRATEGY parameter — "the value of one point" — set explicitly (currently 0.1),
 # NOT auto-detected from the exchange. So with the current params:
-#   SL = 2000 pts → $200,  trail-activation = 55 pts → $5.5,  trail-offset = 30 pts → $3.0.
+#   SL = 2000 pts → $200,  trail-activation = 55 pts → $5.5,  trail-offset = 15 pts → $1.5.
 # Change it here or via the MINTICK_OVERRIDE env var.
 MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.1))
 FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance
 FIXED_TP     = 55      # trail_points=55 ticks → trailing only ARMS after +55 profit
-TRAIL_OFFSET = 30      # close 30 pts (ticks) off the peak — user override (Pine had 15)
+TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak
 
 # Recomputed inside init_markets() once the real mintick is known.
 SL_DIST = round(FIXED_SL     * MINTICK, 8)
@@ -98,6 +98,7 @@ SYMBOL = None
 
 _last_good_price   = 0.0
 _ticker_fail_count = 0
+_jump_reject_count = 0     # consecutive jump-filter rejects → resync after a few
 _MAX_TICK_JUMP_PCT = 1.5   # ETH/USDT should not move >1.5% in a single second
 
 # ── Real-time concurrency ────────────────────────────────────────────────
@@ -158,7 +159,7 @@ def get_live_price() -> float:
     Logs the actual exception type/message on failure so root cause is
     visible in Render logs instead of failing silently.
     """
-    global _last_good_price, _ticker_fail_count
+    global _last_good_price, _ticker_fail_count, _jump_reject_count, _last_price_ts
     try:
         price = float(ticker_ex.fetch_ticker(SYMBOL or "ETH/USDT:USDT")["last"])
         if price <= 0:
@@ -170,13 +171,23 @@ def get_live_price() -> float:
         if _last_good_price > 0:
             jump_pct = abs(price - _last_good_price) / _last_good_price * 100
             if jump_pct > _MAX_TICK_JUMP_PCT:
-                logger.warning(f"[TICKER] rejected implausible jump "
-                                f"{_last_good_price:.2f} → {price:.2f} "
-                                f"({jump_pct:.2f}%) — keeping last good price")
-                return _last_good_price
+                _jump_reject_count += 1
+                # A one-off corrupted read is rejected; but a REAL sustained move
+                # keeps "jumping" vs the now-stale price, so after a few rejects in
+                # a row we ACCEPT it and resync — otherwise the price freezes
+                # forever (this was the "not receiving live prices" bug).
+                if _jump_reject_count < 3:
+                    logger.warning(f"[TICKER] rejected jump {_last_good_price:.2f} "
+                                   f"→ {price:.2f} ({jump_pct:.2f}%) "
+                                   f"#{_jump_reject_count}")
+                    return _last_good_price
+                logger.warning(f"[TICKER] resync after {_jump_reject_count} "
+                               f"rejected jumps → {price:.2f}")
 
         _last_good_price   = price
-        _ticker_fail_count  = 0
+        _last_price_ts     = time_mod.time()
+        _ticker_fail_count = 0
+        _jump_reject_count = 0
         return price
     except Exception as e:
         _ticker_fail_count += 1
@@ -496,6 +507,7 @@ state = {
     "unrealized":  "0.00",
     "trail_stop":  "—",
     "winrate":     "—",
+    "price":       "—",
 }
 
 def _resolve_candles(ohlcv):
@@ -554,16 +566,20 @@ def on_live_price(price: float, from_ws: bool = False):
     silent (>5 s). So normal sampling jitter never closes a trade early, but a
     websocket stall can never freeze it either.
     """
-    global _last_good_price, _last_price_ts, _last_ws_tick_ts
+    global _last_good_price, _last_price_ts, _last_ws_tick_ts, _jump_reject_count
     if price <= 0:
         return
     if _last_good_price > 0:
         jump = abs(price - _last_good_price) / _last_good_price * 100
         if jump > _MAX_TICK_JUMP_PCT:
-            return                              # reject corrupted tick
+            _jump_reject_count += 1
+            if _jump_reject_count < 3:
+                return                          # reject a one-off corrupted tick
+            # sustained move → resync instead of freezing on a stale price
     _last_good_price = price
     now = time_mod.time()
     _last_price_ts   = now
+    _jump_reject_count = 0
     if from_ws:
         _last_ws_tick_ts = now
 
@@ -575,6 +591,7 @@ def on_live_price(price: float, from_ws: bool = False):
     trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
                   else ("armed" if paper["side"] != "none" else "—"))
     state.update({
+        "price":         f"{price:.2f}",
         "unrealized":    f"{paper['unrealized']:+.2f}",
         "balance":       f"{paper['balance']:.2f}",
         "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
@@ -797,6 +814,24 @@ def keepalive(interval):
 for _iv in [8, 15, 23]:
     threading.Thread(target=keepalive, args=(_iv,), daemon=True).start()
 
+# ── Always-on live-price feed ─────────────────────────────────────────────
+# Keeps _last_good_price fresh for the UI even when the strategy is STOPPED, so
+# the live price is always visible. When the strategy is running its own loop +
+# websocket already refresh the price, so this only fills the gaps.
+def price_poller():
+    try:
+        ticker_ex.load_markets()
+    except Exception as e:
+        logger.warning(f"[PRICE] poller load_markets failed: {type(e).__name__}: {e}")
+    while True:
+        try:
+            get_live_price()              # refreshes _last_good_price + _last_price_ts
+        except Exception:
+            pass
+        time_mod.sleep(2)
+
+threading.Thread(target=price_poller, daemon=True).start()
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FLASK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -852,12 +887,26 @@ tr:hover td{background:#1c2128}
 #toast{position:fixed;bottom:18px;right:18px;padding:10px 16px;border-radius:8px;
        font-size:.84rem;display:none;z-index:99;color:#fff}
 footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
+.head-right{display:flex;align-items:center;gap:22px}
+#liveprice{text-align:right;line-height:1.1}
+#liveprice .lbl2{font-size:.6rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:2px}
+#lp-val{font-size:1.4rem;font-weight:700;color:#3fb950}
+#lp-val.stale{color:#e3b341}
+.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;
+          margin-right:7px;vertical-align:middle;box-shadow:0 0 6px #3fb950}
+.live-dot.stale{background:#e3b341;box-shadow:none}
 </style>
 </head>
 <body>
 <header>
   <h1>⚡ AZLEMA Bot — Paper Trading</h1>
-  <span id="clock"></span>
+  <div class="head-right">
+    <div id="liveprice">
+      <span class="lbl2">ETH/USDT ao vivo</span>
+      <span class="live-dot" id="lp-dot"></span><span id="lp-val">—</span>
+    </div>
+    <span id="clock"></span>
+  </div>
 </header>
 <div class="container">
   <div class="top-row">
@@ -914,6 +963,20 @@ function tick(){const d=new Date();document.getElementById('clock').textContent=
   `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} `+
   `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`}
 setInterval(tick,1000);tick();
+
+async function pollPrice(){
+  try{
+    const r=await fetch('/price');const d=await r.json();
+    const v=document.getElementById('lp-val'),dot=document.getElementById('lp-dot');
+    if(d.price>0){
+      v.textContent='$'+Number(d.price).toLocaleString('en-US',
+        {minimumFractionDigits:2,maximumFractionDigits:2});
+      const stale=(d.age_s==null||d.age_s>6);
+      v.classList.toggle('stale',stale);dot.classList.toggle('stale',stale);
+    }
+  }catch(e){}
+}
+setInterval(pollPrice,1000);pollPrice();
 
 function toast(msg,ok){const e=document.getElementById('toast');
   e.textContent=msg;e.style.background=ok?'#238636':'#da3633';
@@ -992,6 +1055,17 @@ def ping(): return jsonify({"ok": True, "time": datetime.utcnow().isoformat()})
 
 @app.route("/status")
 def status(): return jsonify({**state, "running": state["running"]})
+
+@app.route("/price")
+def price():
+    """Fast live-price read for the UI (polled ~every second)."""
+    age = round(time_mod.time() - _last_price_ts, 1) if _last_price_ts else None
+    return jsonify({
+        "price":  _last_good_price,
+        "age_s":  age,                 # seconds since last update; small = live
+        "ws":     _ws_active,          # websocket delivering ticks?
+        "symbol": SYMBOL or "ETH/USDT:USDT",
+    })
 
 @app.route("/history")
 def history(): return jsonify(trade_history)
