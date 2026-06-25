@@ -5,7 +5,13 @@ logger = logging.getLogger(__name__)
 
 PI = np.pi
 IFM_RANGE   = 50
-GAIN_LIMIT  = 900
+# GAIN_LIMIT MUST match the chart's "Gain Limit" input. The user's TradingView
+# chart uses 55 (per screenshot) — NOT the Pine default of 900. This sets the
+# range of gains tested in the Zero-Lag EMA (gains run -GAIN_LIMIT/10 …
+# +GAIN_LIMIT/10), so a wrong value changes EC, the EC×EMA cross, and therefore
+# WHICH trades are taken. Getting this wrong makes the bot trade different setups
+# than TradingView entirely.
+GAIN_LIMIT  = 55
 THRESHOLD   = 0.0
 DEF_PERIOD  = 20
 

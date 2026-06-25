@@ -28,9 +28,9 @@ logger = logging.getLogger(__name__)
 # real value from the exchange via ccxt. This env override is only a manual
 # escape hatch if you ever confirm the chart uses a different tick.
 MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.01))   # fallback only
-FIXED_SL     = 2000    # loss=2000 ticks
-FIXED_TP     = 55      # trail_points=55 ticks → trailing-stop activation
-TRAIL_OFFSET = 15      # trail_offset=15 ticks → trailing distance
+FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance
+FIXED_TP     = 55      # trail_points=55 ticks → trailing only ARMS after +55 profit
+TRAIL_OFFSET = 30      # close 30 pts (ticks) off the peak — user override (Pine had 15)
 
 # Recomputed inside init_markets() once the real mintick is known.
 SL_DIST = round(FIXED_SL     * MINTICK, 8)
