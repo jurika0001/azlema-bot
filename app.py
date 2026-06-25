@@ -32,6 +32,14 @@ FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance
 FIXED_TP     = 55      # trail_points=55 ticks → trailing only ARMS after +55 profit
 TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak
 
+# ── Position sizing ───────────────────────────────────────────────────────
+# Position notional = the FULL balance (~1x): qty = balance / price. So every
+# trade compounds the account by the SAME % it shows in the history, and the
+# total profit finally AGREES with the trades. This is DECOUPLED from the
+# distance MINTICK on purpose: raising MINTICK to widen the trailing must NOT
+# shrink the position (that coupling made the total ~10× below the per-trade
+# %s). See _calc_qty.
+
 # Recomputed inside init_markets() once the real mintick is known.
 SL_DIST = round(FIXED_SL     * MINTICK, 8)
 TP_DIST = round(FIXED_TP     * MINTICK, 8)
@@ -278,12 +286,13 @@ def _close_position(price, reason):
     return raw, pct
 
 def _calc_qty(price, balance):
-    # Pine:  lots = (risk * balance) / (fixedSL * mintick);  capped at `limit`.
-    # The Pine code does NOT cap by available balance, so neither do we — that
-    # extra cap was shrinking the size on small balances and breaking parity.
-    sl_usdt   = FIXED_SL * MINTICK
-    risk_usdt = RISK * balance
-    qty       = (risk_usdt / sl_usdt) if sl_usdt else 0.0
+    # Position notional = full balance (1x): qty = balance / price. On the
+    # TradingView run the position tracked the account exactly — trade #976 held
+    # 5.62 ETH and 5.62 = balance / price. So each trade compounds the balance by
+    # the SAME % it shows, and the total finally agrees with the trades (the old
+    # risk/(fixedSL·mintick) sizing shrank the position, so the total grew far
+    # slower than the per-trade %s). Capped at MAX_LOTS like Pine.
+    qty = (balance / price) if price else 0.0
     return round(min(qty, MAX_LOTS), 4)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -744,6 +753,27 @@ def strategy_loop():
                                         "trail_stop": "—",
                                         "winrate":  _winrate(),
                                     })
+
+                            # (a2) TIME EXIT (intra-candle mode): if the trade
+                            #      survived the WHOLE candle without hitting the
+                            #      trailing-TP or the SL, close it NOW at the
+                            #      candle's CLOSE price (the real price at the
+                            #      boundary — NOT an extreme). So every trade lasts
+                            #      at most one candle; a fresh one opens below per
+                            #      the signal.
+                            elif paper["side"] != "none":
+                                ce_px    = float(last_closed[4])
+                                ce_side  = paper["side"]
+                                raw, pct = _close_position(ce_px, "CANDLE_END")
+                                _record_exit(ce_side.upper(), ce_px, "CANDLE_END",
+                                             raw, pct, last_candle_str)
+                                state.update({
+                                    "position": "none", "unrealized": "0.00",
+                                    "balance":  f"{paper['balance']:.2f}",
+                                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                                    "trail_stop": "—",
+                                    "winrate":  _winrate(),
+                                })
 
                             # (b) Recompute the signal on the closed bar.
                             closes = [c[4] for c in sig_closes]
