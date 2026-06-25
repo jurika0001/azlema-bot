@@ -21,13 +21,13 @@ logger = logging.getLogger(__name__)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIG  (matching Pine Script defaults)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ── Tick size ────────────────────────────────────────────────────────────
-# In Pine Script the SL/TP distances are measured in TICKS and multiplied by
-# syminfo.mintick. To match TradingView exactly the bot must use the SAME tick
-# size as the chart symbol. Instead of hard-coding it, init_markets() reads the
-# real value from the exchange via ccxt. This env override is only a manual
-# escape hatch if you ever confirm the chart uses a different tick.
-MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.01))   # fallback only
+# ── Point value (mintick) ─────────────────────────────────────────────────
+# In Pine the SL/TP distances are in TICKS × syminfo.mintick. Here mintick is a
+# STRATEGY parameter — "the value of one point" — set explicitly (currently 0.1),
+# NOT auto-detected from the exchange. So with the current params:
+#   SL = 2000 pts → $200,  trail-activation = 55 pts → $5.5,  trail-offset = 30 pts → $3.0.
+# Change it here or via the MINTICK_OVERRIDE env var.
+MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.1))
 FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance
 FIXED_TP     = 55      # trail_points=55 ticks → trailing only ARMS after +55 profit
 TRAIL_OFFSET = 30      # close 30 pts (ticks) off the peak — user override (Pine had 15)
@@ -129,29 +129,16 @@ def init_markets():
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
 
-    # ── Read the REAL tick size from the exchange and rebuild SL/TP/trail ──
-    # This is what makes the bot match TradingView without guessing 0.01.
-    global MINTICK, SL_DIST, TP_DIST, TR_DIST
-    if "MINTICK_OVERRIDE" in os.environ:
-        logger.info(f"[INIT] mintick OVERRIDE from env = {MINTICK}")
-    else:
-        try:
-            prec = mkts[SYMBOL]["precision"]["price"]
-            if prec:
-                prec = float(prec)
-                # ccxt usually reports tick size directly (e.g. 0.01). If it ever
-                # reports a number of decimal places (e.g. 2), convert it.
-                MINTICK = prec if prec < 1 else 10 ** (-int(prec))
-            logger.info(f"[INIT] mintick auto-detected from Phemex = {MINTICK}")
-        except Exception as e:
-            logger.warning(f"[INIT] could not read mintick ({e}); "
-                           f"using fallback {MINTICK}")
-
+    # ── SL/TP/trail distances from the configured point value (mintick) ──
+    # mintick is a STRATEGY parameter set in code (MINTICK / env MINTICK_OVERRIDE),
+    # NOT auto-detected from Phemex — the exchange's real tick is irrelevant to the
+    # strategy's point distances. Currently 0.1 per the user.
+    global SL_DIST, TP_DIST, TR_DIST
     SL_DIST = round(FIXED_SL     * MINTICK, 8)
     TP_DIST = round(FIXED_TP     * MINTICK, 8)
     TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
-    logger.info(f"[INIT] SL=${SL_DIST}  trail-activation=${TP_DIST}  "
-                f"trail-offset=${TR_DIST}  (mintick={MINTICK})")
+    logger.info(f"[INIT] point value (mintick)={MINTICK}  →  SL=${SL_DIST}  "
+                f"trail-activation=${TP_DIST}  trail-offset=${TR_DIST}")
     # Warm up ticker_ex once at init so the first loop iteration isn't 0.0
     try:
         warm = float(ticker_ex.fetch_ticker(SYMBOL)["last"])
