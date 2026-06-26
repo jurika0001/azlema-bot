@@ -21,16 +21,19 @@ logger = logging.getLogger(__name__)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIG  (matching Pine Script defaults)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ── Point value (mintick) ─────────────────────────────────────────────────
-# In Pine the SL/TP distances are in TICKS × syminfo.mintick. Here mintick is a
-# STRATEGY parameter — "the value of one point" — set explicitly (currently 0.1),
-# NOT auto-detected from the exchange. So with the current params:
-#   SL = 2000 pts → $200,  trail-activation = 55 pts → $5.5,  trail-offset = 15 pts → $1.5.
-# Change it here or via the MINTICK_OVERRIDE env var.
-MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.1))
-FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance
-FIXED_TP     = 55      # trail_points=55 ticks → trailing only ARMS after +55 profit
-TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak
+# ── Point values (minticks) ───────────────────────────────────────────────
+# The "point value" is a STRATEGY parameter, set explicitly (NOT auto-detected).
+# The STOP LOSS uses its OWN point (SL_MINTICK) so it can stay TIGHT, while the
+# take-profit activation + trailing use a BIGGER point (MINTICK) to ride more:
+#   SL           = 2000 pts × 0.01 = $20    (tight stop → ~1.2% risk at 1x size)
+#   TP-activation =  55 pts × 0.1  = $5.5   (trail only ARMS after +$5.5 profit)
+#   trail-offset  =  15 pts × 0.1  = $1.5   (closes $1.5 off the running peak)
+# Override via MINTICK_OVERRIDE / SL_MINTICK_OVERRIDE env vars.
+MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.1))      # TP + trailing
+SL_MINTICK   = float(os.environ.get("SL_MINTICK_OVERRIDE", 0.01))  # stop-loss only
+FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance (× SL_MINTICK)
+FIXED_TP     = 55      # trail_points=55 ticks → trailing ARMS after +55 (× MINTICK)
+TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak (× MINTICK)
 
 # ── Position sizing ───────────────────────────────────────────────────────
 # Position notional = the FULL balance (~1x): qty = balance / price. So every
@@ -40,10 +43,10 @@ TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak
 # shrink the position (that coupling made the total ~10× below the per-trade
 # %s). See _calc_qty.
 
-# Recomputed inside init_markets() once the real mintick is known.
-SL_DIST = round(FIXED_SL     * MINTICK, 8)
-TP_DIST = round(FIXED_TP     * MINTICK, 8)
-TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
+# Recomputed inside init_markets().
+SL_DIST = round(FIXED_SL     * SL_MINTICK, 8)   # stop-loss → SL_MINTICK (0.01)
+TP_DIST = round(FIXED_TP     * MINTICK,    8)   # trail activation → MINTICK (0.1)
+TR_DIST = round(TRAIL_OFFSET * MINTICK,    8)   # trail offset → MINTICK (0.1)
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
 # THE USER WANTS INTRA-CANDLE EXITS: the trade closes LIVE, during the candle, at
@@ -138,15 +141,15 @@ def init_markets():
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
 
-    # ── SL/TP/trail distances from the configured point value (mintick) ──
-    # mintick is a STRATEGY parameter set in code (MINTICK / env MINTICK_OVERRIDE),
-    # NOT auto-detected from Phemex — the exchange's real tick is irrelevant to the
-    # strategy's point distances. Currently 0.1 per the user.
+    # ── SL/TP/trail distances from the configured point values ──
+    # Strategy params set in code (NOT auto-detected from Phemex). The stop-loss
+    # uses SL_MINTICK (0.01 → $20, tight); the TP activation + trailing use the
+    # bigger MINTICK (0.1 → $5.5 / $1.5) so the trade rides more.
     global SL_DIST, TP_DIST, TR_DIST
-    SL_DIST = round(FIXED_SL     * MINTICK, 8)
-    TP_DIST = round(FIXED_TP     * MINTICK, 8)
-    TR_DIST = round(TRAIL_OFFSET * MINTICK, 8)
-    logger.info(f"[INIT] point value (mintick)={MINTICK}  →  SL=${SL_DIST}  "
+    SL_DIST = round(FIXED_SL     * SL_MINTICK, 8)
+    TP_DIST = round(FIXED_TP     * MINTICK,    8)
+    TR_DIST = round(TRAIL_OFFSET * MINTICK,    8)
+    logger.info(f"[INIT] SL_pt={SL_MINTICK} TP/trail_pt={MINTICK}  →  SL=${SL_DIST}  "
                 f"trail-activation=${TP_DIST}  trail-offset=${TR_DIST}")
     # Warm up ticker_ex once at init so the first loop iteration isn't 0.0
     try:
@@ -1147,7 +1150,8 @@ def debug_ticker():
         "sl_dist":           SL_DIST,
         "tp_activation_dist": TP_DIST,
         "trail_offset_dist": TR_DIST,
-        "mintick":           MINTICK,
+        "sl_mintick":        SL_MINTICK,   # stop-loss point (0.01)
+        "mintick":           MINTICK,      # TP + trailing point (0.1)
     })
 
 @app.route("/start", methods=["POST"])
