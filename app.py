@@ -717,14 +717,12 @@ def strategy_loop():
     last_candle_str  = "—"
     last_ohlcv_check = 0.0   # throttle ohlcv fetching to every 15 s
 
-    # Startup sync
-    init_ohlcv = fetch_candles()
-    if init_ohlcv and len(init_ohlcv) >= 70:
-        _lc, _ = _resolve_candles(init_ohlcv)
-        last_candle_ts = _lc[0]
-        logger.info(f"[SYNC] locked to candle "
-                    f"{datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)}"
-                    f" — waiting for next close")
+    # Startup: do NOT lock last_candle_ts to the current candle. Leaving it None
+    # makes the FIRST OHLCV check (within ~15 s) treat the latest CLOSED candle as
+    # "new" and open the first trade right away, instead of waiting up to 30 min
+    # for the next candle to close (which looked like "it doesn't even start").
+    logger.info("[SYNC] will open the first trade on the next OHLCV check "
+                "(latest closed candle) — no 30 min wait")
 
     logger.info(f"[CFG] REALTIME_EXITS={REALTIME_EXITS}  ws_available={_HAS_WS}  "
                 f"(if REALTIME_EXITS is False, exits only happen at candle close — "
