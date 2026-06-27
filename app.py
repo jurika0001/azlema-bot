@@ -233,6 +233,8 @@ paper = {
     "trail_active": False,
     "trail_stop":   0.0,
     "unrealized":   0.0,
+    "mfe_pct":      0.0,   # max favorable excursion (best unrealized %) this trade
+    "mae_pct":      0.0,   # max adverse excursion (worst unrealized %) this trade
     "total_pnl":    0.0,
     "total_pnl_pct": 0.0,
 }
@@ -263,6 +265,8 @@ def _open_position(side, qty, price):
     paper["trail_active"] = False
     paper["trail_stop"]   = 0.0
     paper["unrealized"]   = 0.0
+    paper["mfe_pct"]      = 0.0   # reset excursions for the new trade
+    paper["mae_pct"]      = 0.0
     oid = f"SIM-{int(time_mod.time())}"
     logger.info(f"[PAPER] OPEN {side}  qty={qty}  @ {price:.2f}  id={oid}")
     return {"id": oid}
@@ -470,6 +474,9 @@ def _save_history():
     except Exception as e: logger.warning(f"[HISTORY] {e}")
 
 def _record_exit(side_str, price, reason, pnl_usd, pnl_pct_val, candle_str):
+    # paper["mfe_pct"]/["mae_pct"] still hold THIS trade's excursions here:
+    # _close_position does not reset them (only _open_position does), so they are
+    # the max profit / max loss % the trade reached while it was open.
     trade_history.insert(0, {
         "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "candle":   candle_str,
@@ -479,6 +486,8 @@ def _record_exit(side_str, price, reason, pnl_usd, pnl_pct_val, candle_str):
         "order_id": f"EXIT-{reason}",
         "balance":  f"{paper['balance']:.2f}",
         "pnl_pct":  f"{pnl_pct_val:+.2f}",
+        "mfe":      f"{paper['mfe_pct']:+.2f}",
+        "mae":      f"{paper['mae_pct']:+.2f}",
     })
     _save_history()
 
@@ -492,6 +501,8 @@ def _record_entry(side_str, price, qty, candle_str, order_id):
         "order_id": order_id,
         "balance":  f"{paper['balance']:.2f}",
         "pnl_pct":  "—",
+        "mfe":      "—",
+        "mae":      "—",
     })
     _save_history()
 
@@ -517,6 +528,8 @@ state = {
     "balance":     f"{PAPER_START_BAL:.2f}",
     "total_pnl_pct": "0.00",
     "unrealized":  "0.00",
+    "mfe":         "0.00",
+    "mae":         "0.00",
     "trail_stop":  "—",
     "winrate":     "—",
     "price":       "—",
@@ -596,6 +609,19 @@ def on_live_price(price: float, from_ws: bool = False):
         _last_ws_tick_ts = now
 
     paper["unrealized"] = _unrealized_pct(price)
+    # Track the max favorable / adverse excursion (best & worst unrealized %)
+    # the trade reached while open — BEFORE the exit check (so a trade that hits
+    # its peak and then closes still records that peak).
+    if paper["side"] != "none":
+        u = paper["unrealized"]
+        if u > paper["mfe_pct"]:
+            paper["mfe_pct"] = u
+        if u < paper["mae_pct"]:
+            paper["mae_pct"] = u
+        mfe_disp, mae_disp = f"{paper['mfe_pct']:+.2f}", f"{paper['mae_pct']:+.2f}"
+    else:
+        mfe_disp, mae_disp = "0.00", "0.00"
+
     ws_healthy = (now - _last_ws_tick_ts) < 5.0
     if REALTIME_EXITS and (from_ws or not ws_healthy):
         _try_realtime_exit(price, _last_candle_str)
@@ -605,6 +631,8 @@ def on_live_price(price: float, from_ws: bool = False):
     state.update({
         "price":         f"{price:.2f}",
         "unrealized":    f"{paper['unrealized']:+.2f}",
+        "mfe":           mfe_disp,
+        "mae":           mae_disp,
         "balance":       f"{paper['balance']:.2f}",
         "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
         "trail_stop":    trail_disp,
@@ -967,6 +995,8 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
     <div class="card"><div class="lbl">Saldo (USDT)</div><div class="val" id="c-bal">—</div></div>
     <div class="card"><div class="lbl">PnL Total %</div><div class="val" id="c-pnl">—</div></div>
     <div class="card"><div class="lbl">Não Realizado %</div><div class="val" id="c-unr">—</div></div>
+    <div class="card"><div class="lbl">Lucro Máx % (aberta)</div><div class="val" id="c-mfe">—</div></div>
+    <div class="card"><div class="lbl">Perda Máx % (aberta)</div><div class="val" id="c-mae">—</div></div>
     <div class="card"><div class="lbl">Winrate</div><div class="val" id="c-win">—</div></div>
     <div class="card"><div class="lbl">Trail Stop</div><div class="val" id="c-trail">—</div></div>
     <div class="card"><div class="lbl">EMA</div><div class="val" id="c-ema">—</div></div>
@@ -980,10 +1010,11 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
   <table>
     <thead>
       <tr><th>Hora</th><th>Candle</th><th>Lado</th>
-          <th>Preço</th><th>Qtd</th><th>PnL %</th><th>Saldo</th><th>ID</th></tr>
+          <th>Preço</th><th>Qtd</th><th>PnL %</th>
+          <th>Lucro Máx %</th><th>Perda Máx %</th><th>Saldo</th><th>ID</th></tr>
     </thead>
     <tbody id="tbody">
-      <tr><td colspan="8" style="text-align:center;color:#484f58;padding:20px">
+      <tr><td colspan="10" style="text-align:center;color:#484f58;padding:20px">
         Nenhuma trade ainda</td></tr>
     </tbody>
   </table>
@@ -1050,6 +1081,10 @@ async function fetchAll(){
   pnl.textContent=s.total_pnl_pct+'%';pnl.className=pnlCls(s.total_pnl_pct);
   const unr=document.getElementById('c-unr');
   unr.textContent=s.unrealized+'%';unr.className=pnlCls(s.unrealized);
+  const mfe=document.getElementById('c-mfe');
+  mfe.textContent=s.mfe+'%';mfe.className=pnlCls(s.mfe);
+  const mae=document.getElementById('c-mae');
+  mae.textContent=s.mae+'%';mae.className=pnlCls(s.mae);
   document.getElementById('c-win').textContent=s.winrate;
   document.getElementById('c-trail').textContent=s.trail_stop;
   ['ema','ec','period'].forEach(k=>document.getElementById('c-'+k).textContent=s[k]);
@@ -1066,9 +1101,11 @@ async function fetchAll(){
     <td>${r.qty||'—'}</td>
     <td class="${r.pnl_pct&&r.pnl_pct!=='—'?(parseFloat(r.pnl_pct)>=0?'pos-num':'neg-num'):''}">
       ${r.pnl_pct&&r.pnl_pct!=='—'?r.pnl_pct+'%':'—'}</td>
+    <td class="${r.mfe&&r.mfe!=='—'?'pos-num':''}">${r.mfe&&r.mfe!=='—'?r.mfe+'%':'—'}</td>
+    <td class="${r.mae&&r.mae!=='—'?'neg-num':''}">${r.mae&&r.mae!=='—'?r.mae+'%':'—'}</td>
     <td>$${r.balance}</td>
     <td style="font-size:.68rem;color:#8b949e">${r.order_id}</td></tr>`).join('')
-    :'<tr><td colspan="8" style="text-align:center;color:#484f58;padding:20px">Nenhuma trade ainda</td></tr>'}
+    :'<tr><td colspan="10" style="text-align:center;color:#484f58;padding:20px">Nenhuma trade ainda</td></tr>'}
 // Load saved fee values on page open
 fetch('/settings').then(r=>r.json()).then(d=>{
   document.getElementById('fee-entry').value=d.fee_entry;
