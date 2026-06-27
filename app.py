@@ -622,8 +622,14 @@ def on_live_price(price: float, from_ws: bool = False):
     else:
         mfe_disp, mae_disp = "0.00", "0.00"
 
-    ws_healthy = (now - _last_ws_tick_ts) < 5.0
-    if REALTIME_EXITS and (from_ws or not ws_healthy):
+    # Check the SL/trailing on EVERY price update — every websocket tick AND the
+    # 1 s loop poll. The old gate skipped the loop's check while the WS *looked*
+    # healthy; if the WS then went quietly stale, exits went unchecked and trades
+    # only closed at the candle end. With the trailing offset now $1.5 (not the
+    # old $0.15), the coarse 1 s sampling can't trigger an early exit on jitter
+    # (a real $1.5 move ≠ jitter), so always checking is safe. After a close,
+    # side is 'none' → the duplicate check is a harmless no-op (no double close).
+    if REALTIME_EXITS:
         _try_realtime_exit(price, _last_candle_str)
 
     trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
