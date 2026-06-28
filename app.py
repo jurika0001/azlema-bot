@@ -43,10 +43,38 @@ TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak (× MINTICK)
 # shrink the position (that coupling made the total ~10× below the per-trade
 # %s). See _calc_qty.
 
-# Recomputed inside init_markets().
-SL_DIST = round(FIXED_SL     * SL_MINTICK, 8)   # stop-loss → SL_MINTICK (0.01)
-TP_DIST = round(FIXED_TP     * MINTICK,    8)   # trail activation → MINTICK (0.1)
-TR_DIST = round(TRAIL_OFFSET * MINTICK,    8)   # trail offset → MINTICK (0.1)
+# ── Exit distances ($) — USER-EDITABLE in the UI, persisted to config.json ──
+# These default to the point math above (SL=$20, TP-activation=$5.5, trail=$1.5)
+# but the dashboard lets you change them live (and the backtest uses them too).
+CONFIG_FILE = "config.json"
+def _default_config():
+    return {
+        "sl_dist": round(FIXED_SL     * SL_MINTICK, 8),  # stop-loss distance, $
+        "tp_dist": round(FIXED_TP     * MINTICK,    8),  # trailing activation, $
+        "tr_dist": round(TRAIL_OFFSET * MINTICK,    8),  # trailing offset, $
+    }
+def _load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            d = json.load(f); base = _default_config(); base.update(d); return base
+    except Exception:
+        return _default_config()
+def _save_config():
+    try:
+        with open(CONFIG_FILE, "w") as f: json.dump(config, f)
+    except Exception as e: logging.getLogger(__name__).warning(f"[CONFIG] {e}")
+
+config = _load_config()
+
+# SL_DIST / TP_DIST / TR_DIST are what the exit logic reads. _apply_config keeps
+# them in sync with the editable `config` dict (called on load + on every save).
+SL_DIST = TP_DIST = TR_DIST = 0.0
+def _apply_config():
+    global SL_DIST, TP_DIST, TR_DIST
+    SL_DIST = round(float(config["sl_dist"]), 8)
+    TP_DIST = round(float(config["tp_dist"]), 8)
+    TR_DIST = round(float(config["tr_dist"]), 8)
+_apply_config()
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
 # THE USER WANTS INTRA-CANDLE EXITS: the trade closes LIVE, during the candle, at
@@ -105,6 +133,10 @@ ticker_ex = ccxt.phemex({
     "rateLimit": 250,     # ms between requests — safe, still ~4 req/s ceiling
     "timeout": 6000,
 })
+# bt_ex: SEPARATE instance for the backtest's bulk OHLCV fetches, so they never
+# run concurrently with the strategy loop on the same ccxt session (a requests
+# Session is not thread-safe for concurrent calls).
+bt_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
 SYMBOL = None
 
 _last_good_price   = 0.0
@@ -141,16 +173,10 @@ def init_markets():
     if not SYMBOL:
         raise RuntimeError("No ETH perpetual found on Phemex")
 
-    # ── SL/TP/trail distances from the configured point values ──
-    # Strategy params set in code (NOT auto-detected from Phemex). The stop-loss
-    # uses SL_MINTICK (0.01 → $20, tight); the TP activation + trailing use the
-    # bigger MINTICK (0.1 → $5.5 / $1.5) so the trade rides more.
-    global SL_DIST, TP_DIST, TR_DIST
-    SL_DIST = round(FIXED_SL     * SL_MINTICK, 8)
-    TP_DIST = round(FIXED_TP     * MINTICK,    8)
-    TR_DIST = round(TRAIL_OFFSET * MINTICK,    8)
-    logger.info(f"[INIT] SL_pt={SL_MINTICK} TP/trail_pt={MINTICK}  →  SL=${SL_DIST}  "
-                f"trail-activation=${TP_DIST}  trail-offset=${TR_DIST}")
+    # ── SL/TP/trail distances come from the editable config (config.json / UI) ──
+    _apply_config()
+    logger.info(f"[INIT] SL=${SL_DIST}  trail-activation=${TP_DIST}  "
+                f"trail-offset=${TR_DIST}  (editable in the dashboard)")
     # Warm up ticker_ex once at init so the first loop iteration isn't 0.0
     try:
         warm = float(ticker_ex.fetch_ticker(SYMBOL)["last"])
@@ -904,6 +930,133 @@ def price_poller():
 threading.Thread(target=price_poller, daemon=True).start()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BACKTEST  (intra-candle replay using 1-minute sub-candles)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Each 30m candle is NOT read as just its O/H/L/C — we replay the real intra-candle
+# price path from its 1-minute sub-candles and run the SAME trailing/SL/candle-end
+# exit rules as live trading, so the backtest is as close to real trades as REST
+# data allows. Runs in a background thread; the UI polls /backtest-result.
+_backtest = {"running": False, "progress": "", "result": None, "error": None}
+
+def _fetch_1m_candles(since_ms, until_ms):
+    out, cur = [], int(since_ms)
+    for _ in range(300):                       # safety cap on pages
+        try:
+            rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="1m",
+                                     since=cur, limit=1000)
+        except Exception as e:
+            logger.warning(f"[BT] 1m fetch: {type(e).__name__}: {e}"); break
+        if not rows: break
+        out.extend(rows)
+        last = rows[-1][0]
+        if last <= cur or last >= until_ms: break   # reached the end / no progress
+        cur = last + 60_000
+    seen = {r[0]: r for r in out}
+    return [seen[k] for k in sorted(seen)]
+
+def _intra_path(o, h, l, c):
+    # approximate the within-minute price path (broker-emulator bar order)
+    return [o, l, h, c] if c >= o else [o, h, l, c]
+
+def _simulate_trade(side, entry, subs, candle_close, sl, tp, tr):
+    """Replay one trade through its 1m sub-candles. Returns (exit_px, reason, mfe%, mae%)."""
+    peak = entry; trail_active = False; trail_stop = 0.0; mfe = 0.0; mae = 0.0
+    for s in subs:
+        for px in _intra_path(float(s[1]), float(s[2]), float(s[3]), float(s[4])):
+            d = (px - entry) if side == "LONG" else (entry - px)
+            pct = (d / entry * 100) if entry else 0.0
+            if pct > mfe: mfe = pct
+            if pct < mae: mae = pct
+            if side == "LONG":
+                if px > peak: peak = px
+                if peak - entry >= tp:
+                    nt = peak - tr
+                    if not trail_active or nt > trail_stop:
+                        trail_active = True; trail_stop = nt
+                if trail_active and px <= trail_stop:
+                    return trail_stop, "TRAIL_TP", mfe, mae
+                if px <= entry - sl:
+                    return entry - sl, "SL", mfe, mae
+            else:
+                if px < peak: peak = px
+                if entry - peak >= tp:
+                    nt = peak + tr
+                    if not trail_active or nt < trail_stop:
+                        trail_active = True; trail_stop = nt
+                if trail_active and px >= trail_stop:
+                    return trail_stop, "TRAIL_TP", mfe, mae
+                if px >= entry + sl:
+                    return entry + sl, "SL", mfe, mae
+    return candle_close, "CANDLE_END", mfe, mae   # never hit TP/SL → close at candle end
+
+def run_backtest(n_candles=300):
+    _backtest.update({"running": True, "result": None, "error": None,
+                      "progress": "buscando candles de 30m…"})
+    try:
+        try:
+            bt_ex.load_markets()
+        except Exception as e:
+            logger.warning(f"[BT] load_markets: {type(e).__name__}: {e}")
+        warm    = 65
+        limit30 = n_candles + warm
+        since30 = int((time_mod.time() - limit30 * 1800) * 1000)
+        c30 = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="30m",
+                                since=since30, limit=limit30)
+        if not c30 or len(c30) < 70:
+            raise RuntimeError("poucos candles de 30m da Phemex")
+        c30 = c30[-(n_candles + warm):]
+        _backtest["progress"] = "buscando candles de 1m (variações intra-candle)…"
+        c1m = _fetch_1m_candles(c30[0][0], c30[-1][0] + 1_800_000)
+        buckets = {}
+        for r in c1m:
+            buckets.setdefault((r[0] // 1_800_000) * 1_800_000, []).append(r)
+        for b in buckets: buckets[b].sort(key=lambda x: x[0])
+
+        _backtest["progress"] = "calculando sinais (EC×EMA por candle)…"
+        signals = strat.calculate_series([c[4] for c in c30])
+
+        _backtest["progress"] = "simulando trades (replay 1m)…"
+        sl, tp, tr = SL_DIST, TP_DIST, TR_DIST
+        bal = PAPER_START_BAL; trades = []; wins = 0
+        for i in range(60, len(c30) - 1):
+            sig = signals[i]
+            if not sig: continue
+            entry = float(c30[i][4])                 # candle i close = candle i+1 open
+            nxt   = c30[i + 1]
+            subs  = buckets.get((nxt[0] // 1_800_000) * 1_800_000) or [nxt]
+            ex_px, reason, mfe, mae = _simulate_trade(sig, entry, subs,
+                                                      float(nxt[4]), sl, tp, tr)
+            qty = (bal / entry) if entry else 0.0
+            raw = (ex_px - entry) * qty if sig == "LONG" else (entry - ex_px) * qty
+            bal += raw
+            pct = (raw / (entry * qty) * 100) if (entry * qty) else 0.0
+            if pct > 0: wins += 1
+            trades.append({
+                "candle": datetime.fromtimestamp(nxt[0] / 1000, tz=timezone.utc)
+                          .strftime("%Y-%m-%d %H:%M UTC"),
+                "side": sig, "entry": round(entry, 2), "exit": round(ex_px, 2),
+                "reason": reason, "pnl_pct": round(pct, 3),
+                "mfe": round(mfe, 3), "mae": round(mae, 3), "balance": round(bal, 2),
+            })
+        n = len(trades)
+        summary = {
+            "trades": n,
+            "winrate": round(wins / n * 100, 1) if n else 0.0,
+            "final_balance": round(bal, 2),
+            "total_pnl_pct": round((bal - PAPER_START_BAL) / PAPER_START_BAL * 100, 2),
+            "candles": n_candles, "sl": sl, "tp": tp, "tr": tr,
+            "intrabar_minutes_loaded": len(c1m),
+        }
+        _backtest.update({"running": False, "progress": "concluído",
+                          "result": {"summary": summary, "trades": trades[::-1]}})
+        logger.info(f"[BT] done: {n} trades, bal={bal:.2f}, "
+                    f"pnl={summary['total_pnl_pct']}%")
+    except Exception as e:
+        logger.error(f"[BT] {type(e).__name__}: {e}")
+        _backtest.update({"running": False, "progress": "erro",
+                          "error": f"{type(e).__name__}: {e}"})
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FLASK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 app = Flask(__name__)
@@ -966,6 +1119,24 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
 .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;
           margin-right:7px;vertical-align:middle;box-shadow:0 0 6px #3fb950}
 .live-dot.stale{background:#e3b341;box-shadow:none}
+.tabs{display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid #30363d}
+.tabbtn{background:none;border:none;color:#8b949e;padding:10px 18px;font-size:.92rem;
+        font-weight:600;cursor:pointer;border-bottom:2px solid transparent;border-radius:0}
+.tabbtn.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.cfg-box{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px 18px;
+         display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin-bottom:18px}
+.cfg-box label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em}
+.cfg-box input{width:90px;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+               color:#e6edf3;font-size:.88rem;padding:6px 8px;text-align:center}
+.cfg-box input:focus{outline:none;border-color:#58a6ff}
+#btn-cfg,#btn-bt{padding:7px 16px;font-size:.82rem;background:#1f6feb;color:#fff;border:none;
+                 border-radius:6px;cursor:pointer}#btn-cfg:hover,#btn-bt:hover{background:#388bfd}
+.cfg-hint{font-size:.72rem;color:#8b949e}
+.bt-ctrl{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.bt-ctrl input{width:90px;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+               color:#e6edf3;font-size:.88rem;padding:6px 8px;text-align:center}
+.badge.tp{background:#0d4429;color:#3fb950}.badge.slr{background:#3d1010;color:#f85149}
+.badge.ce{background:#1e2533;color:#8b949e}
 </style>
 </head>
 <body>
@@ -980,6 +1151,20 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
   </div>
 </header>
 <div class="container">
+  <div class="tabs">
+    <button class="tabbtn active" id="tb-paper" onclick="showTab('paper')">📈 Paper Trading</button>
+    <button class="tabbtn" id="tb-backtest" onclick="showTab('backtest')">🧪 Backtesting</button>
+  </div>
+
+  <div class="cfg-box">
+    <div><label>Stop Loss ($)</label><br><input id="cfg-sl" type="number" step="0.1" min="0.1"></div>
+    <div><label>TP ativação ($)</label><br><input id="cfg-tp" type="number" step="0.1" min="0.1"></div>
+    <div><label>Trailing ($)</label><br><input id="cfg-tr" type="number" step="0.1" min="0.1"></div>
+    <button id="btn-cfg" onclick="saveConfig()">Salvar Config</button>
+    <span class="cfg-hint">vale pro bot ao vivo E pro backtest</span>
+  </div>
+
+  <div id="tab-paper">
   <div class="top-row">
     <div class="controls">
       <button id="btn-start" onclick="ctrl('start')">▶ Start</button>
@@ -1030,6 +1215,34 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
         Nenhuma trade ainda</td></tr>
     </tbody>
   </table>
+  </div><!-- /tab-paper -->
+
+  <div id="tab-backtest" style="display:none">
+    <div class="top-row">
+      <div class="bt-ctrl">
+        <div><label>Candles</label><br>
+          <input id="bt-candles" type="number" step="10" min="50" max="1000" value="300"></div>
+        <button id="btn-bt" onclick="runBacktest()">▶ Rodar Backtest</button>
+        <span id="bt-progress" class="cfg-hint"></span>
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="lbl">Trades</div><div class="val" id="bt-trades">—</div></div>
+      <div class="card"><div class="lbl">Winrate</div><div class="val" id="bt-win">—</div></div>
+      <div class="card"><div class="lbl">PnL Total %</div><div class="val" id="bt-pnl">—</div></div>
+      <div class="card"><div class="lbl">Saldo Final</div><div class="val" id="bt-bal">—</div></div>
+      <div class="card"><div class="lbl">Candles 1m</div><div class="val" id="bt-1m">—</div></div>
+    </div>
+    <div class="st">Trades do Backtest — replay intra-candle (1m), regras iguais às do bot</div>
+    <table>
+      <thead><tr><th>Candle</th><th>Lado</th><th>Entrada</th><th>Saída</th>
+        <th>Motivo</th><th>PnL %</th><th>Lucro Máx %</th><th>Perda Máx %</th><th>Saldo</th></tr></thead>
+      <tbody id="bt-tbody">
+        <tr><td colspan="9" style="text-align:center;color:#484f58;padding:20px">
+          Rode um backtest para ver as trades</td></tr>
+      </tbody>
+    </table>
+  </div><!-- /tab-backtest -->
 </div>
 <div id="toast"></div>
 <footer>AZLEMA · Paper Trading Interno · 30 m · ETH/USDT · Preços Phemex Live</footer>
@@ -1061,6 +1274,82 @@ async function pollPrice(){
   }catch(e){}
 }
 setInterval(pollPrice,1000);pollPrice();
+
+// ── Tabs ──
+function showTab(t){
+  document.getElementById('tab-paper').style.display    = (t==='paper')?'':'none';
+  document.getElementById('tab-backtest').style.display = (t==='backtest')?'':'none';
+  document.getElementById('tb-paper').classList.toggle('active', t==='paper');
+  document.getElementById('tb-backtest').classList.toggle('active', t==='backtest');
+}
+
+// ── Config (SL / TP / trailing — vale pro bot e pro backtest) ──
+function loadConfig(){
+  fetch('/config').then(r=>r.json()).then(d=>{
+    document.getElementById('cfg-sl').value=d.sl_dist;
+    document.getElementById('cfg-tp').value=d.tp_dist;
+    document.getElementById('cfg-tr').value=d.tr_dist;
+  });
+}
+async function saveConfig(){
+  const body={sl_dist:parseFloat(document.getElementById('cfg-sl').value),
+              tp_dist:parseFloat(document.getElementById('cfg-tp').value),
+              tr_dist:parseFloat(document.getElementById('cfg-tr').value)};
+  const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+                                 body:JSON.stringify(body)});
+  const d=await r.json();toast(d.message,d.ok);
+}
+
+// ── Backtest ──
+let btTimer=null;
+function btBadge(r){
+  if(r==='TRAIL_TP')return '<span class="badge tp">TRAIL_TP</span>';
+  if(r==='SL')return '<span class="badge slr">SL</span>';
+  return '<span class="badge ce">CANDLE_END</span>';
+}
+async function runBacktest(){
+  const n=parseInt(document.getElementById('bt-candles').value)||300;
+  document.getElementById('btn-bt').disabled=true;
+  const r=await fetch('/backtest',{method:'POST',headers:{'Content-Type':'application/json'},
+                                   body:JSON.stringify({candles:n})});
+  const d=await r.json();toast(d.message,d.ok);
+  if(!d.ok){document.getElementById('btn-bt').disabled=false;return;}
+  if(btTimer)clearInterval(btTimer);
+  btTimer=setInterval(pollBacktest,1500);pollBacktest();
+}
+async function pollBacktest(){
+  try{
+    const r=await fetch('/backtest-result');const d=await r.json();
+    const pr=document.getElementById('bt-progress');
+    if(d.running){pr.textContent='⏳ '+(d.progress||'rodando…');return;}
+    if(btTimer){clearInterval(btTimer);btTimer=null;}
+    document.getElementById('btn-bt').disabled=false;
+    if(d.error){pr.textContent='❌ '+d.error;return;}
+    if(d.result){pr.textContent='✅ '+(d.progress||'concluído');renderBacktest(d.result);}
+  }catch(e){}
+}
+function renderBacktest(res){
+  const s=res.summary;
+  document.getElementById('bt-trades').textContent=s.trades;
+  document.getElementById('bt-win').textContent=s.winrate+'%';
+  const pl=document.getElementById('bt-pnl');
+  pl.textContent=s.total_pnl_pct+'%';pl.className='val '+(s.total_pnl_pct>=0?'pos-num':'neg-num');
+  document.getElementById('bt-bal').textContent='$'+s.final_balance;
+  document.getElementById('bt-1m').textContent=s.intrabar_minutes_loaded;
+  const tb=document.getElementById('bt-tbody');
+  tb.innerHTML=res.trades.length?res.trades.map(r=>`<tr>
+    <td style="font-size:.73rem">${r.candle}</td>
+    <td>${badge(r.side)}</td>
+    <td>$${r.entry.toFixed(2)}</td>
+    <td>$${r.exit.toFixed(2)}</td>
+    <td>${btBadge(r.reason)}</td>
+    <td class="${r.pnl_pct>=0?'pos-num':'neg-num'}">${r.pnl_pct.toFixed(3)}%</td>
+    <td class="pos-num">${r.mfe.toFixed(3)}%</td>
+    <td class="neg-num">${r.mae.toFixed(3)}%</td>
+    <td>$${r.balance.toFixed(2)}</td></tr>`).join('')
+    :'<tr><td colspan="9" style="text-align:center;color:#484f58;padding:20px">Sem trades</td></tr>';
+}
+loadConfig();
 
 function toast(msg,ok){const e=document.getElementById('toast');
   e.textContent=msg;e.style.background=ok?'#238636':'#da3633';
@@ -1174,6 +1463,43 @@ def settings():
     _save_fees()
     logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
     return jsonify({"ok": True, "message": f"Fees: entrada {fees['entry']}% / saída {fees['exit']}%"})
+
+@app.route("/config", methods=["GET"])
+def get_config():
+    return jsonify({"sl_dist": SL_DIST, "tp_dist": TP_DIST, "tr_dist": TR_DIST})
+
+@app.route("/config", methods=["POST"])
+def set_config():
+    """Edit the exit distances (SL / TP activation / trailing offset) live."""
+    data = request.get_json() or {}
+    for k in ("sl_dist", "tp_dist", "tr_dist"):
+        if k in data:
+            try:
+                v = float(data[k])
+                if v > 0: config[k] = v
+            except Exception:
+                return jsonify({"ok": False, "message": f"valor inválido em {k}"})
+    _save_config()
+    _apply_config()
+    logger.info(f"[CONFIG] SL=${SL_DIST} TP=${TP_DIST} trail=${TR_DIST}")
+    return jsonify({"ok": True,
+                    "message": f"Config salva: SL=${SL_DIST}  TP=${TP_DIST}  Trail=${TR_DIST}"})
+
+@app.route("/backtest", methods=["POST"])
+def backtest():
+    if _backtest["running"]:
+        return jsonify({"ok": False, "message": "Backtest já está rodando"})
+    n = 300
+    try:
+        n = max(50, min(1000, int((request.get_json() or {}).get("candles", 300))))
+    except Exception:
+        pass
+    threading.Thread(target=run_backtest, args=(n,), daemon=True).start()
+    return jsonify({"ok": True, "message": f"Backtest de {n} candles iniciado"})
+
+@app.route("/backtest-result")
+def backtest_result():
+    return jsonify(_backtest)
 
 @app.route("/debug-ticker")
 def debug_ticker():

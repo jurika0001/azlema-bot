@@ -110,3 +110,31 @@ def calculate(closes: list) -> dict:
 
     logger.info(f"[STRATEGY] period={period} ema={last_ema:.4f} ec={last_ec:.4f} signal={signal}")
     return {"signal": signal, "ema": last_ema, "ec": last_ec, "period": period, "least_error": last_err}
+
+
+# ── Signal series (for backtesting) ───────────────────────────────────────────
+def calculate_series(closes: list) -> list:
+    """
+    Returns the signal ('LONG'|'SHORT'|None) for EVERY candle, exactly the way the
+    live bot would have computed it at that candle: the adaptive period at candle i
+    comes from the (causal) Cos-IFM at i, and EC/EMA are recomputed over closes[:i+1]
+    with that period — so each candle's signal matches strategy.calculate(closes[:i+1]).
+    Much faster than calling calculate() n times (Cos-IFM is computed only once).
+    """
+    n = len(closes)
+    sig = [None] * n
+    if n < 60:
+        return sig
+
+    arr = np.array(closes, dtype=np.float64)
+    lc  = cos_ifm(arr)                      # causal → lc[i] depends only on closes[:i+1]
+
+    for i in range(60, n):
+        period = int(round(lc[i])) if lc[i] > 0 else DEF_PERIOD
+        period = max(2, period)
+        ema, ec, lerr = zlema(arr[:i + 1], period)
+        last_err = float(lerr[i]); last_src = float(arr[i])
+        if last_src and (100.0 * last_err / last_src) > THRESHOLD:
+            if   ec[i] > ema[i]: sig[i] = "LONG"
+            elif ec[i] < ema[i]: sig[i] = "SHORT"
+    return sig
