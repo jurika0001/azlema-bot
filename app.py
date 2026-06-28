@@ -1214,7 +1214,12 @@ def debug_ticker():
 @app.route("/start", methods=["POST"])
 def start():
     global _strategy_thread
-    if state["running"]:
+    # Only refuse if the strategy thread is actually ALIVE. If `running` got stuck
+    # True but the thread died (e.g. an exception outside the loop), the old check
+    # said "Já em execução" forever and nothing could restart it → "não inicia
+    # trade nenhuma". Now a dead thread is restarted.
+    alive = _strategy_thread is not None and _strategy_thread.is_alive()
+    if state["running"] and alive:
         return jsonify({"ok": False, "message": "Já em execução"})
     state["running"] = True
     state["status"]  = "Iniciando…"
