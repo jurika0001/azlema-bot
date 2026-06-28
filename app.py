@@ -717,12 +717,18 @@ def strategy_loop():
     last_candle_str  = "—"
     last_ohlcv_check = 0.0   # throttle ohlcv fetching to every 15 s
 
-    # Startup: do NOT lock last_candle_ts to the current candle. Leaving it None
-    # makes the FIRST OHLCV check (within ~15 s) treat the latest CLOSED candle as
-    # "new" and open the first trade right away, instead of waiting up to 30 min
-    # for the next candle to close (which looked like "it doesn't even start").
-    logger.info("[SYNC] will open the first trade on the next OHLCV check "
-                "(latest closed candle) — no 30 min wait")
+    # Startup sync: LOCK to the current last-closed candle so the first ENTRY
+    # only happens at the NEXT candle boundary (:00 / :30) — entries must be at a
+    # candle open, at that candle's price. (Entering mid-candle on Start used a
+    # stale candle-open price and was wrong.) The trade-off is the first trade can
+    # take up to 30 min; that wait is normal, not a failure.
+    init_ohlcv = fetch_candles()
+    if init_ohlcv and len(init_ohlcv) >= 70:
+        _lc, _ = _resolve_candles(init_ohlcv)
+        last_candle_ts = _lc[0]
+        logger.info(f"[SYNC] locked to candle "
+                    f"{datetime.fromtimestamp(last_candle_ts/1000,tz=timezone.utc)}"
+                    f" — first entry at the next candle close")
 
     logger.info(f"[CFG] REALTIME_EXITS={REALTIME_EXITS}  ws_available={_HAS_WS}  "
                 f"(if REALTIME_EXITS is False, exits only happen at candle close — "
@@ -1008,6 +1014,8 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
     <div class="card"><div class="lbl">Período</div><div class="val" id="c-period">—</div></div>
     <div class="card"><div class="lbl">Último Candle</div>
       <div class="val" style="font-size:.8rem" id="c-candle">—</div></div>
+    <div class="card"><div class="lbl">Próximo Candle (entrada)</div>
+      <div class="val" style="font-size:.85rem" id="c-next">—</div></div>
   </div>
 
   <div class="st">Histórico de Trades</div>
@@ -1029,7 +1037,15 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
 function p(n){return String(n).padStart(2,'0')}
 function tick(){const d=new Date();document.getElementById('clock').textContent=
   `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} `+
-  `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`}
+  `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`;
+  // next 30m candle boundary (UTC) + countdown → when the next entry happens
+  const nx=new Date(d);
+  if(d.getUTCMinutes()<30){nx.setUTCMinutes(30,0,0);}
+  else{nx.setUTCHours(d.getUTCHours()+1,0,0,0);}
+  const secs=Math.max(0,Math.round((nx-d)/1000)),mm=Math.floor(secs/60),ss=secs%60;
+  const el=document.getElementById('c-next');
+  if(el)el.textContent=`${p(nx.getUTCHours())}:${p(nx.getUTCMinutes())} UTC (em ${mm}:${p(ss)})`;
+}
 setInterval(tick,1000);tick();
 
 async function pollPrice(){
