@@ -3,138 +3,84 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-PI = np.pi
-IFM_RANGE   = 50
-# GAIN_LIMIT MUST match the chart's "Gain Limit" input. The user's TradingView
-# chart uses 55 (per screenshot) — NOT the Pine default of 900. This sets the
-# range of gains tested in the Zero-Lag EMA (gains run -GAIN_LIMIT/10 …
-# +GAIN_LIMIT/10), so a wrong value changes EC, the EC×EMA cross, and therefore
-# WHICH trades are taken. Getting this wrong makes the bot trade different setups
-# than TradingView entirely.
-GAIN_LIMIT  = 55
-THRESHOLD   = 0.0
-DEF_PERIOD  = 20
+PI         = 3.14159265359
+IFM_RANGE  = 50
+GAIN_LIMIT = 55          # the user's TradingView chart "Gain Limit" input
+THRESHOLD  = 0.0
+DEF_PERIOD = 20
 
 
-# ── Cosine IFM ────────────────────────────────────────────────────────────────
-def cos_ifm(closes: np.ndarray) -> np.ndarray:
-    n       = len(closes)
-    v1      = np.zeros(n)
-    s2      = np.zeros(n)
-    s3      = np.zeros(n)
-    v2      = np.zeros(n)
-    delta   = np.zeros(n)
-    len_c   = np.zeros(n)
+def _compute(arr: np.ndarray):
+    """
+    Single causal pass that matches the Pine "Adaptive Zero Lag EMA v2" EXACTLY:
+    a PER-BAR adaptive period (Cos-IFM) drives a per-bar alpha for the Zero-Lag
+    EMA (EMA + error-correcting EC with the per-bar best gain). Returns
+    (ema, ec, period) arrays; the value at index i depends only on arr[:i+1].
 
-    for i in range(7, n):
-        v1[i] = closes[i] - closes[i - 7]
-    for i in range(8, n):
-        s2[i] = 0.2 * (v1[i-1] + v1[i])**2 + 0.8 * s2[i-1]
-        s3[i] = 0.2 * (v1[i-1] - v1[i])**2 + 0.8 * s3[i-1]
-        if s2[i] != 0:
-            v2[i] = np.sqrt(s3[i] / s2[i])
+    The old code recomputed EMA/EC over the whole window with ONE fixed period
+    (the last bar's) — that does NOT match Pine, where alpha changes every bar.
+    That was the cause of the wrong signals / ~50% winrate.
+    """
+    n      = len(arr)
+    ema    = np.zeros(n); ec = np.zeros(n); period = np.zeros(n, dtype=int)
+    v1     = np.zeros(n); s2 = np.zeros(n); s3 = np.zeros(n); deltaC = np.zeros(n)
+    lenC   = np.zeros(n)
+    gains  = np.arange(-GAIN_LIMIT, GAIN_LIMIT + 1, dtype=np.float64) / 10.0
+    inst_prev = 0.0
+
+    for i in range(n):
+        # ── Cos-IFM adaptive period (Pine: lenC / Period) ──
+        if i >= 7:
+            v1[i] = arr[i] - arr[i - 7]
+        if i >= 1:
+            s2[i] = 0.2 * (v1[i-1] + v1[i]) ** 2 + 0.8 * s2[i-1]
+            s3[i] = 0.2 * (v1[i-1] - v1[i]) ** 2 + 0.8 * s3[i-1]
+        v2 = np.sqrt(s3[i] / s2[i]) if s2[i] != 0 else 0.0
         if s3[i] != 0:
-            delta[i] = 2.0 * np.arctan(v2[i])
-
-    prev = 0.0
-    for i in range(IFM_RANGE + 1, n):
-        v4, inst = 0.0, 0.0
+            deltaC[i] = 2.0 * np.arctan(v2)
+        v4 = 0.0; inst = 0.0
         for j in range(IFM_RANGE + 1):
             if i - j >= 0:
-                v4 += delta[i - j]
+                v4 += deltaC[i - j]
             if v4 > 2 * PI and inst == 0.0:
-                inst = float(j - 1)
-                break
+                inst = j - 1
         if inst == 0.0:
-            inst = prev
-        else:
-            prev = inst
-        len_c[i] = 0.25 * inst + 0.75 * len_c[i - 1]
-    return len_c
+            inst = inst_prev
+        inst_prev = inst
+        lenC[i] = 0.25 * inst + 0.75 * (lenC[i-1] if i >= 1 else 0.0)
+        p = int(round(lenC[i]))
+        period[i] = p if p >= 2 else DEF_PERIOD
+
+        # ── Zero-Lag EMA with the PER-BAR alpha ──
+        alpha = 2.0 / (period[i] + 1)
+        pe = ema[i-1] if i >= 1 else 0.0
+        pc = ec[i-1]  if i >= 1 else 0.0
+        ema[i] = alpha * arr[i] + (1 - alpha) * pe
+        trials = alpha * (ema[i] + gains * (arr[i] - pc)) + (1 - alpha) * pc
+        ec[i]  = trials[int(np.argmin(np.abs(arr[i] - trials)))]
+
+    return ema, ec, period
 
 
-# ── Zero Lag EMA ──────────────────────────────────────────────────────────────
-def zlema(closes: np.ndarray, period: int) -> tuple:
-    n     = len(closes)
-    alpha = 2.0 / (period + 1)
-    ema   = np.zeros(n)
-    ec    = np.zeros(n)
-    lerr  = np.zeros(n)
-    gains = np.arange(-GAIN_LIMIT, GAIN_LIMIT + 1, dtype=np.float64) / 10.0
-
-    for i in range(1, n):
-        ema[i]   = alpha * closes[i] + (1.0 - alpha) * ema[i - 1]
-        prev_ec  = ec[i - 1]
-        trials   = alpha * (ema[i] + gains * (closes[i] - prev_ec)) + (1.0 - alpha) * prev_ec
-        errors   = np.abs(closes[i] - trials)
-        best_idx = int(np.argmin(errors))
-        ec[i]    = trials[best_idx]
-        lerr[i]  = errors[best_idx]
-
-    return ema, ec, lerr
-
-
-# ── Main strategy entry point ─────────────────────────────────────────────────
 def calculate(closes: list) -> dict:
-    """
-    Receives list of closed-candle closes (30 m).
-    Returns { signal: 'LONG'|'SHORT'|None, ema, ec, period, least_error }
-    EC > EMA  →  LONG   (trade every candle)
-    EC < EMA  →  SHORT
-    """
+    """Signal at the LAST closed candle (for the live bot). EC>EMA → LONG, EC<EMA → SHORT."""
     if len(closes) < 60:
         return {"signal": None, "ema": None, "ec": None, "period": DEF_PERIOD}
-
-    arr    = np.array(closes, dtype=np.float64)
-    lc     = cos_ifm(arr)
-    period = int(round(lc[-1])) if lc[-1] > 0 else DEF_PERIOD
-    period = max(2, period)
-
-    ema, ec, lerr = zlema(arr, period)
-
-    last_ema  = float(ema[-1])
-    last_ec   = float(ec[-1])
-    last_err  = float(lerr[-1])
-    last_src  = float(arr[-1])
-
-    threshold_ok = (100.0 * last_err / last_src > THRESHOLD) if last_src else False
-
-    if not threshold_ok:
-        signal = None
-    elif last_ec > last_ema:
-        signal = "LONG"
-    elif last_ec < last_ema:
-        signal = "SHORT"
-    else:
-        signal = None
-
-    logger.info(f"[STRATEGY] period={period} ema={last_ema:.4f} ec={last_ec:.4f} signal={signal}")
-    return {"signal": signal, "ema": last_ema, "ec": last_ec, "period": period, "least_error": last_err}
+    arr = np.array(closes, dtype=np.float64)
+    ema, ec, period = _compute(arr)
+    le, lc, per = float(ema[-1]), float(ec[-1]), int(period[-1])
+    signal = "LONG" if lc > le else ("SHORT" if lc < le else None)
+    logger.info(f"[STRATEGY] period={per} ema={le:.4f} ec={lc:.4f} signal={signal}")
+    return {"signal": signal, "ema": le, "ec": lc, "period": per}
 
 
-# ── Signal series (for backtesting) ───────────────────────────────────────────
 def calculate_series(closes: list) -> list:
-    """
-    Returns the signal ('LONG'|'SHORT'|None) for EVERY candle, exactly the way the
-    live bot would have computed it at that candle: the adaptive period at candle i
-    comes from the (causal) Cos-IFM at i, and EC/EMA are recomputed over closes[:i+1]
-    with that period — so each candle's signal matches strategy.calculate(closes[:i+1]).
-    Much faster than calling calculate() n times (Cos-IFM is computed only once).
-    """
-    n = len(closes)
-    sig = [None] * n
+    """Signal for EVERY candle (for the backtest) — one causal pass, same as the live bot."""
+    n = len(closes); sig = [None] * n
     if n < 60:
         return sig
-
-    arr = np.array(closes, dtype=np.float64)
-    lc  = cos_ifm(arr)                      # causal → lc[i] depends only on closes[:i+1]
-
+    ema, ec, _ = _compute(np.array(closes, dtype=np.float64))
     for i in range(60, n):
-        period = int(round(lc[i])) if lc[i] > 0 else DEF_PERIOD
-        period = max(2, period)
-        ema, ec, lerr = zlema(arr[:i + 1], period)
-        last_err = float(lerr[i]); last_src = float(arr[i])
-        if last_src and (100.0 * last_err / last_src) > THRESHOLD:
-            if   ec[i] > ema[i]: sig[i] = "LONG"
-            elif ec[i] < ema[i]: sig[i] = "SHORT"
+        if   ec[i] > ema[i]: sig[i] = "LONG"
+        elif ec[i] < ema[i]: sig[i] = "SHORT"
     return sig

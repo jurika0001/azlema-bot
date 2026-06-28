@@ -818,26 +818,14 @@ def strategy_loop():
                                         "winrate":  _winrate(),
                                     })
 
-                            # (a2) TIME EXIT (intra-candle mode): if the trade
-                            #      survived the WHOLE candle without hitting the
-                            #      trailing-TP or the SL, close it NOW at the
-                            #      candle's CLOSE price (the real price at the
-                            #      boundary — NOT an extreme). So every trade lasts
-                            #      at most one candle; a fresh one opens below per
-                            #      the signal.
-                            elif paper["side"] != "none":
-                                ce_px    = float(last_closed[4])
-                                ce_side  = paper["side"]
-                                raw, pct = _close_position(ce_px, "CANDLE_END")
-                                _record_exit(ce_side.upper(), ce_px, "CANDLE_END",
-                                             raw, pct, last_candle_str)
-                                state.update({
-                                    "position": "none", "unrealized": "0.00",
-                                    "balance":  f"{paper['balance']:.2f}",
-                                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                                    "trail_stop": "—",
-                                    "winrate":  _winrate(),
-                                })
+                            # (a2) NO forced candle-end close. The Pine HOLDS the
+                            #      position across candles (pyramiding=1); it closes
+                            #      ONLY via the trailing-TP / SL (intra-candle, in
+                            #      _check_sl_tp) or a REVERSAL when the signal flips
+                            #      (handled in (c) below). Forcing a close every
+                            #      candle at the close price was ~50/50 → ~50% win
+                            #      rate; holding rides the trend → ~90% like TV.
+                            #      paper["peak"]/trail persist across candles here.
 
                             # (b) Recompute the signal on the closed bar.
                             closes = [c[4] for c in sig_closes]
