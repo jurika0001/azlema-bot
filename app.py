@@ -334,53 +334,45 @@ def _calc_qty(price, balance):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL / TRAILING TP  — two variants
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _check_sl_tp(cur_price: float):
+def _check_sl_tp(pos, cur_price: float):
     """
-    Real-time intra-candle exit management — runs ~every second on the live
-    price. This reproduces TradingView's actual behaviour: the SL + trailing
-    stop is a standing order the broker tracks tick-by-tick, so it arms and
-    fires intra-candle (seconds after entry with these tight params) rather
-    than waiting for the bar to close.
+    Intra-candle exit math — the SINGLE source of truth used by BOTH live paper
+    trading (pos = the global `paper`) AND the backtest (pos = a local dict), so
+    the two can never diverge again. Mutates pos["peak"]/["trail_active"]/
+    ["trail_stop"] and returns (exit, exit_price, reason).
 
-    Long  : peak = highest price seen since entry; trail arms once
-            peak - entry >= TP_DIST and then sits TR_DIST below peak.
+    Long  : peak = highest price since entry; trail arms once peak-entry >= TP_DIST
+            then sits TR_DIST below peak. SL is FIXED at entry-SL_DIST (Pine `loss`).
     Short : symmetric (peak = lowest price; trail sits TR_DIST above it).
-
-    The closed-candle check (_check_sl_tp_candle) still runs at each bar close
-    as a backstop, correcting peak/exit from the true OHLC in case a fast spike
-    fell between two 1-second samples.
     """
-    if paper["side"] == "none":
+    if pos["side"] == "none":
         return False, 0.0, ""
-    entry = paper["entry_price"]
+    entry = pos["entry_price"]
 
-    if paper["side"] == "long":
-        # advance peak + trailing stop with the live price
-        if cur_price > paper["peak"]:
-            paper["peak"] = cur_price
-        if paper["peak"] - entry >= TP_DIST:
-            nt = round(paper["peak"] - TR_DIST, 8)
-            if not paper["trail_active"] or nt > paper["trail_stop"]:
-                paper["trail_active"] = True
-                paper["trail_stop"]   = nt
-        if paper["trail_active"] and cur_price <= paper["trail_stop"]:
-            return True, paper["trail_stop"], "TRAIL_TP"
-        # FIXED stop-loss (Pine `loss`): entry − SL_DIST, never moves.
-        sl = round(entry - SL_DIST, 8)
+    if pos["side"] == "long":
+        if cur_price > pos["peak"]:
+            pos["peak"] = cur_price
+        if pos["peak"] - entry >= TP_DIST:
+            nt = round(pos["peak"] - TR_DIST, 8)
+            if not pos["trail_active"] or nt > pos["trail_stop"]:
+                pos["trail_active"] = True
+                pos["trail_stop"]   = nt
+        if pos["trail_active"] and cur_price <= pos["trail_stop"]:
+            return True, pos["trail_stop"], "TRAIL_TP"
+        sl = round(entry - SL_DIST, 8)               # FIXED stop-loss (Pine `loss`)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
-        if paper["peak"] == 0 or cur_price < paper["peak"]:
-            paper["peak"] = cur_price
-        if entry - paper["peak"] >= TP_DIST:
-            nt = round(paper["peak"] + TR_DIST, 8)
-            if not paper["trail_active"] or nt < paper["trail_stop"]:
-                paper["trail_active"] = True
-                paper["trail_stop"]   = nt
-        if paper["trail_active"] and cur_price >= paper["trail_stop"]:
-            return True, paper["trail_stop"], "TRAIL_TP"
-        # FIXED stop-loss (Pine `loss`): entry + SL_DIST, never moves.
-        sl = round(entry + SL_DIST, 8)
+        if pos["peak"] == 0 or cur_price < pos["peak"]:
+            pos["peak"] = cur_price
+        if entry - pos["peak"] >= TP_DIST:
+            nt = round(pos["peak"] + TR_DIST, 8)
+            if not pos["trail_active"] or nt < pos["trail_stop"]:
+                pos["trail_active"] = True
+                pos["trail_stop"]   = nt
+        if pos["trail_active"] and cur_price >= pos["trail_stop"]:
+            return True, pos["trail_stop"], "TRAIL_TP"
+        sl = round(entry + SL_DIST, 8)               # FIXED stop-loss (Pine `loss`)
         if cur_price >= sl:
             return True, sl, "SL"
 
@@ -593,7 +585,7 @@ def _try_realtime_exit(price: float, candle_str: str):
     with trade_lock:
         if paper["side"] == "none":
             return False
-        ex, ex_px, ex_rsn = _check_sl_tp(price)
+        ex, ex_px, ex_rsn = _check_sl_tp(paper, price)
         if not ex:
             return False
         ex_side  = paper["side"]
@@ -994,36 +986,22 @@ def _second_path(o, h, l, c, steps=60):
     out.append(pts[3])
     return out
 
-def _simulate_trade(side, entry, subs, candle_close, sl, tp, tr):
-    """Replay one trade through its 1m sub-candles at 1s resolution.
-    Returns (exit_px, reason, mfe%, mae%)."""
-    peak = entry; trail_active = False; trail_stop = 0.0; mfe = 0.0; mae = 0.0
+def _simulate_trade(side, entry, subs, candle_close):
+    """Replay one trade through its 1m sub-candles at 1s resolution, using the
+    EXACT SAME _check_sl_tp as live paper trading (single source of truth, so the
+    backtest result matches live). Returns (exit_px, reason, mfe%, mae%)."""
+    pos = {"side": "long" if side == "LONG" else "short", "entry_price": entry,
+           "peak": entry, "trail_active": False, "trail_stop": 0.0}
+    mfe = 0.0; mae = 0.0
     for s in subs:
         for px in _second_path(float(s[1]), float(s[2]), float(s[3]), float(s[4])):
             d = (px - entry) if side == "LONG" else (entry - px)
             pct = (d / entry * 100) if entry else 0.0
             if pct > mfe: mfe = pct
             if pct < mae: mae = pct
-            if side == "LONG":
-                if px > peak: peak = px
-                if peak - entry >= tp:
-                    nt = peak - tr
-                    if not trail_active or nt > trail_stop:
-                        trail_active = True; trail_stop = nt
-                if trail_active and px <= trail_stop:
-                    return trail_stop, "TRAIL_TP", mfe, mae
-                if px <= peak - sl:                       # TRAILING stop-loss
-                    return peak - sl, "SL", mfe, mae
-            else:
-                if px < peak: peak = px
-                if entry - peak >= tp:
-                    nt = peak + tr
-                    if not trail_active or nt < trail_stop:
-                        trail_active = True; trail_stop = nt
-                if trail_active and px >= trail_stop:
-                    return trail_stop, "TRAIL_TP", mfe, mae
-                if px >= peak + sl:                       # TRAILING stop-loss
-                    return peak + sl, "SL", mfe, mae
+            ex, ex_px, reason = _check_sl_tp(pos, px)     # same logic as live
+            if ex:
+                return ex_px, reason, mfe, mae
     return candle_close, "CANDLE_END", mfe, mae   # never hit TP/SL → close at candle end
 
 def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
@@ -1061,8 +1039,7 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             entry = float(c30[i][4])                 # candle i close = candle i+1 open
             nxt   = c30[i + 1]
             subs  = buckets.get((nxt[0] // 1_800_000) * 1_800_000) or [nxt]
-            ex_px, reason, mfe, mae = _simulate_trade(sig, entry, subs,
-                                                      float(nxt[4]), sl, tp, tr)
+            ex_px, reason, mfe, mae = _simulate_trade(sig, entry, subs, float(nxt[4]))
             qty = (bal / entry) if entry else 0.0
             raw = (ex_px - entry) * qty if sig == "LONG" else (entry - ex_px) * qty
             fee = (entry * qty * fee_entry / 100) + (ex_px * qty * fee_exit / 100)
