@@ -21,19 +21,18 @@ logger = logging.getLogger(__name__)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIG  (matching Pine Script defaults)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ── Point values (minticks) ───────────────────────────────────────────────
-# The "point value" is a STRATEGY parameter, set explicitly (NOT auto-detected).
-# The STOP LOSS uses its OWN point (SL_MINTICK) so it can stay TIGHT, while the
-# take-profit activation + trailing use a BIGGER point (MINTICK) to ride more:
-#   SL           = 2000 pts × 0.01 = $20    (tight stop → ~1.2% risk at 1x size)
-#   TP-activation =  55 pts × 0.1  = $5.5   (trail only ARMS after +$5.5 profit)
-#   trail-offset  =  15 pts × 0.1  = $1.5   (closes $1.5 off the running peak)
-# Override via MINTICK_OVERRIDE / SL_MINTICK_OVERRIDE env vars.
-MINTICK      = float(os.environ.get("MINTICK_OVERRIDE", 0.1))      # TP + trailing
-SL_MINTICK   = float(os.environ.get("SL_MINTICK_OVERRIDE", 0.01))  # stop-loss only
-FIXED_SL     = 2000    # loss=2000 ticks → fixed stop-loss distance (× SL_MINTICK)
-FIXED_TP     = 55      # trail_points=55 ticks → trailing ARMS after +55 (× MINTICK)
-TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak (× MINTICK)
+# ── Tick size (mintick) — ONE value for ALL exit distances, like Pine ────────
+# Pine uses a SINGLE syminfo.mintick for loss / trail_points / trail_offset. So
+# here ONE mintick multiplies EVERY exit distance (no SL-vs-TP split — that split
+# broke the $ math vs the broker). With the defaults (mintick 0.01):
+#   SL distance        = 2000 × 0.01 = $20.0
+#   trail ACTIVATION   =   55 × 0.01 = $0.55
+#   trail OFFSET       =   15 × 0.01 = $0.15
+# mintick is editable in the dashboard config (env MINTICK_OVERRIDE sets default).
+MINTICK_DEFAULT = float(os.environ.get("MINTICK_OVERRIDE", 0.01))
+FIXED_SL     = 2000    # Pine fixedSL       (loss)         → SL distance      = ×mintick
+FIXED_TP     = 55      # Pine fixedTP       (trail_points) → trail ACTIVATION = ×mintick
+TRAIL_OFFSET = 15      # Pine trail_offset  (literal 15)   → trail OFFSET      = ×mintick
 
 # ── Position sizing ───────────────────────────────────────────────────────
 # Position notional = the FULL balance (~1x): qty = balance / price. So every
@@ -43,14 +42,15 @@ TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak (× MINTICK)
 # shrink the position (that coupling made the total ~10× below the per-trade
 # %s). See _calc_qty.
 
-# ── Exit distances in POINTS — USER-EDITABLE in the UI, persisted to config.json ─
-# The user edits POINT counts (not $). The $ distance = points × the point value:
-# the stop-loss uses SL_MINTICK (0.01) and the TP/trailing use MINTICK (0.1). So
-# defaults 2000/55/15 points → SL=$20, TP-activation=$5.5, trail=$1.5.
+# ── Editable config (persisted to config.json) ──────────────────────────────
+# POINT counts (sl/tp/tr) + the SINGLE mintick + the Gain Limit. Every exit
+# distance = its point count × the ONE mintick (Pine-faithful). Defaults
+# 2000/55/15 pts × 0.01 → SL=$20, TP-activation=$0.55, trail=$0.15.
 CONFIG_FILE = "config.json"
 def _default_config():
     return {"sl_pts": FIXED_SL, "tp_pts": FIXED_TP, "tr_pts": TRAIL_OFFSET,  # 2000/55/15
-            "gain_limit": 900}     # strategy Gain Limit (Pine default 900)
+            "mintick": MINTICK_DEFAULT,   # ONE tick size for SL, TP and trailing
+            "gain_limit": 900}            # strategy Gain Limit (Pine default 900)
 def _load_config():
     try:
         with open(CONFIG_FILE) as f:
@@ -65,13 +65,16 @@ def _save_config():
 config = _load_config()
 
 # SL_DIST / TP_DIST / TR_DIST ($) are what the exit logic reads. _apply_config
-# converts the editable POINT counts → $ distances (called on load + every save).
+# converts the editable POINT counts → $ distances using the ONE shared mintick
+# (called on load + every save). MINTICK mirrors the active tick for display.
 SL_DIST = TP_DIST = TR_DIST = 0.0
+MINTICK = MINTICK_DEFAULT
 def _apply_config():
-    global SL_DIST, TP_DIST, TR_DIST
-    SL_DIST = round(float(config["sl_pts"]) * SL_MINTICK, 8)
-    TP_DIST = round(float(config["tp_pts"]) * MINTICK,    8)
-    TR_DIST = round(float(config["tr_pts"]) * MINTICK,    8)
+    global SL_DIST, TP_DIST, TR_DIST, MINTICK
+    MINTICK = float(config["mintick"])
+    SL_DIST = round(float(config["sl_pts"]) * MINTICK, 8)
+    TP_DIST = round(float(config["tp_pts"]) * MINTICK, 8)
+    TR_DIST = round(float(config["tr_pts"]) * MINTICK, 8)
 _apply_config()
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
@@ -927,9 +930,29 @@ threading.Thread(target=price_poller, daemon=True).start()
 # data allows. Runs in a background thread; the UI polls /backtest-result.
 _backtest = {"running": False, "progress": "", "result": None, "error": None}
 
+def _fetch_30m_candles(n):
+    """Paginated 30m fetch — supports UNLIMITED n (e.g. a year = 17 520 candles),
+    since Phemex caps each request at ~1000."""
+    now_ms = int(time_mod.time() * 1000)
+    out, cur = [], now_ms - int(n) * 1_800_000
+    for _ in range(400):                       # safety cap on pages (~400k candles)
+        try:
+            rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="30m",
+                                     since=cur, limit=1000)
+        except Exception as e:
+            logger.warning(f"[BT] 30m fetch: {type(e).__name__}: {e}"); break
+        if not rows: break
+        out.extend(rows)
+        last = rows[-1][0]
+        if last <= cur or last >= now_ms: break
+        cur = last + 1_800_000
+        _backtest["progress"] = f"buscando candles de 30m… ({len(out)})"
+    seen = {r[0]: r for r in out}
+    return [seen[k] for k in sorted(seen)]
+
 def _fetch_1m_candles(since_ms, until_ms):
     out, cur = [], int(since_ms)
-    for _ in range(300):                       # safety cap on pages
+    for _ in range(2000):                      # safety cap on pages (~2M minutes ≈ 3.8 yr)
         try:
             rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="1m",
                                      since=cur, limit=1000)
@@ -940,6 +963,8 @@ def _fetch_1m_candles(since_ms, until_ms):
         last = rows[-1][0]
         if last <= cur or last >= until_ms: break   # reached the end / no progress
         cur = last + 60_000
+        if len(out) % 10000 < 1000:
+            _backtest["progress"] = f"buscando candles de 1m… ({len(out)})"
     seen = {r[0]: r for r in out}
     return [seen[k] for k in sorted(seen)]
 
@@ -997,11 +1022,8 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             bt_ex.load_markets()
         except Exception as e:
             logger.warning(f"[BT] load_markets: {type(e).__name__}: {e}")
-        warm    = 200                                # warmup bars so EC/EMA/period converge like TV
-        limit30 = n_candles + warm
-        since30 = int((time_mod.time() - limit30 * 1800) * 1000)
-        c30 = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="30m",
-                                since=since30, limit=limit30)
+        warm = 200                                   # warmup bars so EC/EMA/period converge like TV
+        c30  = _fetch_30m_candles(n_candles + warm)   # paginated → unlimited length
         if not c30 or len(c30) < 70:
             raise RuntimeError("poucos candles de 30m da Phemex")
         c30 = c30[-(n_candles + warm):]
@@ -1171,6 +1193,7 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
     <div><label>TP ativação (pontos)</label><br><input id="cfg-tp" type="number" step="1" min="1"></div>
     <div><label>Trailing (pontos)</label><br><input id="cfg-tr" type="number" step="1" min="1"></div>
     <div><label>Gain Limit</label><br><input id="cfg-gl" type="number" step="1" min="1"></div>
+    <div><label>Mintick (tick)</label><br><input id="cfg-mt" type="number" step="0.001" min="0.0001"></div>
     <button id="btn-cfg" onclick="saveConfig()">Salvar Config</button>
     <span class="cfg-hint" id="cfg-eq">vale pro bot ao vivo E pro backtest</span>
   </div>
@@ -1231,8 +1254,9 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
   <div id="tab-backtest" style="display:none">
     <div class="top-row">
       <div class="bt-ctrl">
-        <div><label>Candles</label><br>
-          <input id="bt-candles" type="number" step="10" min="50" max="1000" value="300"></div>
+        <div><label>Candles de 30m</label><br>
+          <input id="bt-candles" type="number" step="10" min="50" max="35040" value="300"></div>
+        <span class="cfg-hint">300 ≈ 6 dias · 1440 ≈ 1 mês · 17520 ≈ 1 ano (longo demora minutos)</span>
         <div><label>Fee Entrada %</label><br>
           <input id="bt-fee-entry" type="number" step="0.01" min="0" value="0"></div>
         <div><label>Fee Saída %</label><br>
@@ -1308,14 +1332,16 @@ function loadConfig(){
     document.getElementById('cfg-tp').value=d.tp_pts;
     document.getElementById('cfg-tr').value=d.tr_pts;
     document.getElementById('cfg-gl').value=d.gain_limit;
+    document.getElementById('cfg-mt').value=d.mintick;
     document.getElementById('cfg-eq').textContent=
-      `≈ SL $${d.sl_dist} · TP $${d.tp_dist} · Trail $${d.tr_dist}  (vale pro bot e pro backtest)`;
+      `mintick ${d.mintick} → SL $${d.sl_dist} · TP $${d.tp_dist} · Trail $${d.tr_dist}  (vale pro bot e backtest)`;
   });
 }
 async function saveConfig(){
   const body={sl_pts:parseFloat(document.getElementById('cfg-sl').value),
               tp_pts:parseFloat(document.getElementById('cfg-tp').value),
               tr_pts:parseFloat(document.getElementById('cfg-tr').value),
+              mintick:parseFloat(document.getElementById('cfg-mt').value),
               gain_limit:parseInt(document.getElementById('cfg-gl').value)};
   const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
                                  body:JSON.stringify(body)});
@@ -1498,7 +1524,8 @@ def settings():
 def get_config():
     # POINT counts (editable) + the resulting $ distances (read-only display)
     return jsonify({"sl_pts": config["sl_pts"], "tp_pts": config["tp_pts"],
-                    "tr_pts": config["tr_pts"], "gain_limit": config.get("gain_limit", 900),
+                    "tr_pts": config["tr_pts"], "mintick": config.get("mintick", MINTICK_DEFAULT),
+                    "gain_limit": config.get("gain_limit", 900),
                     "sl_dist": SL_DIST, "tp_dist": TP_DIST, "tr_dist": TR_DIST})
 
 @app.route("/config", methods=["POST"])
@@ -1512,6 +1539,12 @@ def set_config():
                 if v > 0: config[k] = v
             except Exception:
                 return jsonify({"ok": False, "message": f"valor inválido em {k}"})
+    if "mintick" in data:
+        try:
+            mt = float(data["mintick"])
+            if mt > 0: config["mintick"] = mt
+        except Exception:
+            return jsonify({"ok": False, "message": "mintick inválido"})
     if "gain_limit" in data:
         try:
             gl = int(data["gain_limit"])
@@ -1523,7 +1556,7 @@ def set_config():
     logger.info(f"[CONFIG] SL={config['sl_pts']}pt(${SL_DIST}) "
                 f"TP={config['tp_pts']}pt(${TP_DIST}) trail={config['tr_pts']}pt(${TR_DIST})")
     return jsonify({"ok": True,
-                    "message": f"Config: SL={config['sl_pts']}pt (${SL_DIST}) · "
+                    "message": f"Config (mintick {MINTICK}): SL={config['sl_pts']}pt (${SL_DIST}) · "
                                f"TP={config['tp_pts']}pt (${TP_DIST}) · "
                                f"Trail={config['tr_pts']}pt (${TR_DIST}) · "
                                f"GainLimit={config.get('gain_limit', 900)}"})
@@ -1534,7 +1567,9 @@ def backtest():
         return jsonify({"ok": False, "message": "Backtest já está rodando"})
     data = request.get_json() or {}
     n = 300; fe = 0.0; fx = 0.0
-    try: n  = max(50, min(1000, int(data.get("candles", 300))))
+    # No 1000-candle cap — long backtests (e.g. 1 year = 17 520 candles) allowed.
+    # 35 040 ≈ 2 years is a sanity ceiling so a typo can't hang the server forever.
+    try: n  = max(50, min(35040, int(data.get("candles", 300))))
     except Exception: pass
     try: fe = max(0.0, float(data.get("fee_entry", 0)))
     except Exception: pass
@@ -1579,8 +1614,7 @@ def debug_ticker():
         "sl_dist":           SL_DIST,
         "tp_activation_dist": TP_DIST,
         "trail_offset_dist": TR_DIST,
-        "sl_mintick":        SL_MINTICK,   # stop-loss point (0.01)
-        "mintick":           MINTICK,      # TP + trailing point (0.1)
+        "mintick":           MINTICK,      # ONE tick for SL, TP and trailing
     })
 
 @app.route("/start", methods=["POST"])
