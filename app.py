@@ -363,12 +363,10 @@ def _check_sl_tp(cur_price: float):
             if not paper["trail_active"] or nt > paper["trail_stop"]:
                 paper["trail_active"] = True
                 paper["trail_stop"]   = nt
-        # TP trail (tight, after +TP_DIST) sits above the SL trail → check first
         if paper["trail_active"] and cur_price <= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        # TRAILING stop-loss: sits SL_DIST below the running peak (starts at
-        # entry-SL_DIST and ratchets UP as the peak rises — never down).
-        sl = round(paper["peak"] - SL_DIST, 8)
+        # FIXED stop-loss (Pine `loss`): entry − SL_DIST, never moves.
+        sl = round(entry - SL_DIST, 8)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
@@ -381,8 +379,8 @@ def _check_sl_tp(cur_price: float):
                 paper["trail_stop"]   = nt
         if paper["trail_active"] and cur_price >= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        # trailing stop-loss: SL_DIST above the running low (ratchets DOWN only)
-        sl = round(paper["peak"] + SL_DIST, 8)
+        # FIXED stop-loss (Pine `loss`): entry + SL_DIST, never moves.
+        sl = round(entry + SL_DIST, 8)
         if cur_price >= sl:
             return True, sl, "SL"
 
@@ -827,14 +825,26 @@ def strategy_loop():
                                         "winrate":  _winrate(),
                                     })
 
-                            # (a2) NO forced candle-end close. The Pine HOLDS the
-                            #      position across candles (pyramiding=1); it closes
-                            #      ONLY via the trailing-TP / SL (intra-candle, in
-                            #      _check_sl_tp) or a REVERSAL when the signal flips
-                            #      (handled in (c) below). Forcing a close every
-                            #      candle at the close price was ~50/50 → ~50% win
-                            #      rate; holding rides the trend → ~90% like TV.
-                            #      paper["peak"]/trail persist across candles here.
+                            # (a2) TIME EXIT (intra-candle mode): if the trade did
+                            #      NOT hit the trailing-TP or the SL during the
+                            #      candle, close it NOW at the candle's CLOSE price
+                            #      (the user's rule: "fecha no fim do candle se não
+                            #      bater trailing nem SL"). The intra-candle
+                            #      trailing/SL in _check_sl_tp handle the live exits;
+                            #      this guarantees nothing stays open past a candle.
+                            elif paper["side"] != "none":
+                                ce_px    = float(last_closed[4])
+                                ce_side  = paper["side"]
+                                raw, pct = _close_position(ce_px, "CANDLE_END")
+                                _record_exit(ce_side.upper(), ce_px, "CANDLE_END",
+                                             raw, pct, last_candle_str)
+                                state.update({
+                                    "position": "none", "unrealized": "0.00",
+                                    "balance":  f"{paper['balance']:.2f}",
+                                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
+                                    "trail_stop": "—",
+                                    "winrate":  _winrate(),
+                                })
 
                             # (b) Recompute the signal on the closed bar.
                             closes = [c[4] for c in sig_closes]
