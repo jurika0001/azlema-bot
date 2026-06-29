@@ -5,12 +5,12 @@ logger = logging.getLogger(__name__)
 
 PI         = 3.14159265359
 IFM_RANGE  = 50
-GAIN_LIMIT = 55          # the user's TradingView chart "Gain Limit" input
+GAIN_LIMIT = 900         # Pine default; the live bot / backtest pass the UI value
 THRESHOLD  = 0.0
 DEF_PERIOD = 20
 
 
-def _compute(arr: np.ndarray):
+def _compute(arr: np.ndarray, gain_limit: int = GAIN_LIMIT):
     """
     Single causal pass that matches the Pine "Adaptive Zero Lag EMA v2" EXACTLY:
     a PER-BAR adaptive period (Cos-IFM) drives a per-bar alpha for the Zero-Lag
@@ -25,7 +25,7 @@ def _compute(arr: np.ndarray):
     ema    = np.zeros(n); ec = np.zeros(n); period = np.zeros(n, dtype=int)
     v1     = np.zeros(n); s2 = np.zeros(n); s3 = np.zeros(n); deltaC = np.zeros(n)
     lenC   = np.zeros(n)
-    gains  = np.arange(-GAIN_LIMIT, GAIN_LIMIT + 1, dtype=np.float64) / 10.0
+    gains  = np.arange(-gain_limit, gain_limit + 1, dtype=np.float64) / 10.0
     inst_prev = 0.0
 
     for i in range(n):
@@ -62,24 +62,24 @@ def _compute(arr: np.ndarray):
     return ema, ec, period
 
 
-def calculate(closes: list) -> dict:
+def calculate(closes: list, gain_limit: int = GAIN_LIMIT) -> dict:
     """Signal at the LAST closed candle (for the live bot). EC>EMA → LONG, EC<EMA → SHORT."""
     if len(closes) < 60:
         return {"signal": None, "ema": None, "ec": None, "period": DEF_PERIOD}
     arr = np.array(closes, dtype=np.float64)
-    ema, ec, period = _compute(arr)
+    ema, ec, period = _compute(arr, gain_limit)
     le, lc, per = float(ema[-1]), float(ec[-1]), int(period[-1])
     signal = "LONG" if lc > le else ("SHORT" if lc < le else None)
     logger.info(f"[STRATEGY] period={per} ema={le:.4f} ec={lc:.4f} signal={signal}")
     return {"signal": signal, "ema": le, "ec": lc, "period": per}
 
 
-def calculate_series(closes: list) -> list:
+def calculate_series(closes: list, gain_limit: int = GAIN_LIMIT) -> list:
     """Signal for EVERY candle (for the backtest) — one causal pass, same as the live bot."""
     n = len(closes); sig = [None] * n
     if n < 60:
         return sig
-    ema, ec, _ = _compute(np.array(closes, dtype=np.float64))
+    ema, ec, _ = _compute(np.array(closes, dtype=np.float64), gain_limit)
     for i in range(60, n):
         if   ec[i] > ema[i]: sig[i] = "LONG"
         elif ec[i] < ema[i]: sig[i] = "SHORT"

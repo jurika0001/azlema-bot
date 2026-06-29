@@ -49,7 +49,8 @@ TRAIL_OFFSET = 15      # close 15 pts (ticks) off the peak (× MINTICK)
 # defaults 2000/55/15 points → SL=$20, TP-activation=$5.5, trail=$1.5.
 CONFIG_FILE = "config.json"
 def _default_config():
-    return {"sl_pts": FIXED_SL, "tp_pts": FIXED_TP, "tr_pts": TRAIL_OFFSET}  # 2000/55/15
+    return {"sl_pts": FIXED_SL, "tp_pts": FIXED_TP, "tr_pts": TRAIL_OFFSET,  # 2000/55/15
+            "gain_limit": 900}     # strategy Gain Limit (Pine default 900)
 def _load_config():
     try:
         with open(CONFIG_FILE) as f:
@@ -357,10 +358,12 @@ def _check_sl_tp(cur_price: float):
             if not paper["trail_active"] or nt > paper["trail_stop"]:
                 paper["trail_active"] = True
                 paper["trail_stop"]   = nt
-        # trail sits above the fixed SL once armed → check it first
+        # TP trail (tight, after +TP_DIST) sits above the SL trail → check first
         if paper["trail_active"] and cur_price <= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        sl = round(entry - SL_DIST, 8)
+        # TRAILING stop-loss: sits SL_DIST below the running peak (starts at
+        # entry-SL_DIST and ratchets UP as the peak rises — never down).
+        sl = round(paper["peak"] - SL_DIST, 8)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
@@ -373,7 +376,8 @@ def _check_sl_tp(cur_price: float):
                 paper["trail_stop"]   = nt
         if paper["trail_active"] and cur_price >= paper["trail_stop"]:
             return True, paper["trail_stop"], "TRAIL_TP"
-        sl = round(entry + SL_DIST, 8)
+        # trailing stop-loss: SL_DIST above the running low (ratchets DOWN only)
+        sl = round(paper["peak"] + SL_DIST, 8)
         if cur_price >= sl:
             return True, sl, "SL"
 
@@ -829,7 +833,7 @@ def strategy_loop():
 
                             # (b) Recompute the signal on the closed bar.
                             closes = [c[4] for c in sig_closes]
-                            result = strat.calculate(closes)
+                            result = strat.calculate(closes, int(config.get("gain_limit", 900)))
                             signal = result["signal"]
                             state.update({
                                 "signal":      signal or "—",
@@ -971,8 +975,8 @@ def _simulate_trade(side, entry, subs, candle_close, sl, tp, tr):
                         trail_active = True; trail_stop = nt
                 if trail_active and px <= trail_stop:
                     return trail_stop, "TRAIL_TP", mfe, mae
-                if px <= entry - sl:
-                    return entry - sl, "SL", mfe, mae
+                if px <= peak - sl:                       # TRAILING stop-loss
+                    return peak - sl, "SL", mfe, mae
             else:
                 if px < peak: peak = px
                 if entry - peak >= tp:
@@ -981,8 +985,8 @@ def _simulate_trade(side, entry, subs, candle_close, sl, tp, tr):
                         trail_active = True; trail_stop = nt
                 if trail_active and px >= trail_stop:
                     return trail_stop, "TRAIL_TP", mfe, mae
-                if px >= entry + sl:
-                    return entry + sl, "SL", mfe, mae
+                if px >= peak + sl:                       # TRAILING stop-loss
+                    return peak + sl, "SL", mfe, mae
     return candle_close, "CANDLE_END", mfe, mae   # never hit TP/SL → close at candle end
 
 def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
@@ -993,7 +997,7 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             bt_ex.load_markets()
         except Exception as e:
             logger.warning(f"[BT] load_markets: {type(e).__name__}: {e}")
-        warm    = 65
+        warm    = 200                                # warmup bars so EC/EMA/period converge like TV
         limit30 = n_candles + warm
         since30 = int((time_mod.time() - limit30 * 1800) * 1000)
         c30 = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="30m",
@@ -1001,20 +1005,23 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
         if not c30 or len(c30) < 70:
             raise RuntimeError("poucos candles de 30m da Phemex")
         c30 = c30[-(n_candles + warm):]
+        # only the LAST n_candles are traded; the earlier ones are warmup-only
+        start_i = max(60, len(c30) - 1 - n_candles)
         _backtest["progress"] = "buscando candles de 1m (variações intra-candle)…"
-        c1m = _fetch_1m_candles(c30[0][0], c30[-1][0] + 1_800_000)
+        # 1m only for the TRADED window (keeps it fast; warmup needs only 30m closes)
+        c1m = _fetch_1m_candles(c30[start_i][0], c30[-1][0] + 1_800_000)
         buckets = {}
         for r in c1m:
             buckets.setdefault((r[0] // 1_800_000) * 1_800_000, []).append(r)
         for b in buckets: buckets[b].sort(key=lambda x: x[0])
 
         _backtest["progress"] = "calculando sinais (EC×EMA por candle)…"
-        signals = strat.calculate_series([c[4] for c in c30])
+        signals = strat.calculate_series([c[4] for c in c30], int(config.get("gain_limit", 900)))
 
         _backtest["progress"] = "simulando trades (replay 1m)…"
         sl, tp, tr = SL_DIST, TP_DIST, TR_DIST
         bal = PAPER_START_BAL; trades = []; wins = 0
-        for i in range(60, len(c30) - 1):
+        for i in range(start_i, len(c30) - 1):
             sig = signals[i]
             if not sig: continue
             entry = float(c30[i][4])                 # candle i close = candle i+1 open
@@ -1037,20 +1044,15 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
                 "mfe": round(mfe, 3), "mae": round(mae, 3), "balance": round(bal, 2),
             })
         n = len(trades)
-        # Sharpe ratio (per-trade): mean / std of the net % returns
         rets = [t["pnl_pct"] for t in trades]
-        if len(rets) > 1:
-            m  = sum(rets) / len(rets)
-            sd = (sum((r - m) ** 2 for r in rets) / (len(rets) - 1)) ** 0.5
-            sharpe = round(m / sd, 3) if sd else 0.0
-        else:
-            sharpe = 0.0
         summary = {
             "trades": n,
             "winrate": round(wins / n * 100, 1) if n else 0.0,
             "final_balance": round(bal, 2),
             "total_pnl_pct": round((bal - PAPER_START_BAL) / PAPER_START_BAL * 100, 2),
-            "sharpe": sharpe,
+            "max_profit": round(max(rets), 3) if rets else 0.0,   # biggest single-trade win %
+            "max_loss":   round(min(rets), 3) if rets else 0.0,   # biggest single-trade loss %
+            "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,  # average % per trade
             "fee_entry": fee_entry, "fee_exit": fee_exit,
             "candles": n_candles, "sl": sl, "tp": tp, "tr": tr,
             "intrabar_minutes_loaded": len(c1m),
@@ -1168,6 +1170,7 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
     <div><label>Stop Loss (pontos)</label><br><input id="cfg-sl" type="number" step="1" min="1"></div>
     <div><label>TP ativação (pontos)</label><br><input id="cfg-tp" type="number" step="1" min="1"></div>
     <div><label>Trailing (pontos)</label><br><input id="cfg-tr" type="number" step="1" min="1"></div>
+    <div><label>Gain Limit</label><br><input id="cfg-gl" type="number" step="1" min="1"></div>
     <button id="btn-cfg" onclick="saveConfig()">Salvar Config</button>
     <span class="cfg-hint" id="cfg-eq">vale pro bot ao vivo E pro backtest</span>
   </div>
@@ -1242,7 +1245,9 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
       <div class="card"><div class="lbl">Trades</div><div class="val" id="bt-trades">—</div></div>
       <div class="card"><div class="lbl">Winrate</div><div class="val" id="bt-win">—</div></div>
       <div class="card"><div class="lbl">PnL Total %</div><div class="val" id="bt-pnl">—</div></div>
-      <div class="card"><div class="lbl">Razão de Sharpe</div><div class="val" id="bt-sharpe">—</div></div>
+      <div class="card"><div class="lbl">Lucro Médio %/trade</div><div class="val" id="bt-avg">—</div></div>
+      <div class="card"><div class="lbl">Maior Lucro %</div><div class="val" id="bt-max">—</div></div>
+      <div class="card"><div class="lbl">Maior Perda %</div><div class="val" id="bt-min">—</div></div>
       <div class="card"><div class="lbl">Saldo Final</div><div class="val" id="bt-bal">—</div></div>
       <div class="card"><div class="lbl">Candles 1m</div><div class="val" id="bt-1m">—</div></div>
     </div>
@@ -1302,6 +1307,7 @@ function loadConfig(){
     document.getElementById('cfg-sl').value=d.sl_pts;
     document.getElementById('cfg-tp').value=d.tp_pts;
     document.getElementById('cfg-tr').value=d.tr_pts;
+    document.getElementById('cfg-gl').value=d.gain_limit;
     document.getElementById('cfg-eq').textContent=
       `≈ SL $${d.sl_dist} · TP $${d.tp_dist} · Trail $${d.tr_dist}  (vale pro bot e pro backtest)`;
   });
@@ -1309,7 +1315,8 @@ function loadConfig(){
 async function saveConfig(){
   const body={sl_pts:parseFloat(document.getElementById('cfg-sl').value),
               tp_pts:parseFloat(document.getElementById('cfg-tp').value),
-              tr_pts:parseFloat(document.getElementById('cfg-tr').value)};
+              tr_pts:parseFloat(document.getElementById('cfg-tr').value),
+              gain_limit:parseInt(document.getElementById('cfg-gl').value)};
   const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
                                  body:JSON.stringify(body)});
   const d=await r.json();toast(d.message,d.ok);loadConfig();
@@ -1351,8 +1358,12 @@ function renderBacktest(res){
   document.getElementById('bt-win').textContent=s.winrate+'%';
   const pl=document.getElementById('bt-pnl');
   pl.textContent=s.total_pnl_pct+'%';pl.className='val '+(s.total_pnl_pct>=0?'pos-num':'neg-num');
-  const sh=document.getElementById('bt-sharpe');
-  sh.textContent=s.sharpe;sh.className='val '+(s.sharpe>=0?'pos-num':'neg-num');
+  const avg=document.getElementById('bt-avg');
+  avg.textContent=s.avg_pct+'%';avg.className='val '+(s.avg_pct>=0?'pos-num':'neg-num');
+  document.getElementById('bt-max').textContent='+'+s.max_profit+'%';
+  document.getElementById('bt-max').className='val pos-num';
+  document.getElementById('bt-min').textContent=s.max_loss+'%';
+  document.getElementById('bt-min').className='val neg-num';
   document.getElementById('bt-bal').textContent='$'+s.final_balance;
   document.getElementById('bt-1m').textContent=s.intrabar_minutes_loaded;
   const tb=document.getElementById('bt-tbody');
@@ -1487,12 +1498,12 @@ def settings():
 def get_config():
     # POINT counts (editable) + the resulting $ distances (read-only display)
     return jsonify({"sl_pts": config["sl_pts"], "tp_pts": config["tp_pts"],
-                    "tr_pts": config["tr_pts"],
+                    "tr_pts": config["tr_pts"], "gain_limit": config.get("gain_limit", 900),
                     "sl_dist": SL_DIST, "tp_dist": TP_DIST, "tr_dist": TR_DIST})
 
 @app.route("/config", methods=["POST"])
 def set_config():
-    """Edit the exit distances in POINTS (SL / TP activation / trailing offset)."""
+    """Edit the exit distances in POINTS + the strategy Gain Limit."""
     data = request.get_json() or {}
     for k in ("sl_pts", "tp_pts", "tr_pts"):
         if k in data:
@@ -1501,6 +1512,12 @@ def set_config():
                 if v > 0: config[k] = v
             except Exception:
                 return jsonify({"ok": False, "message": f"valor inválido em {k}"})
+    if "gain_limit" in data:
+        try:
+            gl = int(data["gain_limit"])
+            if gl >= 1: config["gain_limit"] = gl
+        except Exception:
+            return jsonify({"ok": False, "message": "Gain Limit inválido"})
     _save_config()
     _apply_config()
     logger.info(f"[CONFIG] SL={config['sl_pts']}pt(${SL_DIST}) "
@@ -1508,7 +1525,8 @@ def set_config():
     return jsonify({"ok": True,
                     "message": f"Config: SL={config['sl_pts']}pt (${SL_DIST}) · "
                                f"TP={config['tp_pts']}pt (${TP_DIST}) · "
-                               f"Trail={config['tr_pts']}pt (${TR_DIST})"})
+                               f"Trail={config['tr_pts']}pt (${TR_DIST}) · "
+                               f"GainLimit={config.get('gain_limit', 900)}"})
 
 @app.route("/backtest", methods=["POST"])
 def backtest():
