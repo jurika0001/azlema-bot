@@ -602,43 +602,16 @@ def _try_realtime_exit(price: float, candle_str: str):
         return True
 
 
-def _process_1m_exit(o, h, l, c):
-    """
-    Replay one CLOSED 1-minute candle through _check_sl_tp on the LIVE position —
-    IDENTICAL to the backtest's per-1m processing (same _check_sl_tp, same
-    _second_path), so live exits match the backtest instead of firing on raw tick
-    noise. Updates MFE/MAE and closes the position if the trailing/SL fires.
-    """
-    with trade_lock:
-        if paper["side"] == "none":
-            return
-        entry = paper["entry_price"]
-        for px in _second_path(float(o), float(h), float(l), float(c)):
-            d   = (px - entry) if paper["side"] == "long" else (entry - px)
-            pct = (d / entry * 100) if entry else 0.0
-            if pct > paper["mfe_pct"]: paper["mfe_pct"] = pct
-            if pct < paper["mae_pct"]: paper["mae_pct"] = pct
-            ex, ex_px, ex_rsn = _check_sl_tp(paper, px)
-            if ex:
-                ex_side  = paper["side"]
-                raw, p   = _close_position(ex_px, ex_rsn)
-                _record_exit(ex_side.upper(), ex_px, ex_rsn, raw, p, _last_candle_str)
-                state.update({
-                    "position": "none", "unrealized": "0.00",
-                    "balance":  f"{paper['balance']:.2f}",
-                    "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
-                    "trail_stop": "—", "winrate": _winrate(),
-                })
-                logger.info(f"[EXIT-1m] {ex_rsn} @ {ex_px:.2f}  pnl={p:+.2f}%")
-                return
-
-
 def on_live_price(price: float, from_ws: bool = False):
     """
-    Updates the live price + unrealized PnL for the UI ONLY. Exits are NOT driven
-    here anymore — they run on CLOSED 1-minute candles (see _process_1m_exit),
-    exactly like the backtest, so live results match the backtest instead of
-    firing on raw tick noise (the $0.10 trailing would close on every tick wiggle).
+    Called on EVERY price update — each websocket tick (from_ws=True) or each
+    ~1 s REST poll. Tracks the SL/trailing in REAL TIME and exits intra-candle,
+    exactly like the standing strategy.exit order the user watched close live.
+
+    Exit driving: the websocket (true ticks) drives exits whenever it is healthy;
+    the coarser 1 s REST poll only drives exits when the websocket has gone
+    silent (>5 s). So normal sampling jitter never closes a trade early, but a
+    websocket stall can never freeze it either.
     """
     global _last_good_price, _last_price_ts, _last_ws_tick_ts, _jump_reject_count
     if price <= 0:
@@ -649,6 +622,7 @@ def on_live_price(price: float, from_ws: bool = False):
             _jump_reject_count += 1
             if _jump_reject_count < 3:
                 return                          # reject a one-off corrupted tick
+            # sustained move → resync instead of freezing on a stale price
     _last_good_price = price
     now = time_mod.time()
     _last_price_ts   = now
@@ -657,14 +631,36 @@ def on_live_price(price: float, from_ws: bool = False):
         _last_ws_tick_ts = now
 
     paper["unrealized"] = _unrealized_pct(price)
-    open_pos = paper["side"] != "none"
+    # Track the max favorable / adverse excursion (best & worst unrealized %)
+    # the trade reached while open — BEFORE the exit check (so a trade that hits
+    # its peak and then closes still records that peak).
+    if paper["side"] != "none":
+        u = paper["unrealized"]
+        if u > paper["mfe_pct"]:
+            paper["mfe_pct"] = u
+        if u < paper["mae_pct"]:
+            paper["mae_pct"] = u
+        mfe_disp, mae_disp = f"{paper['mfe_pct']:+.2f}", f"{paper['mae_pct']:+.2f}"
+    else:
+        mfe_disp, mae_disp = "0.00", "0.00"
+
+    # Check the SL/trailing on EVERY price update — every websocket tick AND the
+    # 1 s loop poll. The old gate skipped the loop's check while the WS *looked*
+    # healthy; if the WS then went quietly stale, exits went unchecked and trades
+    # only closed at the candle end. With the trailing offset now $1.5 (not the
+    # old $0.15), the coarse 1 s sampling can't trigger an early exit on jitter
+    # (a real $1.5 move ≠ jitter), so always checking is safe. After a close,
+    # side is 'none' → the duplicate check is a harmless no-op (no double close).
+    if REALTIME_EXITS:
+        _try_realtime_exit(price, _last_candle_str)
+
     trail_disp = (f"${paper['trail_stop']:.2f}" if paper["trail_active"]
-                  else ("armed" if open_pos else "—"))
+                  else ("armed" if paper["side"] != "none" else "—"))
     state.update({
         "price":         f"{price:.2f}",
         "unrealized":    f"{paper['unrealized']:+.2f}",
-        "mfe":           f"{paper['mfe_pct']:+.2f}" if open_pos else "0.00",
-        "mae":           f"{paper['mae_pct']:+.2f}" if open_pos else "0.00",
+        "mfe":           mfe_disp,
+        "mae":           mae_disp,
         "balance":       f"{paper['balance']:.2f}",
         "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
         "trail_stop":    trail_disp,
@@ -741,9 +737,7 @@ def strategy_loop():
 
     last_candle_ts   = None
     last_candle_str  = "—"
-    last_ohlcv_check = 0.0   # throttle 30m ohlcv fetching to every 15 s
-    last_1m_check    = 0.0   # throttle 1m ohlcv fetching to every 5 s
-    last_1m_ts       = 0     # timestamp of the last CLOSED 1m candle processed for exits
+    last_ohlcv_check = 0.0   # throttle ohlcv fetching to every 15 s
 
     # Startup sync: LOCK to the current last-closed candle so the first ENTRY
     # only happens at the NEXT candle boundary (:00 / :30) — entries must be at a
@@ -768,32 +762,20 @@ def strategy_loop():
 
     while state["running"]:
         try:
-            # ── 1a. LIVE PRICE (UI display only — does NOT drive exits) ──────
+            # ── 1. PRICE + REAL-TIME EXITS ───────────────────────────────────
+            # The websocket feed (price_ws_loop → on_live_price) fires exits the
+            # instant a tick arrives. This ~1 s REST poll ALWAYS runs too, as a
+            # guaranteed safety net: if the websocket silently stalls (stays
+            # "connected" but stops sending ticks), exits still happen within a
+            # second instead of freezing. Both call the same thread-safe
+            # on_live_price(); after a close, side is 'none' so the next check is
+            # a harmless no-op — there is never a double close.
             live_price = get_live_price()
             if live_price > 0:
                 on_live_price(live_price)
 
-            # ── 1b. EXITS run on CLOSED 1-MINUTE candles (every ~5 s), exactly
-            #        like the backtest, so live results MATCH the backtest instead
-            #        of firing on raw tick noise. ────────────────────────────────
-            now = time_mod.time()
-            if paper["side"] != "none" and now - last_1m_check >= 5:
-                last_1m_check = now
-                try:
-                    rows1m = live_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT",
-                                                 timeframe="1m", limit=6)
-                    now_ms = int(now * 1000)
-                    for c1 in (rows1m or []):
-                        if c1[0] <= last_1m_ts or c1[0] + 60_000 > now_ms:
-                            continue                       # done already / still forming
-                        last_1m_ts = c1[0]
-                        _process_1m_exit(c1[1], c1[2], c1[3], c1[4])
-                        if paper["side"] == "none":
-                            break
-                except Exception as e:
-                    logger.warning(f"[1M] {type(e).__name__}: {e}")
-
             # ── 2. CANDLE CLOSE  (every 15 s — this is where trades happen) ──
+            now = time_mod.time()
             if now - last_ohlcv_check >= 15:
                 last_ohlcv_check = now
                 ohlcv = fetch_candles()
@@ -808,9 +790,6 @@ def strategy_loop():
                     if candle_ts != last_candle_ts:
                         last_candle_ts   = candle_ts
                         _last_candle_str = last_candle_str   # share with WS exits
-                        # process the NEW (forming) 30m candle's 1m sub-candles from
-                        # its open (= candle_ts + 30 min) onward for the new trade.
-                        last_1m_ts       = candle_ts + 1_800_000 - 1
 
                         # Hold trade_lock across the whole bar transition so a
                         # websocket-driven exit can't race the bar-close exit /
