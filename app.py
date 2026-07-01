@@ -1899,6 +1899,44 @@ def debug_ticker():
         "mintick":           MINTICK,      # ONE tick for SL, TP and trailing
     })
 
+@app.route("/debug-raw")
+def debug_raw():
+    """
+    Surfaces the RAW reason the live price is (not) arriving. Runs a fresh
+    load_markets + fetch_ticker WITHOUT swallowing the error, so the exact cause —
+    a Phemex geo-block (403/451), rate-limit (DDoSProtection), timeout, or a
+    symbol/endpoint change — shows up directly here in the browser instead of only
+    in the Render logs. Open /debug-raw and read `fetch_ticker`.
+    """
+    info = {
+        "symbol":             SYMBOL,
+        "symbol_used":        SYMBOL or "ETH/USDT:USDT",
+        "last_good_price":    _last_good_price,
+        "price_age_s":        round(time_mod.time() - _last_price_ts, 1) if _last_price_ts else None,
+        "ticker_fail_count":  _ticker_fail_count,
+        "ws_available":       _HAS_WS,
+        "ws_active":          _ws_active,
+        "record_ticks":       RECORD_TICKS,
+    }
+    # 1) Can we even load the market list from Phemex?
+    try:
+        mkts = ticker_ex.load_markets()
+        info["load_markets"]  = "ok"
+        info["markets_count"] = len(mkts)
+        info["eth_usdt_swap_present"] = ("ETH/USDT:USDT" in mkts)
+    except Exception as e:
+        info["load_markets"] = f"FAIL: {type(e).__name__}: {str(e)[:300]}"
+    # 2) The actual price call — the exact error, unswallowed.
+    try:
+        t = ticker_ex.fetch_ticker(SYMBOL or "ETH/USDT:USDT")
+        info["fetch_ticker"] = "ok"
+        info["last"] = t.get("last")
+        info["bid"]  = t.get("bid")
+        info["ask"]  = t.get("ask")
+    except Exception as e:
+        info["fetch_ticker"] = f"FAIL: {type(e).__name__}: {str(e)[:400]}"
+    return jsonify(info)
+
 @app.route("/start", methods=["POST"])
 def start():
     global _strategy_thread
