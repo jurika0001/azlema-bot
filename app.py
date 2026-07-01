@@ -1,4 +1,4 @@
-import os, time as time_mod, threading, logging, json, asyncio
+import os, time as time_mod, threading, logging, json, asyncio, math
 import requests as req
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
@@ -116,6 +116,69 @@ def _save_fees():
 
 fees = _load_fees()
 logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TICK RECORDER  (for a 1:1-real backtest)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phemex has NO 1-second historical candle (smallest is 1m), so a synthetic path
+# is the best we can do for HISTORICAL backtests. But the live bot already sees a
+# real ~1-second price stream (the ticker websocket + the 1s REST poll). If we
+# RECORD that exact stream, the backtest can REPLAY it and match paper trading
+# ~1:1 for the recorded period — no interpolation, the real prices the exit engine
+# actually saw. Turn it on with env RECORD_TICKS=1.
+#
+# Caveats: (1) it only works FORWARD — you cannot record the past. (2) On Render's
+# free tier the disk is EPHEMERAL: ticks.csv is wiped on every redeploy/restart, so
+# attach a Persistent Disk (or point TICKS_FILE at one) to keep the history.
+RECORD_TICKS = os.environ.get("RECORD_TICKS", "0") == "1"
+TICKS_FILE   = os.environ.get("TICKS_FILE", "ticks.csv")
+
+_tick_buf        = []
+_tick_buf_lock   = threading.Lock()
+_tick_last_flush = 0.0
+_tick_last_px    = 0.0
+
+def _record_tick(ts_ms: int, price: float):
+    """Append (timestamp_ms, price) to ticks.csv — buffered & flushed every ~5 s so
+    it never does disk I/O on the hot path per tick. Exception-proof: recording can
+    NEVER break trading. Consecutive identical prices are skipped to save space
+    (the exit logic only cares about price CHANGES)."""
+    if not RECORD_TICKS:
+        return
+    global _tick_last_flush, _tick_last_px
+    try:
+        lines = None
+        with _tick_buf_lock:
+            if price == _tick_last_px:
+                return
+            _tick_last_px = price
+            _tick_buf.append((int(ts_ms), float(price)))
+            now = time_mod.time()
+            if now - _tick_last_flush >= 5:
+                lines = "".join(f"{t},{p}\n" for t, p in _tick_buf)
+                _tick_buf.clear()
+                _tick_last_flush = now
+        if lines:
+            with open(TICKS_FILE, "a") as f:
+                f.write(lines)
+    except Exception:
+        pass   # recording is best-effort; trading must never be affected
+
+def _load_recorded_ticks():
+    """Read ticks.csv → sorted list of (ts_ms, price). Empty list if none."""
+    out = []
+    try:
+        with open(TICKS_FILE) as f:
+            for ln in f:
+                try:
+                    t, p = ln.split(",")
+                    out.append((int(t), float(p)))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    out.sort(key=lambda x: x[0])
+    return out
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # EXCHANGE  (Phemex live — OHLCV + ticker, no auth needed)
@@ -630,6 +693,11 @@ def on_live_price(price: float, from_ws: bool = False):
     if from_ws:
         _last_ws_tick_ts = now
 
+    # Record the exact price the exit engine is about to act on, so a "ticks"
+    # backtest can replay the real stream (1:1 with paper trading). No-op unless
+    # RECORD_TICKS=1. Timestamped in ms to bucket into 30m candles later.
+    _record_tick(int(now * 1000), price)
+
     paper["unrealized"] = _unrealized_pct(price)
     # Track the max favorable / adverse excursion (best & worst unrealized %)
     # the trade reached while open — BEFORE the exit check (so a trade that hits
@@ -972,18 +1040,68 @@ def _fetch_1m_candles(since_ms, until_ms):
     seen = {r[0]: r for r in out}
     return [seen[k] for k in sorted(seen)]
 
+# ── Intra-minute realism knob ────────────────────────────────────────────────
+# THE #1 REASON the backtest diverged from paper trading.
+#
+# A 1-minute candle only gives us O/H/L/C. The OLD path walked L→H in a perfectly
+# STRAIGHT line, so on the way up the price NEVER pulled back. A tight trailing
+# stop (e.g. trail offset 1 tick = $0.10) therefore never tripped during the
+# climb — the backtest rode EVERY winner all the way to the minute's HIGH and
+# exited at high−offset. Live trading is the opposite: the real websocket ticks
+# wiggle constantly, so the same trailing stop gets shaken out on the FIRST small
+# pullback, exiting near where it armed (≈ entry + activation). Result: the
+# backtest's winners were several times bigger than the live ones → "completamente
+# diferente".
+#
+# INTRABAR_JAG overlays a deterministic, mean-reverting zig-zag on each leg so the
+# path contains sub-minute pullbacks of about INTRABAR_JAG × (this minute's H−L).
+# The shared _check_sl_tp then fires the trailing stop at a realistic spot. A WIDE
+# trailing offset is barely affected (the wiggle stays inside it); only the tight
+# offsets — the ones the straight line mis-modelled — get corrected. The walk is
+# fully deterministic (no RNG) so a backtest is reproducible, and every leg still
+# starts/ends exactly on O/H/L/C (the candle's real extremes are never exceeded).
+#
+# 0.0  → restores the OLD straight-line path (optimistic, rides to the extreme).
+# 0.4  → sensible default for ETH 30m/1m.   Env BT_INTRABAR_JAG overrides.
+# NOTE: this is still a MODEL of the path, not the real ticks. For literal 1:1
+# parity with paper trading, replay recorded live ticks (see notes in the answer).
+INTRABAR_JAG = float(os.environ.get("BT_INTRABAR_JAG", 0.4))
+
+def _leg_path(a, b, n, jag):
+    """One O/H/L/C leg a→b as ~n points, walked with periodic pullbacks AGAINST
+    the leg direction (amplitude jag×|b−a|) instead of a straight line. Stays
+    strictly inside [min(a,b), max(a,b)] and ends exactly at b, so the candle's
+    real high/low are touched but never overshot."""
+    if n <= 1 or a == b:
+        return [b]
+    up    = b > a
+    span  = abs(b - a)
+    pull  = jag * span
+    lo, hi = (a, b) if up else (b, a)
+    pts = []
+    for i in range(1, n + 1):
+        f    = i / n
+        base = a + (b - a) * f                       # monotone progress a→b
+        # envelope sin(πf) is 0 at both ends; the (1−cos) term makes ~4 humps,
+        # so the retraces fade out at the leg boundaries (exact endpoints).
+        saw  = pull * math.sin(f * math.pi) * (0.5 - 0.5 * math.cos(f * 8.0 * math.pi))
+        p    = base - saw if up else base + saw      # pull back, never past b
+        pts.append(min(hi, max(lo, p)))
+    pts[-1] = b
+    return pts
+
 def _second_path(o, h, l, c, steps=60):
     # Read each 1-minute candle SECOND BY SECOND (~`steps` points), walking the
     # broker path O→L→H→C (up bar) / O→H→L→C (down bar). Real 1-second history
     # isn't available via REST, so we step through each minute's OHLC at 1s
-    # resolution — the backtest "sees" prices ~like the live 1s poll.
+    # resolution — the backtest "sees" prices ~like the live tick stream, INCLUDING
+    # the small intra-minute pullbacks (INTRABAR_JAG) that a tight trailing stop
+    # reacts to. With INTRABAR_JAG=0 this is the old straight-line walk.
     pts = [o, l, h, c] if c >= o else [o, h, l, c]
-    out = []; seg = max(1, steps // 3)
+    seg = max(1, steps // 3)
+    out = []
     for k in range(3):
-        a, b = pts[k], pts[k + 1]
-        for s in range(seg):
-            out.append(a + (b - a) * (s / seg))
-    out.append(pts[3])
+        out.extend(_leg_path(pts[k], pts[k + 1], seg, INTRABAR_JAG))
     return out
 
 def _simulate_trade(side, entry, subs, candle_close):
@@ -1003,6 +1121,134 @@ def _simulate_trade(side, entry, subs, candle_close):
             if ex:
                 return ex_px, reason, mfe, mae
     return candle_close, "CANDLE_END", mfe, mae   # never hit TP/SL → close at candle end
+
+def _fetch_range(tf: str, tf_ms: int, since_ms: int, until_ms: int):
+    """Generic paginated OHLCV fetch for [since_ms, until_ms) at timeframe tf."""
+    out, cur = [], int(since_ms)
+    for _ in range(4000):
+        try:
+            rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe=tf,
+                                     since=cur, limit=1000)
+        except Exception as e:
+            logger.warning(f"[BT] {tf} fetch: {type(e).__name__}: {e}"); break
+        if not rows: break
+        out.extend(rows)
+        last = rows[-1][0]
+        if last <= cur or last >= until_ms: break
+        cur = last + tf_ms
+    seen = {r[0]: r for r in out}
+    return [seen[k] for k in sorted(seen)]
+
+def _simulate_trade_ticks(side, entry, prices, candle_close):
+    """Replay one trade through the REAL recorded 1s prices of its candle, using the
+    EXACT SAME _check_sl_tp as live paper trading. `prices` is the list of recorded
+    prices (chronological) that fell inside the exit candle. Returns
+    (exit_px, reason, mfe%, mae%)."""
+    pos = {"side": "long" if side == "LONG" else "short", "entry_price": entry,
+           "peak": entry, "trail_active": False, "trail_stop": 0.0}
+    mfe = 0.0; mae = 0.0
+    for px in prices:
+        d = (px - entry) if side == "LONG" else (entry - px)
+        pct = (d / entry * 100) if entry else 0.0
+        if pct > mfe: mfe = pct
+        if pct < mae: mae = pct
+        ex, ex_px, reason = _check_sl_tp(pos, px)     # same logic as live
+        if ex:
+            return ex_px, reason, mfe, mae
+    return candle_close, "CANDLE_END", mfe, mae
+
+def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
+    """1:1-REAL backtest: replays the ACTUAL recorded 1-second price stream (from
+    ticks.csv, written live when RECORD_TICKS=1) through the same signal + exit
+    logic as paper trading. No interpolation — the real prices the bot saw. Only
+    covers the period that was actually recorded."""
+    _backtest.update({"running": True, "result": None, "error": None,
+                      "progress": "lendo ticks gravados…"})
+    try:
+        ticks = _load_recorded_ticks()
+        if len(ticks) < 100:
+            raise RuntimeError("poucos ticks gravados — ligue RECORD_TICKS=1 e deixe "
+                               "o bot rodar um tempo antes de rodar o backtest por ticks")
+        t0, t1 = ticks[0][0], ticks[-1][0]
+        try:
+            bt_ex.load_markets()
+        except Exception as e:
+            logger.warning(f"[BT] load_markets: {type(e).__name__}: {e}")
+
+        # 30m candles: 200 bars of warmup BEFORE the recorded window (signals need
+        # lead-in) through the end of the recorded window.
+        warm_ms = 200 * 1_800_000
+        _backtest["progress"] = "buscando candles de 30m (sinais)…"
+        c30 = _fetch_range("30m", 1_800_000, t0 - warm_ms, t1 + 1_800_000)
+        if not c30 or len(c30) < 70:
+            raise RuntimeError("poucos candles de 30m da Phemex para os sinais")
+
+        # Bucket the recorded prices by 30m candle boundary.
+        tbuckets = {}
+        for ts, px in ticks:
+            tbuckets.setdefault((ts // 1_800_000) * 1_800_000, []).append(px)
+
+        _backtest["progress"] = "calculando sinais (EC×EMA por candle)…"
+        signals = strat.calculate_series([c[4] for c in c30],
+                                         int(config.get("gain_limit", 900)))
+
+        _backtest["progress"] = "simulando trades (replay de ticks reais)…"
+        sl, tp, tr = SL_DIST, TP_DIST, TR_DIST
+        bal = PAPER_START_BAL; trades = []; wins = 0; skipped = 0
+        for i in range(60, len(c30) - 1):
+            sig = signals[i]
+            if not sig: continue
+            nxt = c30[i + 1]
+            b   = (nxt[0] // 1_800_000) * 1_800_000
+            prices = tbuckets.get(b)
+            if not prices:
+                # No recorded ticks for this exit candle (bot was down / outside the
+                # recorded window) → skip, so we only compare the real recorded period.
+                skipped += 1
+                continue
+            entry = float(c30[i][4])                 # candle i close = candle i+1 open
+            ex_px, reason, mfe, mae = _simulate_trade_ticks(sig, entry, prices, float(nxt[4]))
+            qty = (bal / entry) if entry else 0.0
+            raw = (ex_px - entry) * qty if sig == "LONG" else (entry - ex_px) * qty
+            fee = (entry * qty * fee_entry / 100) + (ex_px * qty * fee_exit / 100)
+            raw -= fee
+            bal += raw
+            pct = (raw / (entry * qty) * 100) if (entry * qty) else 0.0
+            if pct > 0: wins += 1
+            trades.append({
+                "candle": datetime.fromtimestamp(nxt[0] / 1000, tz=timezone.utc)
+                          .strftime("%Y-%m-%d %H:%M UTC"),
+                "side": sig, "entry": round(entry, 2), "exit": round(ex_px, 2),
+                "reason": reason, "pnl_pct": round(pct, 3),
+                "mfe": round(mfe - fee_entry, 3), "mae": round(mae - fee_entry, 3),
+                "balance": round(bal, 2),
+            })
+        n = len(trades)
+        rets = [t["pnl_pct"] for t in trades]
+        span_h = round((t1 - t0) / 3_600_000, 1)
+        summary = {
+            "trades": n,
+            "winrate": round(wins / n * 100, 1) if n else 0.0,
+            "final_balance": round(bal, 2),
+            "total_pnl_pct": round((bal - PAPER_START_BAL) / PAPER_START_BAL * 100, 2),
+            "max_profit": round(max(rets), 3) if rets else 0.0,
+            "max_loss":   round(min(rets), 3) if rets else 0.0,
+            "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,
+            "fee_entry": fee_entry, "fee_exit": fee_exit,
+            "sl": sl, "tp": tp, "tr": tr,
+            "source": "ticks_reais_gravados",
+            "ticks_loaded": len(ticks),
+            "recorded_hours": span_h,          # how much real time was recorded
+            "candles_skipped_no_ticks": skipped,
+        }
+        _backtest.update({"running": False, "progress": "concluído",
+                          "result": {"summary": summary, "trades": trades[::-1]}})
+        logger.info(f"[BT-TICKS] {n} trades, bal={bal:.2f}, "
+                    f"pnl={summary['total_pnl_pct']}%, {span_h}h gravadas")
+    except Exception as e:
+        logger.error(f"[BT-TICKS] {type(e).__name__}: {e}")
+        _backtest.update({"running": False, "progress": "erro",
+                          "error": f"{type(e).__name__}: {e}"})
 
 def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
     _backtest.update({"running": True, "result": None, "error": None,
@@ -1052,7 +1298,11 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
                           .strftime("%Y-%m-%d %H:%M UTC"),
                 "side": sig, "entry": round(entry, 2), "exit": round(ex_px, 2),
                 "reason": reason, "pnl_pct": round(pct, 3),
-                "mfe": round(mfe, 3), "mae": round(mae, 3), "balance": round(bal, 2),
+                # MFE/MAE shifted by the entry fee so they read EXACTLY like the
+                # live dashboard's _unrealized_pct (which subtracts the entry fee
+                # from every reading). With fees=0 this is a no-op.
+                "mfe": round(mfe - fee_entry, 3), "mae": round(mae - fee_entry, 3),
+                "balance": round(bal, 2),
             })
         n = len(trades)
         rets = [t["pnl_pct"] for t in trades]
@@ -1067,6 +1317,7 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             "fee_entry": fee_entry, "fee_exit": fee_exit,
             "candles": n_candles, "sl": sl, "tp": tp, "tr": tr,
             "intrabar_minutes_loaded": len(c1m),
+            "intrabar_jag": INTRABAR_JAG,   # 0 = old straight-line; >0 = realistic wiggle
         }
         _backtest.update({"running": False, "progress": "concluído",
                           "result": {"summary": summary, "trades": trades[::-1]}})
@@ -1243,9 +1494,15 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
   <div id="tab-backtest" style="display:none">
     <div class="top-row">
       <div class="bt-ctrl">
+        <div><label>Fonte</label><br>
+          <select id="bt-source">
+            <option value="synthetic">Candles 1m (qualquer período)</option>
+            <option value="ticks">Ticks reais gravados (1:1 com paper)</option>
+          </select></div>
+        <span class="cfg-hint">"Ticks reais" só cobre o período gravado (precisa RECORD_TICKS=1). É o mais fiel ao paper trading.</span>
         <div><label>Candles de 30m</label><br>
           <input id="bt-candles" type="number" step="10" min="50" max="35040" value="300"></div>
-        <span class="cfg-hint">300 ≈ 6 dias · 1440 ≈ 1 mês · 17520 ≈ 1 ano (longo demora minutos)</span>
+        <span class="cfg-hint">300 ≈ 6 dias · 1440 ≈ 1 mês · 17520 ≈ 1 ano (longo demora minutos) — só p/ fonte "Candles 1m"</span>
         <div><label>Fee Entrada %</label><br>
           <input id="bt-fee-entry" type="number" step="0.01" min="0" value="0"></div>
         <div><label>Fee Saída %</label><br>
@@ -1348,9 +1605,10 @@ async function runBacktest(){
   const n=parseInt(document.getElementById('bt-candles').value)||300;
   const fe=parseFloat(document.getElementById('bt-fee-entry').value)||0;
   const fx=parseFloat(document.getElementById('bt-fee-exit').value)||0;
+  const src=document.getElementById('bt-source').value;
   document.getElementById('btn-bt').disabled=true;
   const r=await fetch('/backtest',{method:'POST',headers:{'Content-Type':'application/json'},
-                                   body:JSON.stringify({candles:n,fee_entry:fe,fee_exit:fx})});
+                                   body:JSON.stringify({candles:n,fee_entry:fe,fee_exit:fx,source:src})});
   const d=await r.json();toast(d.message,d.ok);
   if(!d.ok){document.getElementById('btn-bt').disabled=false;return;}
   if(btTimer)clearInterval(btTimer);
@@ -1464,6 +1722,10 @@ async function fetchAll(){
 fetch('/settings').then(r=>r.json()).then(d=>{
   document.getElementById('fee-entry').value=d.fee_entry;
   document.getElementById('fee-exit').value=d.fee_exit;
+  // Backtest uses the SAME fees as the live bot by default — pre-fill them here
+  // so the numbers line up with paper trading unless you deliberately change them.
+  document.getElementById('bt-fee-entry').value=d.fee_entry;
+  document.getElementById('bt-fee-exit').value=d.fee_exit;
 });
 fetchAll();setInterval(fetchAll,10000);
 </script>
@@ -1555,21 +1817,52 @@ def backtest():
     if _backtest["running"]:
         return jsonify({"ok": False, "message": "Backtest já está rodando"})
     data = request.get_json() or {}
-    n = 300; fe = 0.0; fx = 0.0
+    # Default the fees to the SAME ones the live paper bot uses (fees.json / the
+    # Settings tab). The two used to be decoupled — running a backtest with 0 fees
+    # while the live bot charged a fee silently produced different numbers. Now an
+    # omitted/blank field inherits the live fee; the backtest form can still
+    # override it explicitly.
+    n = 300; fe = float(fees["entry"]); fx = float(fees["exit"])
     # No 1000-candle cap — long backtests (e.g. 1 year = 17 520 candles) allowed.
     # 35 040 ≈ 2 years is a sanity ceiling so a typo can't hang the server forever.
     try: n  = max(50, min(35040, int(data.get("candles", 300))))
     except Exception: pass
-    try: fe = max(0.0, float(data.get("fee_entry", 0)))
+    try: fe = max(0.0, float(data.get("fee_entry", fees["entry"])))
     except Exception: pass
-    try: fx = max(0.0, float(data.get("fee_exit", 0)))
+    try: fx = max(0.0, float(data.get("fee_exit", fees["exit"])))
     except Exception: pass
+    # source: "synthetic" (1m candles + realistic path — works for any length,
+    # any period) or "ticks" (replay the REAL recorded 1s stream — 1:1 with paper
+    # trading, but only for the period RECORD_TICKS captured).
+    source = str(data.get("source", "synthetic")).lower()
+    if source == "ticks":
+        if not RECORD_TICKS and not _load_recorded_ticks():
+            return jsonify({"ok": False, "message":
+                "Nenhum tick gravado. Ligue RECORD_TICKS=1 no ambiente e deixe o bot "
+                "rodar um tempo — depois rode o backtest por ticks reais."})
+        threading.Thread(target=run_backtest_ticks, args=(fe, fx), daemon=True).start()
+        return jsonify({"ok": True, "message": "Backtest por ticks reais gravados iniciado"})
     threading.Thread(target=run_backtest, args=(n, fe, fx), daemon=True).start()
     return jsonify({"ok": True, "message": f"Backtest de {n} candles iniciado"})
 
 @app.route("/backtest-result")
 def backtest_result():
     return jsonify(_backtest)
+
+@app.route("/ticks-info")
+def ticks_info():
+    """How much real 1s data has been recorded so far (for the ticks backtest)."""
+    ticks = _load_recorded_ticks()
+    if not ticks:
+        return jsonify({"recording": RECORD_TICKS, "ticks": 0, "hours": 0.0,
+                        "note": "ligue RECORD_TICKS=1 e deixe o bot rodar"})
+    span_h = round((ticks[-1][0] - ticks[0][0]) / 3_600_000, 2)
+    return jsonify({"recording": RECORD_TICKS, "ticks": len(ticks),
+                    "hours": span_h,
+                    "from": datetime.fromtimestamp(ticks[0][0]/1000, tz=timezone.utc)
+                            .strftime("%Y-%m-%d %H:%M UTC"),
+                    "to":   datetime.fromtimestamp(ticks[-1][0]/1000, tz=timezone.utc)
+                            .strftime("%Y-%m-%d %H:%M UTC")})
 
 @app.route("/debug-ticker")
 def debug_ticker():
