@@ -48,11 +48,11 @@ TRAIL_OFFSET = 15      # Pine trail_offset  (literal 15)   → trail OFFSET     
 # 2000/55/15 pts × 0.01 → SL=$20, TP-activation=$0.55, trail=$0.15.
 CONFIG_FILE = "config.json"
 def _default_config():
-    # User-chosen defaults (2026-06-28): SL 2000pt·$200, TP-activation 10pt·$1.00,
-    # trail 1pt·$0.10, Gain Limit 1, mintick 0.1.
-    return {"sl_pts": 2000, "tp_pts": 10, "tr_pts": 1,
+    # User-chosen defaults (2026-07-01): SL 2000pt·$200.00, TP-activation 55pt·$5.50,
+    # trail 15pt·$1.50, Gain Limit 1000, mintick 0.1. (Distances = points × mintick.)
+    return {"sl_pts": 2000, "tp_pts": 55, "tr_pts": 15,
             "mintick": 0.1,
-            "gain_limit": 1}
+            "gain_limit": 1000}
 def _load_config():
     try:
         with open(CONFIG_FILE) as f:
