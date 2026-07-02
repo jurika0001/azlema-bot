@@ -429,17 +429,23 @@ def _calc_qty(price, balance):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL / TRAILING TP  — two variants
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _check_sl_tp(pos, cur_price: float):
+def _check_sl_tp(pos, cur_price: float, sl_d=None, tp_d=None, tr_d=None):
     """
     Intra-candle exit math — the SINGLE source of truth used by BOTH live paper
     trading (pos = the global `paper`) AND the backtest (pos = a local dict), so
     the two can never diverge again. Mutates pos["peak"]/["trail_active"]/
     ["trail_stop"] and returns (exit, exit_price, reason).
 
-    Long  : peak = highest price since entry; trail arms once peak-entry >= TP_DIST
-            then sits TR_DIST below peak. SL is FIXED at entry-SL_DIST (Pine `loss`).
-    Short : symmetric (peak = lowest price; trail sits TR_DIST above it).
+    sl_d/tp_d/tr_d: o bot ao vivo NÃO passa (usa o config global); um backtest
+    paralelo passa as SUAS distâncias, então 5 slots podem simular configs
+    diferentes ao mesmo tempo sem interferir um no outro nem no bot.
+
+    Long  : peak = highest price since entry; trail arms once peak-entry >= tp_d
+            then sits tr_d below peak. SL is FIXED at entry-sl_d (Pine `loss`).
+    Short : symmetric (peak = lowest price; trail sits tr_d above it).
     """
+    if sl_d is None:
+        sl_d, tp_d, tr_d = SL_DIST, TP_DIST, TR_DIST
     if pos["side"] == "none":
         return False, 0.0, ""
     entry = pos["entry_price"]
@@ -447,27 +453,27 @@ def _check_sl_tp(pos, cur_price: float):
     if pos["side"] == "long":
         if cur_price > pos["peak"]:
             pos["peak"] = cur_price
-        if pos["peak"] - entry >= TP_DIST:
-            nt = round(pos["peak"] - TR_DIST, 8)
+        if pos["peak"] - entry >= tp_d:
+            nt = round(pos["peak"] - tr_d, 8)
             if not pos["trail_active"] or nt > pos["trail_stop"]:
                 pos["trail_active"] = True
                 pos["trail_stop"]   = nt
         if pos["trail_active"] and cur_price <= pos["trail_stop"]:
             return True, pos["trail_stop"], "TRAIL_TP"
-        sl = round(entry - SL_DIST, 8)               # FIXED stop-loss (Pine `loss`)
+        sl = round(entry - sl_d, 8)                  # FIXED stop-loss (Pine `loss`)
         if cur_price <= sl:
             return True, sl, "SL"
     else:
         if pos["peak"] == 0 or cur_price < pos["peak"]:
             pos["peak"] = cur_price
-        if entry - pos["peak"] >= TP_DIST:
-            nt = round(pos["peak"] + TR_DIST, 8)
+        if entry - pos["peak"] >= tp_d:
+            nt = round(pos["peak"] + tr_d, 8)
             if not pos["trail_active"] or nt < pos["trail_stop"]:
                 pos["trail_active"] = True
                 pos["trail_stop"]   = nt
         if pos["trail_active"] and cur_price >= pos["trail_stop"]:
             return True, pos["trail_stop"], "TRAIL_TP"
-        sl = round(entry + SL_DIST, 8)               # FIXED stop-loss (Pine `loss`)
+        sl = round(entry + sl_d, 8)                  # FIXED stop-loss (Pine `loss`)
         if cur_price >= sl:
             return True, sl, "SL"
 
@@ -1040,7 +1046,15 @@ threading.Thread(target=price_poller, daemon=True).start()
 # price path from its 1-minute sub-candles and run the SAME trailing/SL/candle-end
 # exit rules as live trading, so the backtest is as close to real trades as REST
 # data allows. Runs in a background thread; the UI polls /backtest-result.
-_backtest = {"running": False, "progress": "", "result": None, "error": None}
+#
+# 5 SLOTS simultâneos (pedido 2026-07-02): o otimizador roda 5 combinações em
+# paralelo, cada uma com as PRÓPRIAS variáveis passadas na requisição (nunca
+# mexendo no config global — mudar o /config no meio corrompia os resultados).
+# O slot 0 é o legado: a UI e os modos tv/ticks usam ele.
+N_BT_SLOTS = 5
+_backtests = [{"running": False, "progress": "", "result": None, "error": None}
+              for _ in range(N_BT_SLOTS)]
+_backtest  = _backtests[0]        # alias legado (UI, tv, ticks)
 
 # Última falha de fetch do backtest — vai pro erro mostrado NA TELA. Antes a
 # causa real (rate-limit, timeout, geo-block…) ficava só no log do servidor e a
@@ -1068,6 +1082,62 @@ def _few_candles_msg(got):
     if _bt_fetch_err:
         m += f" — último erro do fetch: {_bt_fetch_err}"
     return m
+
+# ── Cache de candles + sinais (pedido 2026-07-02) ───────────────────────────
+# Baixa UMA vez e reutiliza em todos os backtests seguintes da mesma janela —
+# o otimizador roda milhares de backtests sobre os mesmos candles e o download
+# era a maior parte do tempo de cada um. O cache de 30m expira quando vira o
+# candle (bucket de 30 min); o lock impede que 5 slots concorrentes façam 5
+# downloads iguais (e o bt_ex não é thread-safe pra chamadas simultâneas).
+_fetch_lock = threading.Lock()
+_c30_cache  = {"bucket": None, "n": 0, "rows": []}
+_c1m_cache  = {"key": None, "rows": [], "buckets": None}   # 1 janela (a de 1 ano é grande)
+_sig_lock   = threading.Lock()
+_sig_cache  = {}                                            # (gl, ts0, ts1, len) → sinais
+
+def _fetch_30m_cached(n, bt):
+    bucket = int(time_mod.time() // 1800)
+    with _fetch_lock:
+        if _c30_cache["bucket"] == bucket and _c30_cache["n"] >= n:
+            return _c30_cache["rows"]
+        bt["progress"] = "buscando candles de 30m…"
+        rows = _fetch_30m_candles(n)
+        if rows:
+            _c30_cache.update({"bucket": bucket, "n": n, "rows": rows})
+        return rows
+
+def _fetch_1m_cached(since_ms, until_ms, bt):
+    """1m candles + os buckets por candle de 30m, cacheados juntos (montar os
+    buckets de um ano ~525k candles a cada execução também custava caro)."""
+    key = (int(since_ms) // 60_000, int(until_ms) // 60_000)
+    with _fetch_lock:
+        if _c1m_cache["key"] == key:
+            return _c1m_cache["rows"], _c1m_cache["buckets"]
+        bt["progress"] = "buscando candles de 1m…"
+        rows = _fetch_1m_candles(since_ms, until_ms)
+        buckets = {}
+        for r in rows:
+            buckets.setdefault((r[0] // 1_800_000) * 1_800_000, []).append(r)
+        for b in buckets:
+            buckets[b].sort(key=lambda x: x[0])
+        if rows:
+            _c1m_cache.update({"key": key, "rows": rows, "buckets": buckets})
+        return rows, buckets
+
+def _signals_cached(c30, gain_limit, bt):
+    """Sinais EC×EMA cacheados por (gain_limit, janela) — com o gain_limit fixo
+    o cálculo pesado da strategy roda UMA vez pra milhares de backtests."""
+    key = (int(gain_limit), c30[0][0], c30[-1][0], len(c30))
+    with _sig_lock:
+        if key in _sig_cache:
+            return _sig_cache[key]
+    bt["progress"] = "calculando sinais (EC×EMA por candle)…"
+    sig = strat.calculate_series([r[4] for r in c30], int(gain_limit))
+    with _sig_lock:
+        _sig_cache[key] = sig
+        while len(_sig_cache) > 12:                 # limita memória
+            _sig_cache.pop(next(iter(_sig_cache)))
+    return sig
 
 def _fetch_30m_candles(n):
     """Paginated 30m fetch — supports UNLIMITED n (e.g. a year = 17 520 candles),
@@ -1163,10 +1233,11 @@ def _second_path(o, h, l, c, steps=60):
         out.extend(_leg_path(pts[k], pts[k + 1], seg, INTRABAR_JAG))
     return out
 
-def _simulate_trade(side, entry, subs, candle_close):
+def _simulate_trade(side, entry, subs, candle_close, sl_d=None, tp_d=None, tr_d=None):
     """Replay one trade through its 1m sub-candles at 1s resolution, using the
     EXACT SAME _check_sl_tp as live paper trading (single source of truth, so the
-    backtest result matches live). Returns (exit_px, reason, mfe%, mae%)."""
+    backtest result matches live). sl_d/tp_d/tr_d opcionais = distâncias próprias
+    desta execução (slots paralelos). Returns (exit_px, reason, mfe%, mae%)."""
     pos = {"side": "long" if side == "LONG" else "short", "entry_price": entry,
            "peak": entry, "trail_active": False, "trail_stop": 0.0}
     mfe = 0.0; mae = 0.0
@@ -1176,7 +1247,7 @@ def _simulate_trade(side, entry, subs, candle_close):
             pct = (d / entry * 100) if entry else 0.0
             if pct > mfe: mfe = pct
             if pct < mae: mae = pct
-            ex, ex_px, reason = _check_sl_tp(pos, px)     # same logic as live
+            ex, ex_px, reason = _check_sl_tp(pos, px, sl_d, tp_d, tr_d)
             if ex:
                 return ex_px, reason, mfe, mae
     return candle_close, "CANDLE_END", mfe, mae   # never hit TP/SL → close at candle end
@@ -1308,35 +1379,41 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
         _backtest.update({"running": False, "progress": "erro",
                           "error": f"{type(e).__name__}: {e}"})
 
-def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
-    _backtest.update({"running": True, "result": None, "error": None,
-                      "progress": "buscando candles de 30m…"})
+def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0, slot=0, params=None):
+    """Backtest synthetic (1m). `slot` (0..N_BT_SLOTS-1) permite execuções
+    SIMULTÂNEAS e `params` (sl_pts/tp_pts/tr_pts/mintick_sl/mintick_tp/
+    gain_limit) faz ESTA execução usar as próprias variáveis, sem tocar no
+    config global — requisito do otimizador paralelo (2026-07-02)."""
+    bt = _backtests[slot]
+    bt.update({"running": True, "result": None, "error": None,
+               "progress": "preparando…"})
     global _bt_fetch_err
     _bt_fetch_err = None
+    p    = params or {}
+    msl  = float(p.get("mintick_sl", config["mintick_sl"]))
+    mtp  = float(p.get("mintick_tp", config["mintick_tp"]))
+    sl_d = round(float(p.get("sl_pts", config["sl_pts"])) * msl, 8)
+    tp_d = round(float(p.get("tp_pts", config["tp_pts"])) * mtp, 8)
+    tr_d = round(float(p.get("tr_pts", config["tr_pts"])) * mtp, 8)
+    gl   = int(p.get("gain_limit", config.get("gain_limit", 900)))
     try:
         try:
             bt_ex.load_markets()
         except Exception as e:
             logger.warning(f"[BT] load_markets: {type(e).__name__}: {e}")
         warm = 200                                   # warmup bars so EC/EMA/period converge like TV
-        c30  = _fetch_30m_candles(n_candles + warm)   # paginated → unlimited length
+        c30  = _fetch_30m_cached(n_candles + warm, bt)   # cache: baixa 1x, reutiliza
         if not c30 or len(c30) < 70:
             raise RuntimeError(_few_candles_msg(len(c30) if c30 else 0))
         c30 = c30[-(n_candles + warm):]
         # only the LAST n_candles are traded; the earlier ones are warmup-only
         start_i = max(60, len(c30) - 1 - n_candles)
-        _backtest["progress"] = "buscando candles de 1m (variações intra-candle)…"
-        # 1m only for the TRADED window (keeps it fast; warmup needs only 30m closes)
-        c1m = _fetch_1m_candles(c30[start_i][0], c30[-1][0] + 1_800_000)
-        buckets = {}
-        for r in c1m:
-            buckets.setdefault((r[0] // 1_800_000) * 1_800_000, []).append(r)
-        for b in buckets: buckets[b].sort(key=lambda x: x[0])
+        # 1m only for the TRADED window (cache: baixa/monta buckets 1x)
+        c1m, buckets = _fetch_1m_cached(c30[start_i][0], c30[-1][0] + 1_800_000, bt)
 
-        _backtest["progress"] = "calculando sinais (EC×EMA por candle)…"
-        signals = strat.calculate_series([c[4] for c in c30], int(config.get("gain_limit", 900)))
+        signals = _signals_cached(c30, gl, bt)       # cache por (gain_limit, janela)
 
-        _backtest["progress"] = "simulando trades (replay 1m)…"
+        bt["progress"] = "simulando trades (replay 1m)…"
         bal = PAPER_START_BAL; trades = []; wins = 0
         for i in range(start_i, len(c30) - 1):
             sig = signals[i]
@@ -1344,7 +1421,8 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             entry = float(c30[i][4])                 # candle i close = candle i+1 open
             nxt   = c30[i + 1]
             subs  = buckets.get((nxt[0] // 1_800_000) * 1_800_000) or [nxt]
-            ex_px, reason, mfe, mae = _simulate_trade(sig, entry, subs, float(nxt[4]))
+            ex_px, reason, mfe, mae = _simulate_trade(sig, entry, subs, float(nxt[4]),
+                                                      sl_d, tp_d, tr_d)
             qty = (bal / entry) if entry else 0.0
             raw = (ex_px - entry) * qty if sig == "LONG" else (entry - ex_px) * qty
             fee = (entry * qty * fee_entry / 100) + (ex_px * qty * fee_exit / 100)
@@ -1374,20 +1452,23 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             "max_loss":   round(min(rets), 3) if rets else 0.0,   # biggest single-trade loss %
             "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,  # average % per trade
             "fee_entry": fee_entry, "fee_exit": fee_exit,
-            "candles": n_candles,
-            "sl": SL_DIST, "tp": TP_DIST, "tr": TR_DIST,
-            "mintick_sl": MINTICK_SL, "mintick_tp": MINTICK_TP,
+            "candles": n_candles, "slot": slot,
+            "sl": sl_d, "tp": tp_d, "tr": tr_d,
+            "mintick_sl": msl, "mintick_tp": mtp, "gain_limit": gl,
+            "sl_pts": float(p.get("sl_pts", config["sl_pts"])),
+            "tp_pts": float(p.get("tp_pts", config["tp_pts"])),
+            "tr_pts": float(p.get("tr_pts", config["tr_pts"])),
             "intrabar_minutes_loaded": len(c1m),
             "intrabar_jag": INTRABAR_JAG,   # 0 = old straight-line; >0 = realistic wiggle
         }
-        _backtest.update({"running": False, "progress": "concluído",
-                          "result": {"summary": summary, "trades": trades[::-1]}})
-        logger.info(f"[BT] done: {n} trades, bal={bal:.2f}, "
+        bt.update({"running": False, "progress": "concluído",
+                   "result": {"summary": summary, "trades": trades[::-1]}})
+        logger.info(f"[BT] slot {slot} done: {n} trades, bal={bal:.2f}, "
                     f"pnl={summary['total_pnl_pct']}%")
     except Exception as e:
-        logger.error(f"[BT] {type(e).__name__}: {e}")
-        _backtest.update({"running": False, "progress": "erro",
-                          "error": f"{type(e).__name__}: {e}"})
+        logger.error(f"[BT] slot {slot}: {type(e).__name__}: {e}")
+        bt.update({"running": False, "progress": "erro",
+                   "error": f"{type(e).__name__}: {e}"})
 
 # ── Emulador do TradingView (fonte "tv") ─────────────────────────────────────
 # Reproduz o backtest do TradingView COMO O USUÁRIO O OBSERVOU rodando ao vivo
@@ -2076,8 +2157,6 @@ def set_config():
 
 @app.route("/backtest", methods=["POST"])
 def backtest():
-    if _backtest["running"]:
-        return jsonify({"ok": False, "message": "Backtest já está rodando"})
     data = request.get_json() or {}
     # Default the fees to the SAME ones the live paper bot uses (fees.json / the
     # Settings tab). The two used to be decoupled — running a backtest with 0 fees
@@ -2099,11 +2178,24 @@ def backtest():
     # panel) or "ticks" (replay the REAL recorded 1s stream — 1:1 with paper
     # trading, but only for the period RECORD_TICKS captured).
     source = str(data.get("source", "synthetic")).lower()
+    # slot (0..N_BT_SLOTS-1): permite backtests synthetic SIMULTÂNEOS, cada um
+    # com variáveis próprias passadas inline (sl_pts/tp_pts/tr_pts/mintick_sl/
+    # mintick_tp/gain_limit) — sem tocar no config global. tv/ticks: slot 0.
+    try:
+        slot = max(0, min(N_BT_SLOTS - 1, int(data.get("slot", 0))))
+    except Exception:
+        slot = 0
+    pkeys  = ("sl_pts", "tp_pts", "tr_pts", "mintick_sl", "mintick_tp", "gain_limit")
+    params = {k: data[k] for k in pkeys if k in data} or None
     if source == "tv":
+        if _backtests[0]["running"]:
+            return jsonify({"ok": False, "message": "Backtest já está rodando (slot 0)"})
         threading.Thread(target=run_backtest_tv, args=(n, fe, fx), daemon=True).start()
         return jsonify({"ok": True,
                         "message": f"Backtest emulador TradingView ({n} candles) iniciado"})
     if source == "ticks":
+        if _backtests[0]["running"]:
+            return jsonify({"ok": False, "message": "Backtest já está rodando (slot 0)"})
         if not _load_recorded_ticks():
             return jsonify({"ok": False, "message":
                 "Nenhum tick gravado ainda. A gravação é automática enquanto a "
@@ -2111,12 +2203,27 @@ def backtest():
                 "tente de novo. Acompanhe o quanto já foi gravado em /ticks-info."})
         threading.Thread(target=run_backtest_ticks, args=(fe, fx), daemon=True).start()
         return jsonify({"ok": True, "message": "Backtest por ticks reais gravados iniciado"})
-    threading.Thread(target=run_backtest, args=(n, fe, fx), daemon=True).start()
-    return jsonify({"ok": True, "message": f"Backtest de {n} candles iniciado"})
+    if _backtests[slot]["running"]:
+        return jsonify({"ok": False, "message": f"Backtest já está rodando (slot {slot})"})
+    threading.Thread(target=run_backtest, args=(n, fe, fx, slot, params),
+                     daemon=True).start()
+    return jsonify({"ok": True, "slot": slot,
+                    "message": f"Backtest de {n} candles iniciado (slot {slot})"})
 
 @app.route("/backtest-result")
 def backtest_result():
-    return jsonify(_backtest)
+    try:
+        slot = max(0, min(N_BT_SLOTS - 1, int(request.args.get("slot", 0))))
+    except Exception:
+        slot = 0
+    return jsonify(_backtests[slot])
+
+@app.route("/backtest-slots")
+def backtest_slots():
+    """Visão rápida dos 5 slots paralelos (pro otimizador escolher um livre)."""
+    return jsonify([{"slot": i, "running": b["running"], "progress": b["progress"],
+                     "has_result": b["result"] is not None, "error": b["error"]}
+                    for i, b in enumerate(_backtests)])
 
 @app.route("/ticks-info")
 def ticks_info():
