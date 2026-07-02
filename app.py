@@ -138,12 +138,14 @@ logger.info(f"[FEES] entry={fees['entry']}%  exit={fees['exit']}%")
 # real ~1-second price stream (the ticker websocket + the 1s REST poll). If we
 # RECORD that exact stream, the backtest can REPLAY it and match paper trading
 # ~1:1 for the recorded period — no interpolation, the real prices the exit engine
-# actually saw. Turn it on with env RECORD_TICKS=1.
+# actually saw. LIGADO POR PADRÃO desde 2026-07-02 (pedido do usuário — nada a
+# configurar; env RECORD_TICKS=0 desliga se um dia precisar).
 #
-# Caveats: (1) it only works FORWARD — you cannot record the past. (2) On Render's
-# free tier the disk is EPHEMERAL: ticks.csv is wiped on every redeploy/restart, so
-# attach a Persistent Disk (or point TICKS_FILE at one) to keep the history.
-RECORD_TICKS = os.environ.get("RECORD_TICKS", "0") == "1"
+# Caveats: (1) it only works FORWARD — you cannot record the past; a gravação só
+# acontece enquanto a strategy está INICIADA (Start). (2) On Render's free tier
+# the disk is EPHEMERAL: ticks.csv is wiped on every redeploy/restart, so attach
+# a Persistent Disk (or point TICKS_FILE at one) to keep the history.
+RECORD_TICKS = os.environ.get("RECORD_TICKS", "1") == "1"
 TICKS_FILE   = os.environ.get("TICKS_FILE", "ticks.csv")
 
 _tick_buf        = []
@@ -1218,8 +1220,9 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
     try:
         ticks = _load_recorded_ticks()
         if len(ticks) < 100:
-            raise RuntimeError("poucos ticks gravados — ligue RECORD_TICKS=1 e deixe "
-                               "o bot rodar um tempo antes de rodar o backtest por ticks")
+            raise RuntimeError("poucos ticks gravados ainda — a gravação é automática "
+                               "enquanto a strategy está iniciada (Start); deixe o bot "
+                               "rodando um tempo e tente de novo (acompanhe em /ticks-info)")
         t0, t1 = ticks[0][0], ticks[-1][0]
         try:
             bt_ex.load_markets()
@@ -1742,7 +1745,7 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
             <option value="tv">Emulador TradingView (Strategy Tester)</option>
             <option value="ticks">Ticks reais gravados (1:1 com paper)</option>
           </select></div>
-        <span class="cfg-hint">"Emulador TradingView" = candle 30m puro (O/H/L/C): entra na abertura do candle seguinte, trailing/SL agem no candle e fecha no fim do candle se nada bater — é o modo pra comparar com o TV. "Ticks reais" só cobre o período gravado (precisa RECORD_TICKS=1); é o mais fiel ao paper trading.</span>
+        <span class="cfg-hint">"Emulador TradingView" = candle 30m puro (O/H/L/C): entra na abertura do candle seguinte, trailing/SL agem no candle e fecha no fim do candle se nada bater — é o modo pra comparar com o TV. "Ticks reais" grava sozinho enquanto o bot roda (Start) e só cobre esse período; é o mais fiel ao paper trading (veja /ticks-info).</span>
         <div><label>Candles de 30m</label><br>
           <input id="bt-candles" type="number" step="10" min="50" max="35040" value="300"></div>
         <span class="cfg-hint">300 ≈ 6 dias · 1440 ≈ 1 mês · 17520 ≈ 1 ano (longo demora minutos) — só p/ fonte "Candles 1m"</span>
@@ -2096,10 +2099,11 @@ def backtest():
         return jsonify({"ok": True,
                         "message": f"Backtest emulador TradingView ({n} candles) iniciado"})
     if source == "ticks":
-        if not RECORD_TICKS and not _load_recorded_ticks():
+        if not _load_recorded_ticks():
             return jsonify({"ok": False, "message":
-                "Nenhum tick gravado. Ligue RECORD_TICKS=1 no ambiente e deixe o bot "
-                "rodar um tempo — depois rode o backtest por ticks reais."})
+                "Nenhum tick gravado ainda. A gravação é automática enquanto a "
+                "strategy está iniciada (Start) — deixe o bot rodando um tempo e "
+                "tente de novo. Acompanhe o quanto já foi gravado em /ticks-info."})
         threading.Thread(target=run_backtest_ticks, args=(fe, fx), daemon=True).start()
         return jsonify({"ok": True, "message": "Backtest por ticks reais gravados iniciado"})
     threading.Thread(target=run_backtest, args=(n, fe, fx), daemon=True).start()
@@ -2115,7 +2119,9 @@ def ticks_info():
     ticks = _load_recorded_ticks()
     if not ticks:
         return jsonify({"recording": RECORD_TICKS, "ticks": 0, "hours": 0.0,
-                        "note": "ligue RECORD_TICKS=1 e deixe o bot rodar"})
+                        "note": ("gravação ativa — clique Start e deixe o bot "
+                                 "rodando pra acumular ticks" if RECORD_TICKS
+                                 else "gravação desligada (RECORD_TICKS=0)")})
     span_h = round((ticks[-1][0] - ticks[0][0]) / 3_600_000, 2)
     return jsonify({"recording": RECORD_TICKS, "ticks": len(ticks),
                     "hours": span_h,
