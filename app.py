@@ -204,7 +204,11 @@ def _load_recorded_ticks():
 #             we do NOT guess/derive the scale manually (that was the bug:
 #             a one-off guessed ratio silently drifted wrong over time and
 #             corrupted every subsequent SL/TP price).
-live_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
+# timeout 8 s explícito: numa hospedagem onde a Phemex não responde, a conexão
+# fica PENDURADA e o init/loop trava minutos em "Iniciando…" sem dizer nada —
+# com timeout curto a falha vira erro visível no status em segundos.
+live_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True,
+                       "timeout": 8000})
 # ticker_ex: dedicated instance with a LIGHT custom rate limit — fast enough
 # for ~1 req/s, but still self-throttled so Phemex never bans/blocks the IP
 # (disabling rate-limit entirely caused exactly that — silent total failure).
@@ -217,7 +221,8 @@ ticker_ex = ccxt.phemex({
 # bt_ex: SEPARATE instance for the backtest's bulk OHLCV fetches, so they never
 # run concurrently with the strategy loop on the same ccxt session (a requests
 # Session is not thread-safe for concurrent calls).
-bt_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True})
+bt_ex = ccxt.phemex({"options": {"defaultType": "swap"}, "enableRateLimit": True,
+                     "timeout": 8000})
 SYMBOL = None
 
 _last_good_price   = 0.0
@@ -2227,19 +2232,36 @@ def diagnostico():
             out[name] = {"ok": True, "info": fn()}
         except Exception as e:
             out[name] = {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:300]}"}
-    step("1_load_markets", lambda: f"{len(bt_ex.load_markets())} mercados")
-    step("2_ticker",       lambda: f"last={ticker_ex.fetch_ticker(sym)['last']}")
-    step("3_candles_30m",  lambda: f"{len(bt_ex.fetch_ohlcv(sym, timeframe='30m', limit=10))} candles")
-    step("4_candles_1m",   lambda: f"{len(bt_ex.fetch_ohlcv(sym, timeframe='1m', limit=10))} candles")
-    ok_geral = all(out[k]["ok"] for k in ("1_load_markets", "2_ticker",
-                                          "3_candles_30m", "4_candles_1m"))
-    out["conclusao"] = ("Phemex OK deste servidor — se ainda não houver trades, "
-                        "confira se a strategy está Iniciada e aguarde o próximo "
-                        "candle de 30m" if ok_geral else
-                        "Phemex NÃO responde deste servidor — veja o erro acima. "
-                        "403/451 = IP/região bloqueada (na Render, troque a região "
-                        "do serviço, ex. Frankfurt/Singapore); RateLimit/Timeout = "
-                        "tente de novo em 1 min")
+    # Passos com timeout CURTO e HTTP cru (sem ccxt): o gunicorn mata o worker
+    # em ~30 s — o diagnóstico inteiro tem que caber nisso MESMO com tudo
+    # falhando (6+8+8 = 22 s no pior caso), senão o próprio diagnóstico derruba
+    # o bot. E o IP/país de saída prova em qual região o serviço está de fato.
+    step("1_ip_saida", lambda: {k: req.get("https://ipwho.is/", timeout=6).json().get(k)
+                                for k in ("ip", "country", "city")})
+    step("2_phemex_products", lambda: (lambda r:
+         f"HTTP {r.status_code} em {r.elapsed.total_seconds():.1f}s")(
+         req.get("https://api.phemex.com/public/products", timeout=8)))
+    step("3_phemex_ticker", lambda: (lambda r:
+         f"HTTP {r.status_code} em {r.elapsed.total_seconds():.1f}s")(
+         req.get("https://api.phemex.com/md/v2/ticker/24hr?symbol=ETHUSDT",
+                 timeout=8)))
+    ok_net    = out["1_ip_saida"]["ok"]
+    ok_phemex = (out["2_phemex_products"]["ok"]
+                 and "HTTP 200" in str(out["2_phemex_products"].get("info", "")))
+    if ok_phemex:
+        out["conclusao"] = ("Phemex RESPONDE deste servidor. Se o bot segue sem preço/"
+                            "candles, reinicie o serviço na Render e clique Start; se o "
+                            "status mostrar 'Erro candles 30m', me mande o texto.")
+    elif ok_net:
+        out["conclusao"] = ("Internet OK mas a Phemex NÃO responde deste servidor (IP/"
+                            "região bloqueada). Olhe 1_ip_saida: se country NÃO for "
+                            "Singapore, a região não mudou de verdade — na Render é "
+                            "preciso CRIAR UM SERVIÇO NOVO na região desejada (não dá "
+                            "pra mudar um existente). Se já for Singapore, a Phemex está "
+                            "bloqueando os IPs desse datacenter — teste outra hospedagem.")
+    else:
+        out["conclusao"] = ("Sem internet de saída no servidor — problema na hospedagem, "
+                            "não no bot.")
     return jsonify(out)
 
 @app.route("/start", methods=["POST"])
