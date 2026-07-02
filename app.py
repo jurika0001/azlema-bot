@@ -1015,17 +1015,40 @@ threading.Thread(target=price_poller, daemon=True).start()
 # data allows. Runs in a background thread; the UI polls /backtest-result.
 _backtest = {"running": False, "progress": "", "result": None, "error": None}
 
+# Última falha de fetch do backtest — vai pro erro mostrado NA TELA. Antes a
+# causa real (rate-limit, timeout, geo-block…) ficava só no log do servidor e a
+# UI dizia apenas "poucos candles de 30m", sem explicar o porquê.
+_bt_fetch_err = None
+
+def _bt_fetch(tf, since, tries=3):
+    """Uma página de OHLCV com RETRY. Um rate-limit/timeout transitório da
+    Phemex NÃO pode abortar a paginação inteira — era isso que fazia o backtest
+    'não funcionar': a 1ª exceção quebrava o loop e sobravam poucos candles."""
+    global _bt_fetch_err
+    for a in range(tries):
+        try:
+            return bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe=tf,
+                                     since=int(since), limit=1000)
+        except Exception as e:
+            _bt_fetch_err = f"{type(e).__name__}: {str(e)[:200]}"
+            logger.warning(f"[BT] {tf} fetch tentativa {a+1}/{tries}: {_bt_fetch_err}")
+            if a < tries - 1:
+                time_mod.sleep(1.5 * (a + 1))
+    return None
+
+def _few_candles_msg(got):
+    m = f"poucos candles de 30m da Phemex (recebi {got})"
+    if _bt_fetch_err:
+        m += f" — último erro do fetch: {_bt_fetch_err}"
+    return m
+
 def _fetch_30m_candles(n):
     """Paginated 30m fetch — supports UNLIMITED n (e.g. a year = 17 520 candles),
     since Phemex caps each request at ~1000."""
     now_ms = int(time_mod.time() * 1000)
     out, cur = [], now_ms - int(n) * 1_800_000
     for _ in range(400):                       # safety cap on pages (~400k candles)
-        try:
-            rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="30m",
-                                     since=cur, limit=1000)
-        except Exception as e:
-            logger.warning(f"[BT] 30m fetch: {type(e).__name__}: {e}"); break
+        rows = _bt_fetch("30m", cur)
         if not rows: break
         out.extend(rows)
         last = rows[-1][0]
@@ -1038,11 +1061,7 @@ def _fetch_30m_candles(n):
 def _fetch_1m_candles(since_ms, until_ms):
     out, cur = [], int(since_ms)
     for _ in range(2000):                      # safety cap on pages (~2M minutes ≈ 3.8 yr)
-        try:
-            rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe="1m",
-                                     since=cur, limit=1000)
-        except Exception as e:
-            logger.warning(f"[BT] 1m fetch: {type(e).__name__}: {e}"); break
+        rows = _bt_fetch("1m", cur)
         if not rows: break
         out.extend(rows)
         last = rows[-1][0]
@@ -1139,16 +1158,13 @@ def _fetch_range(tf: str, tf_ms: int, since_ms: int, until_ms: int):
     """Generic paginated OHLCV fetch for [since_ms, until_ms) at timeframe tf."""
     out, cur = [], int(since_ms)
     for _ in range(4000):
-        try:
-            rows = bt_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT", timeframe=tf,
-                                     since=cur, limit=1000)
-        except Exception as e:
-            logger.warning(f"[BT] {tf} fetch: {type(e).__name__}: {e}"); break
+        rows = _bt_fetch(tf, cur)
         if not rows: break
         out.extend(rows)
         last = rows[-1][0]
         if last <= cur or last >= until_ms: break
         cur = last + tf_ms
+        _backtest["progress"] = f"buscando candles de {tf}… ({len(out)})"
     seen = {r[0]: r for r in out}
     return [seen[k] for k in sorted(seen)]
 
@@ -1177,6 +1193,8 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
     covers the period that was actually recorded."""
     _backtest.update({"running": True, "result": None, "error": None,
                       "progress": "lendo ticks gravados…"})
+    global _bt_fetch_err
+    _bt_fetch_err = None
     try:
         ticks = _load_recorded_ticks()
         if len(ticks) < 100:
@@ -1194,7 +1212,7 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
         _backtest["progress"] = "buscando candles de 30m (sinais)…"
         c30 = _fetch_range("30m", 1_800_000, t0 - warm_ms, t1 + 1_800_000)
         if not c30 or len(c30) < 70:
-            raise RuntimeError("poucos candles de 30m da Phemex para os sinais")
+            raise RuntimeError(_few_candles_msg(len(c30) if c30 else 0))
 
         # Bucket the recorded prices by 30m candle boundary.
         tbuckets = {}
@@ -1265,6 +1283,8 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
 def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
     _backtest.update({"running": True, "result": None, "error": None,
                       "progress": "buscando candles de 30m…"})
+    global _bt_fetch_err
+    _bt_fetch_err = None
     try:
         try:
             bt_ex.load_markets()
@@ -1273,7 +1293,7 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
         warm = 200                                   # warmup bars so EC/EMA/period converge like TV
         c30  = _fetch_30m_candles(n_candles + warm)   # paginated → unlimited length
         if not c30 or len(c30) < 70:
-            raise RuntimeError("poucos candles de 30m da Phemex")
+            raise RuntimeError(_few_candles_msg(len(c30) if c30 else 0))
         c30 = c30[-(n_candles + warm):]
         # only the LAST n_candles are traded; the earlier ones are warmup-only
         start_i = max(60, len(c30) - 1 - n_candles)
@@ -1422,6 +1442,8 @@ def run_backtest_tv(n_candles=300, fee_entry=0.0, fee_exit=0.0):
     risk/(SL·mintick) igual ao Pine — é o modo pra comparar com o painel do TV."""
     _backtest.update({"running": True, "result": None, "error": None,
                       "progress": "buscando candles de 30m…"})
+    global _bt_fetch_err
+    _bt_fetch_err = None
     try:
         try:
             bt_ex.load_markets()
@@ -1430,7 +1452,7 @@ def run_backtest_tv(n_candles=300, fee_entry=0.0, fee_exit=0.0):
         warm = 200                                  # warmup pro EC/EMA convergir como no TV
         c30  = _fetch_30m_candles(n_candles + warm)
         if not c30 or len(c30) < 70:
-            raise RuntimeError("poucos candles de 30m da Phemex")
+            raise RuntimeError(_few_candles_msg(len(c30) if c30 else 0))
         c30 = c30[-(n_candles + warm):]
         _backtest["progress"] = "calculando sinais (EC×EMA por candle)…"
         signals = strat.calculate_series([r[4] for r in c30],
