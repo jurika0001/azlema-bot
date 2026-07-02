@@ -43,20 +43,30 @@ TRAIL_OFFSET = 15      # Pine trail_offset  (literal 15)   → trail OFFSET     
 # %s). See _calc_qty.
 
 # ── Editable config (persisted to config.json) ──────────────────────────────
-# POINT counts (sl/tp/tr) + the SINGLE mintick + the Gain Limit. Every exit
-# distance = its point count × the ONE mintick (Pine-faithful). Defaults
-# 2000/55/15 pts × 0.01 → SL=$20, TP-activation=$0.55, trail=$0.15.
+# POINT counts (sl/tp/tr) SEPARADOS por lado — LONG usa sl_pts/tp_pts/tr_pts e
+# SHORT usa sl_pts_short/tp_pts_short/tr_pts_short (pedido do usuário
+# 2026-07-01) — + the SINGLE mintick + the Gain Limit. Every exit distance =
+# its point count × the ONE mintick (Pine-faithful).
 CONFIG_FILE = "config.json"
 def _default_config():
     # User-chosen defaults (2026-07-01): SL 2000pt·$200.00, TP-activation 55pt·$5.50,
     # trail 15pt·$1.50, Gain Limit 1000, mintick 0.1. (Distances = points × mintick.)
+    # LONG e SHORT partem iguais; cada lado é editável separadamente na UI.
     return {"sl_pts": 2000, "tp_pts": 55, "tr_pts": 15,
+            "sl_pts_short": 2000, "tp_pts_short": 55, "tr_pts_short": 15,
             "mintick": 0.1,
             "gain_limit": 1000}
 def _load_config():
     try:
         with open(CONFIG_FILE) as f:
-            d = json.load(f); base = _default_config(); base.update(d); return base
+            d = json.load(f); base = _default_config(); base.update(d)
+            # migração: config.json antigo (sem os campos de SHORT) herda os
+            # valores do LONG que o usuário já tinha, não os defaults de fábrica
+            for lk, sk in (("sl_pts", "sl_pts_short"), ("tp_pts", "tp_pts_short"),
+                           ("tr_pts", "tr_pts_short")):
+                if sk not in d:
+                    base[sk] = base[lk]
+            return base
     except Exception:
         return _default_config()
 def _save_config():
@@ -66,17 +76,22 @@ def _save_config():
 
 config = _load_config()
 
-# SL_DIST / TP_DIST / TR_DIST ($) are what the exit logic reads. _apply_config
-# converts the editable POINT counts → $ distances using the ONE shared mintick
-# (called on load + every save). MINTICK mirrors the active tick for display.
-SL_DIST = TP_DIST = TR_DIST = 0.0
+# SL_DIST / TP_DIST / TR_DIST ($, lado LONG) e SL_DIST_S / TP_DIST_S / TR_DIST_S
+# ($, lado SHORT) are what the exit logic reads. _apply_config converts the
+# editable POINT counts → $ distances using the ONE shared mintick (called on
+# load + every save). MINTICK mirrors the active tick for display.
+SL_DIST = TP_DIST = TR_DIST = 0.0            # LONG
+SL_DIST_S = TP_DIST_S = TR_DIST_S = 0.0      # SHORT (pontos próprios, mesmo mintick)
 MINTICK = MINTICK_DEFAULT
 def _apply_config():
-    global SL_DIST, TP_DIST, TR_DIST, MINTICK
-    MINTICK = float(config["mintick"])
-    SL_DIST = round(float(config["sl_pts"]) * MINTICK, 8)
-    TP_DIST = round(float(config["tp_pts"]) * MINTICK, 8)
-    TR_DIST = round(float(config["tr_pts"]) * MINTICK, 8)
+    global SL_DIST, TP_DIST, TR_DIST, SL_DIST_S, TP_DIST_S, TR_DIST_S, MINTICK
+    MINTICK   = float(config["mintick"])
+    SL_DIST   = round(float(config["sl_pts"]) * MINTICK, 8)
+    TP_DIST   = round(float(config["tp_pts"]) * MINTICK, 8)
+    TR_DIST   = round(float(config["tr_pts"]) * MINTICK, 8)
+    SL_DIST_S = round(float(config["sl_pts_short"]) * MINTICK, 8)
+    TP_DIST_S = round(float(config["tp_pts_short"]) * MINTICK, 8)
+    TR_DIST_S = round(float(config["tr_pts_short"]) * MINTICK, 8)
 _apply_config()
 
 # ── Exit evaluation mode ─────────────────────────────────────────────────
@@ -241,8 +256,9 @@ def init_markets():
 
     # ── SL/TP/trail distances come from the editable config (config.json / UI) ──
     _apply_config()
-    logger.info(f"[INIT] SL=${SL_DIST}  trail-activation=${TP_DIST}  "
-                f"trail-offset=${TR_DIST}  (editable in the dashboard)")
+    logger.info(f"[INIT] LONG SL=${SL_DIST} act=${TP_DIST} off=${TR_DIST}  |  "
+                f"SHORT SL=${SL_DIST_S} act=${TP_DIST_S} off=${TR_DIST_S}  "
+                f"(editable in the dashboard)")
     # Warm up ticker_ex once at init so the first loop iteration isn't 0.0
     try:
         warm = float(ticker_ex.fetch_ticker(SYMBOL)["last"])
@@ -425,17 +441,17 @@ def _check_sl_tp(pos, cur_price: float):
         sl = round(entry - SL_DIST, 8)               # FIXED stop-loss (Pine `loss`)
         if cur_price <= sl:
             return True, sl, "SL"
-    else:
+    else:                                            # SHORT usa os pontos próprios (*_S)
         if pos["peak"] == 0 or cur_price < pos["peak"]:
             pos["peak"] = cur_price
-        if entry - pos["peak"] >= TP_DIST:
-            nt = round(pos["peak"] + TR_DIST, 8)
+        if entry - pos["peak"] >= TP_DIST_S:
+            nt = round(pos["peak"] + TR_DIST_S, 8)
             if not pos["trail_active"] or nt < pos["trail_stop"]:
                 pos["trail_active"] = True
                 pos["trail_stop"]   = nt
         if pos["trail_active"] and cur_price >= pos["trail_stop"]:
             return True, pos["trail_stop"], "TRAIL_TP"
-        sl = round(entry + SL_DIST, 8)               # FIXED stop-loss (Pine `loss`)
+        sl = round(entry + SL_DIST_S, 8)             # FIXED stop-loss (Pine `loss`)
         if cur_price >= sl:
             return True, sl, "SL"
 
@@ -505,8 +521,8 @@ def _check_sl_tp_candle(o: float, h: float, l: float, c: float):
             if ex[0]:
                 return ex
 
-    else:  # short
-        sl = round(entry + SL_DIST, 8)
+    else:  # short — usa os pontos próprios (*_S)
+        sl = round(entry + SL_DIST_S, 8)
 
         def hit_high():
             if paper["trail_active"]:
@@ -519,8 +535,8 @@ def _check_sl_tp_candle(o: float, h: float, l: float, c: float):
         def advance_low():
             if paper["peak"] == 0 or l < paper["peak"]:
                 paper["peak"] = l
-            if entry - paper["peak"] >= TP_DIST:
-                nt = round(paper["peak"] + TR_DIST, 8)
+            if entry - paper["peak"] >= TP_DIST_S:
+                nt = round(paper["peak"] + TR_DIST_S, 8)
                 if not paper["trail_active"] or nt < paper["trail_stop"]:
                     paper["trail_active"] = True
                     paper["trail_stop"]   = nt
@@ -1193,7 +1209,6 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
                                          int(config.get("gain_limit", 900)))
 
         _backtest["progress"] = "simulando trades (replay de ticks reais)…"
-        sl, tp, tr = SL_DIST, TP_DIST, TR_DIST
         bal = PAPER_START_BAL; trades = []; wins = 0; skipped = 0
         for i in range(60, len(c30) - 1):
             sig = signals[i]
@@ -1235,7 +1250,8 @@ def run_backtest_ticks(fee_entry=0.0, fee_exit=0.0):
             "max_loss":   round(min(rets), 3) if rets else 0.0,
             "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,
             "fee_entry": fee_entry, "fee_exit": fee_exit,
-            "sl": sl, "tp": tp, "tr": tr,
+            "sl": SL_DIST, "tp": TP_DIST, "tr": TR_DIST,
+            "sl_short": SL_DIST_S, "tp_short": TP_DIST_S, "tr_short": TR_DIST_S,
             "source": "ticks_reais_gravados",
             "ticks_loaded": len(ticks),
             "recorded_hours": span_h,          # how much real time was recorded
@@ -1277,7 +1293,6 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
         signals = strat.calculate_series([c[4] for c in c30], int(config.get("gain_limit", 900)))
 
         _backtest["progress"] = "simulando trades (replay 1m)…"
-        sl, tp, tr = SL_DIST, TP_DIST, TR_DIST
         bal = PAPER_START_BAL; trades = []; wins = 0
         for i in range(start_i, len(c30) - 1):
             sig = signals[i]
@@ -1315,7 +1330,9 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             "max_loss":   round(min(rets), 3) if rets else 0.0,   # biggest single-trade loss %
             "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,  # average % per trade
             "fee_entry": fee_entry, "fee_exit": fee_exit,
-            "candles": n_candles, "sl": sl, "tp": tp, "tr": tr,
+            "candles": n_candles,
+            "sl": SL_DIST, "tp": TP_DIST, "tr": TR_DIST,
+            "sl_short": SL_DIST_S, "tp_short": TP_DIST_S, "tr_short": TR_DIST_S,
             "intrabar_minutes_loaded": len(c1m),
             "intrabar_jag": INTRABAR_JAG,   # 0 = old straight-line; >0 = realistic wiggle
         }
@@ -1424,7 +1441,6 @@ def run_backtest_tv(n_candles=300, fee_entry=0.0, fee_exit=0.0):
                                          int(config.get("gain_limit", 900)))
 
         _backtest["progress"] = "simulando (emulador do Strategy Tester)…"
-        sl_d, tp_d, tr_d = SL_DIST, TP_DIST, TR_DIST
         bal    = PAPER_START_BAL
         pos    = None
         pend   = None
@@ -1463,19 +1479,24 @@ def run_backtest_tv(n_candles=300, fee_entry=0.0, fee_exit=0.0):
                           float(c30[i][3]), float(c30[i][4]))
 
             # 1) a ordem do candle anterior executa na ABERTURA deste candle
+            #    (cada lado usa os SEUS pontos de SL/TP/trailing)
             if pend and bal > 0:
                 side = "long" if pend == "LONG" else "short"
+                sl_d, tp_d, tr_d = ((SL_DIST, TP_DIST, TR_DIST) if side == "long"
+                                    else (SL_DIST_S, TP_DIST_S, TR_DIST_S))
                 qty  = (RISK * bal / sl_d) if sl_d else 0.0
                 pos  = {"side": side, "entry_price": o, "qty": min(qty, MAX_LOTS),
                         "peak": o, "trail_active": False, "trail_stop": 0.0,
-                        "mfe": 0.0, "mae": 0.0}
+                        "mfe": 0.0, "mae": 0.0,
+                        "sl_d": sl_d, "tp_d": tp_d, "tr_d": tr_d}
             pend = None
 
             # 2) trailing/SL agem ao longo do candle; se NENHUM bater, a trade
             #    fecha no CLOSE do candle (CANDLE_END) — toda trade vive dentro
             #    do próprio candle, como no TV do usuário.
             if pos:
-                ex, px, ex_rsn = _tv_walk_bar(pos, o, h, l, c, sl_d, tp_d, tr_d)
+                ex, px, ex_rsn = _tv_walk_bar(pos, o, h, l, c,
+                                              pos["sl_d"], pos["tp_d"], pos["tr_d"])
                 if ex:
                     _close(px, ex_rsn, ts)
                 else:
@@ -1498,7 +1519,9 @@ def run_backtest_tv(n_candles=300, fee_entry=0.0, fee_exit=0.0):
             "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,
             "avg_usd":    round(sum(usds) / n, 2) if n else 0.0,  # = "Avg P&L" do TV
             "fee_entry": fee_entry, "fee_exit": fee_exit,
-            "candles": n_candles, "sl": sl_d, "tp": tp_d, "tr": tr_d,
+            "candles": n_candles,
+            "sl": SL_DIST, "tp": TP_DIST, "tr": TR_DIST,
+            "sl_short": SL_DIST_S, "tp_short": TP_DIST_S, "tr_short": TR_DIST_S,
             "mintick": MINTICK, "gain_limit": int(config.get("gain_limit", 900)),
             "bars30m": len(c30) - start_i,
             "source": "tv_emulator",
@@ -1613,9 +1636,14 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
   </div>
 
   <div class="cfg-box">
-    <div><label>Stop Loss (pontos)</label><br><input id="cfg-sl" type="number" step="1" min="1"></div>
-    <div><label>TP ativação (pontos)</label><br><input id="cfg-tp" type="number" step="1" min="1"></div>
-    <div><label>Trailing (pontos)</label><br><input id="cfg-tr" type="number" step="1" min="1"></div>
+    <span class="badge long" style="align-self:center">LONG</span>
+    <div><label>SL Long (pontos)</label><br><input id="cfg-sl" type="number" step="1" min="1"></div>
+    <div><label>TP ativação Long (pontos)</label><br><input id="cfg-tp" type="number" step="1" min="1"></div>
+    <div><label>Trailing Long (pontos)</label><br><input id="cfg-tr" type="number" step="1" min="1"></div>
+    <span class="badge short" style="align-self:center">SHORT</span>
+    <div><label>SL Short (pontos)</label><br><input id="cfg-sl-s" type="number" step="1" min="1"></div>
+    <div><label>TP ativação Short (pontos)</label><br><input id="cfg-tp-s" type="number" step="1" min="1"></div>
+    <div><label>Trailing Short (pontos)</label><br><input id="cfg-tr-s" type="number" step="1" min="1"></div>
     <div><label>Gain Limit</label><br><input id="cfg-gl" type="number" step="1" min="1"></div>
     <div><label>Mintick (tick)</label><br><input id="cfg-mt" type="number" step="0.001" min="0.0001"></div>
     <button id="btn-cfg" onclick="saveConfig()">Salvar Config</button>
@@ -1762,16 +1790,23 @@ function loadConfig(){
     document.getElementById('cfg-sl').value=d.sl_pts;
     document.getElementById('cfg-tp').value=d.tp_pts;
     document.getElementById('cfg-tr').value=d.tr_pts;
+    document.getElementById('cfg-sl-s').value=d.sl_pts_short;
+    document.getElementById('cfg-tp-s').value=d.tp_pts_short;
+    document.getElementById('cfg-tr-s').value=d.tr_pts_short;
     document.getElementById('cfg-gl').value=d.gain_limit;
     document.getElementById('cfg-mt').value=d.mintick;
     document.getElementById('cfg-eq').textContent=
-      `mintick ${d.mintick} → SL $${d.sl_dist} · TP $${d.tp_dist} · Trail $${d.tr_dist}  (vale pro bot e backtest)`;
+      `mintick ${d.mintick} → LONG: SL $${d.sl_dist} · TP $${d.tp_dist} · Trail $${d.tr_dist} | `+
+      `SHORT: SL $${d.sl_dist_short} · TP $${d.tp_dist_short} · Trail $${d.tr_dist_short}  (vale pro bot e backtest)`;
   });
 }
 async function saveConfig(){
   const body={sl_pts:parseFloat(document.getElementById('cfg-sl').value),
               tp_pts:parseFloat(document.getElementById('cfg-tp').value),
               tr_pts:parseFloat(document.getElementById('cfg-tr').value),
+              sl_pts_short:parseFloat(document.getElementById('cfg-sl-s').value),
+              tp_pts_short:parseFloat(document.getElementById('cfg-tp-s').value),
+              tr_pts_short:parseFloat(document.getElementById('cfg-tr-s').value),
               mintick:parseFloat(document.getElementById('cfg-mt').value),
               gain_limit:parseInt(document.getElementById('cfg-gl').value)};
   const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1962,17 +1997,24 @@ def settings():
 
 @app.route("/config", methods=["GET"])
 def get_config():
-    # POINT counts (editable) + the resulting $ distances (read-only display)
+    # POINT counts (editable, LONG + SHORT) + the resulting $ distances (display)
     return jsonify({"sl_pts": config["sl_pts"], "tp_pts": config["tp_pts"],
-                    "tr_pts": config["tr_pts"], "mintick": config.get("mintick", MINTICK_DEFAULT),
+                    "tr_pts": config["tr_pts"],
+                    "sl_pts_short": config["sl_pts_short"],
+                    "tp_pts_short": config["tp_pts_short"],
+                    "tr_pts_short": config["tr_pts_short"],
+                    "mintick": config.get("mintick", MINTICK_DEFAULT),
                     "gain_limit": config.get("gain_limit", 900),
-                    "sl_dist": SL_DIST, "tp_dist": TP_DIST, "tr_dist": TR_DIST})
+                    "sl_dist": SL_DIST, "tp_dist": TP_DIST, "tr_dist": TR_DIST,
+                    "sl_dist_short": SL_DIST_S, "tp_dist_short": TP_DIST_S,
+                    "tr_dist_short": TR_DIST_S})
 
 @app.route("/config", methods=["POST"])
 def set_config():
     """Edit the exit distances in POINTS + the strategy Gain Limit."""
     data = request.get_json() or {}
-    for k in ("sl_pts", "tp_pts", "tr_pts"):
+    for k in ("sl_pts", "tp_pts", "tr_pts",
+              "sl_pts_short", "tp_pts_short", "tr_pts_short"):
         if k in data:
             try:
                 v = float(data[k])
@@ -1993,12 +2035,19 @@ def set_config():
             return jsonify({"ok": False, "message": "Gain Limit inválido"})
     _save_config()
     _apply_config()
-    logger.info(f"[CONFIG] SL={config['sl_pts']}pt(${SL_DIST}) "
-                f"TP={config['tp_pts']}pt(${TP_DIST}) trail={config['tr_pts']}pt(${TR_DIST})")
+    logger.info(f"[CONFIG] LONG SL={config['sl_pts']}pt(${SL_DIST}) "
+                f"TP={config['tp_pts']}pt(${TP_DIST}) trail={config['tr_pts']}pt(${TR_DIST})  "
+                f"SHORT SL={config['sl_pts_short']}pt(${SL_DIST_S}) "
+                f"TP={config['tp_pts_short']}pt(${TP_DIST_S}) "
+                f"trail={config['tr_pts_short']}pt(${TR_DIST_S})")
     return jsonify({"ok": True,
-                    "message": f"Config (mintick {MINTICK}): SL={config['sl_pts']}pt (${SL_DIST}) · "
-                               f"TP={config['tp_pts']}pt (${TP_DIST}) · "
-                               f"Trail={config['tr_pts']}pt (${TR_DIST}) · "
+                    "message": f"Config (mintick {MINTICK}): "
+                               f"LONG SL {config['sl_pts']}pt (${SL_DIST}) · "
+                               f"TP {config['tp_pts']}pt (${TP_DIST}) · "
+                               f"Trail {config['tr_pts']}pt (${TR_DIST}) — "
+                               f"SHORT SL {config['sl_pts_short']}pt (${SL_DIST_S}) · "
+                               f"TP {config['tp_pts_short']}pt (${TP_DIST_S}) · "
+                               f"Trail {config['tr_pts_short']}pt (${TR_DIST_S}) · "
                                f"GainLimit={config.get('gain_limit', 900)}"})
 
 @app.route("/backtest", methods=["POST"])
@@ -2088,9 +2137,12 @@ def debug_ticker():
         "peak":              paper["peak"],
         "trail_active":      paper["trail_active"],
         "trail_stop":        paper["trail_stop"],
-        "sl_dist":           SL_DIST,
+        "sl_dist":           SL_DIST,       # LONG
         "tp_activation_dist": TP_DIST,
         "trail_offset_dist": TR_DIST,
+        "sl_dist_short":      SL_DIST_S,    # SHORT (pontos próprios)
+        "tp_activation_dist_short": TP_DIST_S,
+        "trail_offset_dist_short":  TR_DIST_S,
         "mintick":           MINTICK,      # ONE tick for SL, TP and trailing
     })
 
