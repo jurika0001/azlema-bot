@@ -1328,6 +1328,190 @@ def run_backtest(n_candles=300, fee_entry=0.0, fee_exit=0.0):
         _backtest.update({"running": False, "progress": "erro",
                           "error": f"{type(e).__name__}: {e}"})
 
+# ── Emulador do TradingView (fonte "tv") ─────────────────────────────────────
+# Reproduz o backtest do TradingView COMO O USUÁRIO O OBSERVOU rodando ao vivo
+# via webhook (Pine v3, calc_on_every_tick=false, sem bar magnifier):
+#   • TODA trade vive DENTRO do seu candle: entra na ABERTURA do candle seguinte
+#     ao sinal, o trailing/SL agem ao longo do candle e, se NENHUM dos dois
+#     bater, fecha no CLOSE do candle (CANDLE_END). Confirmado pelo usuário
+#     (2026-07-01, com certeza absoluta): no TV dele toda trade fecha no mesmo
+#     candle — NÃO reintroduzir posição multi-candle aqui.
+#   • caminho intra-candle do broker emulator: o extremo mais PRÓXIMO da
+#     abertura é visitado primeiro (O→H→L→C se o high está mais perto do open,
+#     senão O→L→H→C) — regra documentada do TV, sem pullbacks inventados;
+#   • sizing do Pine: qty = risk·saldo/(fixedSL·mintick), cap em MAX_LOTS,
+#     saldo = capital inicial + lucro realizado (compounding igual ao TV).
+def _tv_walk_bar(pos, o, h, l, c, sl_d, tp_d, tr_d):
+    """Anda um candle de 30m pelos pivôs do broker emulator, armando/arrastando
+    o trailing ao longo do candle. Atualiza peak/trail_stop/mfe/mae em `pos` e
+    retorna (saiu, preço, motivo). Se retornar False, quem chama fecha a trade
+    no close do candle (CANDLE_END)."""
+    is_long = pos["side"] == "long"
+    entry   = pos["entry_price"]
+    fixed   = entry - sl_d if is_long else entry + sl_d
+
+    def _stop():
+        return pos["trail_stop"] if pos["trail_active"] else fixed
+
+    def _fav(px):                    # movimento a favor: ratchet do trailing
+        if is_long:
+            if px > pos["peak"]:
+                pos["peak"] = px
+            if pos["peak"] - entry >= tp_d:
+                nt = round(pos["peak"] - tr_d, 8)
+                if not pos["trail_active"] or nt > pos["trail_stop"]:
+                    pos["trail_active"], pos["trail_stop"] = True, nt
+        else:
+            if px < pos["peak"]:
+                pos["peak"] = px
+            if entry - pos["peak"] >= tp_d:
+                nt = round(pos["peak"] + tr_d, 8)
+                if not pos["trail_active"] or nt < pos["trail_stop"]:
+                    pos["trail_active"], pos["trail_stop"] = True, nt
+
+    def _exc(px):                    # excursão máx. favorável/adversa (%)
+        d   = (px - entry) if is_long else (entry - px)
+        pct = d / entry * 100 if entry else 0.0
+        if pct > pos["mfe"]: pos["mfe"] = pct
+        if pct < pos["mae"]: pos["mae"] = pct
+
+    def _rsn():
+        return "TRAIL_TP" if pos["trail_active"] else "SL"
+
+    # gap na abertura: abriu além do stop → preenche na própria abertura
+    _exc(o)
+    s = _stop()
+    if (is_long and o <= s) or (not is_long and o >= s):
+        return True, o, _rsn()
+    _fav(o)
+
+    pts = [h, l, c] if (h - o) < (o - l) else [l, h, c]
+    cur = o
+    for px in pts:
+        contra = (px < cur) if is_long else (px > cur)
+        if contra:
+            s = _stop()
+            if (is_long and px <= s) or (not is_long and px >= s):
+                _exc(s)
+                return True, s, _rsn()
+            _exc(px)
+        else:
+            _fav(px)
+            _exc(px)
+        cur = px
+    return False, 0.0, ""
+
+def run_backtest_tv(n_candles=300, fee_entry=0.0, fee_exit=0.0):
+    """Backtest "tv": emula o TradingView candle a candle (30m O/H/L/C, sem
+    sub-candles): entrada no OPEN do candle seguinte ao sinal, trailing/SL pelo
+    caminho do broker emulator e, se nada bater, CANDLE_END no close — toda
+    trade fecha no próprio candle, como o usuário observou no TV. Sizing
+    risk/(SL·mintick) igual ao Pine — é o modo pra comparar com o painel do TV."""
+    _backtest.update({"running": True, "result": None, "error": None,
+                      "progress": "buscando candles de 30m…"})
+    try:
+        try:
+            bt_ex.load_markets()
+        except Exception as e:
+            logger.warning(f"[BT-TV] load_markets: {type(e).__name__}: {e}")
+        warm = 200                                  # warmup pro EC/EMA convergir como no TV
+        c30  = _fetch_30m_candles(n_candles + warm)
+        if not c30 or len(c30) < 70:
+            raise RuntimeError("poucos candles de 30m da Phemex")
+        c30 = c30[-(n_candles + warm):]
+        _backtest["progress"] = "calculando sinais (EC×EMA por candle)…"
+        signals = strat.calculate_series([r[4] for r in c30],
+                                         int(config.get("gain_limit", 900)))
+
+        _backtest["progress"] = "simulando (emulador do Strategy Tester)…"
+        sl_d, tp_d, tr_d = SL_DIST, TP_DIST, TR_DIST
+        bal    = PAPER_START_BAL
+        pos    = None
+        pend   = None
+        trades = []
+        wins   = 0
+
+        def _fmt(ts):
+            return datetime.fromtimestamp(ts / 1000, tz=timezone.utc) \
+                           .strftime("%Y-%m-%d %H:%M UTC")
+
+        def _close(px, reason, ts):
+            nonlocal bal, pos, wins
+            entry, qty = pos["entry_price"], pos["qty"]
+            raw = (px - entry) * qty if pos["side"] == "long" else (entry - px) * qty
+            raw -= (entry * qty * fee_entry / 100) + (px * qty * fee_exit / 100)
+            bal += raw
+            notional = entry * qty
+            pct = (raw / notional * 100) if notional else 0.0
+            if pct > 0:
+                wins += 1
+            trades.append({
+                "candle":  _fmt(ts),
+                "side":    "LONG" if pos["side"] == "long" else "SHORT",
+                "entry":   round(entry, 2), "exit": round(px, 2),
+                "reason":  reason, "pnl_pct": round(pct, 3),
+                "pnl_usd": round(raw, 2),
+                "mfe": round(pos["mfe"], 3), "mae": round(pos["mae"], 3),
+                "balance": round(bal, 2),
+            })
+            pos = None
+
+        start_i = max(61, len(c30) - n_candles)
+        for i in range(start_i, len(c30)):
+            ts = c30[i][0]
+            o, h, l, c = (float(c30[i][1]), float(c30[i][2]),
+                          float(c30[i][3]), float(c30[i][4]))
+
+            # 1) a ordem do candle anterior executa na ABERTURA deste candle
+            if pend and bal > 0:
+                side = "long" if pend == "LONG" else "short"
+                qty  = (RISK * bal / sl_d) if sl_d else 0.0
+                pos  = {"side": side, "entry_price": o, "qty": min(qty, MAX_LOTS),
+                        "peak": o, "trail_active": False, "trail_stop": 0.0,
+                        "mfe": 0.0, "mae": 0.0}
+            pend = None
+
+            # 2) trailing/SL agem ao longo do candle; se NENHUM bater, a trade
+            #    fecha no CLOSE do candle (CANDLE_END) — toda trade vive dentro
+            #    do próprio candle, como no TV do usuário.
+            if pos:
+                ex, px, ex_rsn = _tv_walk_bar(pos, o, h, l, c, sl_d, tp_d, tr_d)
+                if ex:
+                    _close(px, ex_rsn, ts)
+                else:
+                    _close(c, "CANDLE_END", ts)
+
+            # 3) sinal no fechamento vira ordem pro próximo candle
+            if signals[i]:
+                pend = signals[i]
+
+        n    = len(trades)
+        rets = [t["pnl_pct"] for t in trades]
+        usds = [t["pnl_usd"] for t in trades]
+        summary = {
+            "trades": n,
+            "winrate": round(wins / n * 100, 1) if n else 0.0,
+            "final_balance": round(bal, 2),
+            "total_pnl_pct": round((bal - PAPER_START_BAL) / PAPER_START_BAL * 100, 2),
+            "max_profit": round(max(rets), 3) if rets else 0.0,
+            "max_loss":   round(min(rets), 3) if rets else 0.0,
+            "avg_pct":    round(sum(rets) / n, 3) if n else 0.0,
+            "avg_usd":    round(sum(usds) / n, 2) if n else 0.0,  # = "Avg P&L" do TV
+            "fee_entry": fee_entry, "fee_exit": fee_exit,
+            "candles": n_candles, "sl": sl_d, "tp": tp_d, "tr": tr_d,
+            "mintick": MINTICK, "gain_limit": int(config.get("gain_limit", 900)),
+            "bars30m": len(c30) - start_i,
+            "source": "tv_emulator",
+        }
+        _backtest.update({"running": False, "progress": "concluído (emulador TV)",
+                          "result": {"summary": summary, "trades": trades[::-1]}})
+        logger.info(f"[BT-TV] {n} trades, bal={bal:.2f}, "
+                    f"pnl={summary['total_pnl_pct']}%")
+    except Exception as e:
+        logger.error(f"[BT-TV] {type(e).__name__}: {e}")
+        _backtest.update({"running": False, "progress": "erro",
+                          "error": f"{type(e).__name__}: {e}"})
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FLASK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1497,9 +1681,10 @@ footer{text-align:center;color:#484f58;font-size:.71rem;margin:28px 0 14px}
         <div><label>Fonte</label><br>
           <select id="bt-source">
             <option value="synthetic">Candles 1m (qualquer período)</option>
+            <option value="tv">Emulador TradingView (Strategy Tester)</option>
             <option value="ticks">Ticks reais gravados (1:1 com paper)</option>
           </select></div>
-        <span class="cfg-hint">"Ticks reais" só cobre o período gravado (precisa RECORD_TICKS=1). É o mais fiel ao paper trading.</span>
+        <span class="cfg-hint">"Emulador TradingView" = candle 30m puro (O/H/L/C): entra na abertura do candle seguinte, trailing/SL agem no candle e fecha no fim do candle se nada bater — é o modo pra comparar com o TV. "Ticks reais" só cobre o período gravado (precisa RECORD_TICKS=1); é o mais fiel ao paper trading.</span>
         <div><label>Candles de 30m</label><br>
           <input id="bt-candles" type="number" step="10" min="50" max="35040" value="300"></div>
         <span class="cfg-hint">300 ≈ 6 dias · 1440 ≈ 1 mês · 17520 ≈ 1 ano (longo demora minutos) — só p/ fonte "Candles 1m"</span>
@@ -1599,7 +1784,7 @@ let btTimer=null;
 function btBadge(r){
   if(r==='TRAIL_TP')return '<span class="badge tp">TRAIL_TP</span>';
   if(r==='SL')return '<span class="badge slr">SL</span>';
-  return '<span class="badge ce">CANDLE_END</span>';
+  return '<span class="badge ce">'+r+'</span>';
 }
 async function runBacktest(){
   const n=parseInt(document.getElementById('bt-candles').value)||300;
@@ -1632,13 +1817,17 @@ function renderBacktest(res){
   const pl=document.getElementById('bt-pnl');
   pl.textContent=s.total_pnl_pct+'%';pl.className='val '+(s.total_pnl_pct>=0?'pos-num':'neg-num');
   const avg=document.getElementById('bt-avg');
-  avg.textContent=s.avg_pct+'%';avg.className='val '+(s.avg_pct>=0?'pos-num':'neg-num');
+  avg.textContent=s.avg_pct+'%'+(s.avg_usd!==undefined?' ($'+s.avg_usd+')':'');
+  avg.className='val '+(s.avg_pct>=0?'pos-num':'neg-num');
   document.getElementById('bt-max').textContent='+'+s.max_profit+'%';
   document.getElementById('bt-max').className='val pos-num';
   document.getElementById('bt-min').textContent=s.max_loss+'%';
   document.getElementById('bt-min').className='val neg-num';
   document.getElementById('bt-bal').textContent='$'+s.final_balance;
-  document.getElementById('bt-1m').textContent=s.intrabar_minutes_loaded;
+  document.getElementById('bt-1m').textContent=
+    s.intrabar_minutes_loaded!==undefined?s.intrabar_minutes_loaded:
+    (s.bars30m!==undefined?s.bars30m+' ×30m':
+    (s.ticks_loaded!==undefined?s.ticks_loaded+' ticks':'—'));
   const tb=document.getElementById('bt-tbody');
   tb.innerHTML=res.trades.length?res.trades.map(r=>`<tr>
     <td style="font-size:.73rem">${r.candle}</td>
@@ -1832,9 +2021,15 @@ def backtest():
     try: fx = max(0.0, float(data.get("fee_exit", fees["exit"])))
     except Exception: pass
     # source: "synthetic" (1m candles + realistic path — works for any length,
-    # any period) or "ticks" (replay the REAL recorded 1s stream — 1:1 with paper
+    # any period), "tv" (TradingView Strategy Tester emulator — multi-candle
+    # positions, no CANDLE_END, Pine sizing; the mode to compare with the TV
+    # panel) or "ticks" (replay the REAL recorded 1s stream — 1:1 with paper
     # trading, but only for the period RECORD_TICKS captured).
     source = str(data.get("source", "synthetic")).lower()
+    if source == "tv":
+        threading.Thread(target=run_backtest_tv, args=(n, fe, fx), daemon=True).start()
+        return jsonify({"ok": True,
+                        "message": f"Backtest emulador TradingView ({n} candles) iniciado"})
     if source == "ticks":
         if not RECORD_TICKS and not _load_recorded_ticks():
             return jsonify({"ok": False, "message":
