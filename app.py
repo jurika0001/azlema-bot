@@ -222,6 +222,7 @@ _last_good_price   = 0.0
 _ticker_fail_count = 0
 _jump_reject_count = 0     # consecutive jump-filter rejects → resync after a few
 _MAX_TICK_JUMP_PCT = 1.5   # ETH/USDT should not move >1.5% in a single second
+_ohlcv_last_err    = None  # último erro do fetch de candles 30m — vai pro dashboard
 
 # ── Real-time concurrency ────────────────────────────────────────────────
 # trade_lock serializes EVERY mutation of the `paper` position so the
@@ -315,15 +316,26 @@ def get_live_price() -> float:
         return _last_good_price
 
 def fetch_candles(limit=CANDLES):
-    try:
-        since = int((time_mod.time() - limit * 1800) * 1000)
-        rows  = live_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT",
-                                     timeframe="30m", since=since, limit=limit)
-        if rows and len(rows) >= 70:
-            return rows
-        logger.warning(f"[OHLCV] only {len(rows) if rows else 0} candles")
-    except Exception as e:
-        logger.error(f"[OHLCV] {e}")
+    """Candles de 30m pro bot ao vivo, com RETRY (igual ao backtest): uma falha
+    transitória da Phemex não pode deixar o bot um ciclo inteiro sem sinal. O
+    último erro fica em _ohlcv_last_err e aparece NO DASHBOARD (status) — sem
+    candles não há trade, e antes isso ficava invisível ("Running" mudo)."""
+    global _ohlcv_last_err
+    since = int((time_mod.time() - limit * 1800) * 1000)
+    for a in range(3):
+        try:
+            rows = live_ex.fetch_ohlcv(SYMBOL or "ETH/USDT:USDT",
+                                       timeframe="30m", since=since, limit=limit)
+            if rows and len(rows) >= 70:
+                _ohlcv_last_err = None
+                return rows
+            _ohlcv_last_err = f"Phemex retornou só {len(rows) if rows else 0} candles"
+            logger.warning(f"[OHLCV] {_ohlcv_last_err}")
+        except Exception as e:
+            _ohlcv_last_err = f"{type(e).__name__}: {str(e)[:200]}"
+            logger.error(f"[OHLCV] tentativa {a+1}/3: {_ohlcv_last_err}")
+        if a < 2:
+            time_mod.sleep(1.5 * (a + 1))
     return []
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -746,7 +758,10 @@ def on_live_price(price: float, from_ws: bool = False):
         "total_pnl_pct": f"{paper['total_pnl_pct']:+.2f}",
         "trail_stop":    trail_disp,
         "position":      paper["side"],
-        "status":        "Running",
+        # o preço pode estar vivo com o fetch de candles morto — sem candles não
+        # há sinal nem trade, então o status TEM que mostrar esse erro
+        "status":        ("Running" if not _ohlcv_last_err
+                          else ("Erro candles 30m: " + _ohlcv_last_err)[:110]),
     })
 
 
@@ -860,6 +875,11 @@ def strategy_loop():
             if now - last_ohlcv_check >= 15:
                 last_ohlcv_check = now
                 ohlcv = fetch_candles()
+                if not ohlcv:
+                    # sem candles = sem sinal e sem trade — mostra o motivo NO
+                    # dashboard em vez de fingir que está tudo bem
+                    state["status"] = ("Erro candles 30m: "
+                                       + (_ohlcv_last_err or "desconhecido"))[:110]
 
                 if ohlcv and len(ohlcv) >= 70:
                     last_closed, sig_closes = _resolve_candles(ohlcv)
@@ -2177,6 +2197,44 @@ def debug_raw():
     except Exception as e:
         info["fetch_ticker"] = f"FAIL: {type(e).__name__}: {str(e)[:400]}"
     return jsonify(info)
+
+@app.route("/diagnostico")
+def diagnostico():
+    """UM link que testa TUDO que o bot precisa da Phemex e mostra o erro real
+    de cada passo. Abrir quando "não puxa candles" ou "não tem trades":
+    cada item vem com ok:true ou o erro exato (geo-block 403/451, rate-limit,
+    timeout, DNS…). bt_ex/ticker_ex são usados aqui pra não concorrer com a
+    sessão do loop ao vivo (live_ex)."""
+    sym = SYMBOL or "ETH/USDT:USDT"
+    out = {
+        "symbol":            sym,
+        "strategy_rodando":  state["running"],
+        "status_atual":      state["status"],
+        "ws_ativo":          _ws_active,
+        "preco_atual":       _last_good_price,
+        "idade_preco_s":     round(time_mod.time() - _last_price_ts, 1) if _last_price_ts else None,
+        "erro_candles_bot":  _ohlcv_last_err,     # último erro do loop ao vivo
+        "erro_fetch_backtest": _bt_fetch_err,     # último erro do backtest
+    }
+    def step(name, fn):
+        try:
+            out[name] = {"ok": True, "info": fn()}
+        except Exception as e:
+            out[name] = {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:300]}"}
+    step("1_load_markets", lambda: f"{len(bt_ex.load_markets())} mercados")
+    step("2_ticker",       lambda: f"last={ticker_ex.fetch_ticker(sym)['last']}")
+    step("3_candles_30m",  lambda: f"{len(bt_ex.fetch_ohlcv(sym, timeframe='30m', limit=10))} candles")
+    step("4_candles_1m",   lambda: f"{len(bt_ex.fetch_ohlcv(sym, timeframe='1m', limit=10))} candles")
+    ok_geral = all(out[k]["ok"] for k in ("1_load_markets", "2_ticker",
+                                          "3_candles_30m", "4_candles_1m"))
+    out["conclusao"] = ("Phemex OK deste servidor — se ainda não houver trades, "
+                        "confira se a strategy está Iniciada e aguarde o próximo "
+                        "candle de 30m" if ok_geral else
+                        "Phemex NÃO responde deste servidor — veja o erro acima. "
+                        "403/451 = IP/região bloqueada (na Render, troque a região "
+                        "do serviço, ex. Frankfurt/Singapore); RateLimit/Timeout = "
+                        "tente de novo em 1 min")
+    return jsonify(out)
 
 @app.route("/start", methods=["POST"])
 def start():
