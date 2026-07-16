@@ -1,6 +1,0 @@
-flask==3.0.3
-ccxt==4.3.92
-aiohttp==3.9.5
-numpy==1.26.4
-requests==2.32.3
-gunicorn==22.0.0
