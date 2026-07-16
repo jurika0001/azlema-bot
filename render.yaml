@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: paper-ha2h
+    runtime: python
+    plan: starter          # NAO use "free": ele dorme e voce PERDE trades.
+    buildCommand: pip install -r requirements.txt
+    # 1 worker e 1 thread: os sinais internos 13s/21s/30s vivem no processo.
+    # Com varios workers voce teria varias copias operando e contando trades
+    # duplicados — o resultado do teste sairia errado.
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /ping
+    autoDeploy: false
+    disk:
+      name: estado
+      mountPath: /opt/render/project/src/dados
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ESTADO_DIR
+        value: /opt/render/project/src/dados
