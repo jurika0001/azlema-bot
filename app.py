@@ -102,7 +102,24 @@ def candles_2h(simbolo):
 # --------------------------------------------------- WEBSOCKET (feed principal)
 WS_URL = "wss://contract.mexc.com/edge"
 POR_SIMBOLO = {pt.simbolo: pt for pt in TRADERS.values()}
-ws_estado = {"conectado": False, "ultima_msg": 0.0, "reconexoes": 0, "ticks": 0}
+ws_estado = {"conectado": False, "ultima_msg": 0.0, "reconexoes": 0, "ticks": 0,
+             "pongs": 0, "conectado_desde": 0.0}
+
+
+def _ws_ping(ws):
+    """O MEXC exige ping no protocolo DELE (JSON), nao o ping do WebSocket.
+
+    MEDIDO: sem este ping a conexao morre em 67s (opcode=8, close do servidor);
+    com ele, 240s sem cair e o servidor respondendo pong a cada ~16s.
+    """
+    while True:
+        time.sleep(15)
+        if not ws_estado["conectado"]:
+            return
+        try:
+            ws.send(json.dumps({"method": "ping"}))
+        except Exception:
+            return
 
 
 def _ws_open(ws):
@@ -110,14 +127,21 @@ def _ws_open(ws):
         ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": s}}))
         ws.send(json.dumps({"method": "sub.ticker", "param": {"symbol": s}}))
     ws_estado["conectado"] = True
-    log(f"[ws] conectado | deal+ticker de {', '.join(POR_SIMBOLO)}")
+    ws_estado["ultima_msg"] = time.time()
+    ws_estado["conectado_desde"] = time.time()
+    threading.Thread(target=_ws_ping, args=(ws,), daemon=True).start()
+    log(f"[ws] conectado | deal+ticker de {', '.join(POR_SIMBOLO)} | ping JSON a cada 15s")
 
 
 def _ws_msg(ws, raw):
     try:
         m = json.loads(raw)
         ch = m.get("channel", "")
-        if ch.startswith("rs.") or ch == "pong":
+        if ch == "pong":                       # resposta ao nosso ping JSON
+            ws_estado["pongs"] += 1
+            ws_estado["ultima_msg"] = time.time()
+            return
+        if ch.startswith("rs."):
             return
         pt = POR_SIMBOLO.get(m.get("symbol"))
         if pt is None:
@@ -144,19 +168,27 @@ def _ws_close(ws, *a):
     ws_estado["conectado"] = False
 
 
+def _ws_err(ws, e):
+    # opcode=8 e' o frame de CLOSE do servidor: queda normal, nao erro de codigo.
+    if "opcode=8" in str(e):
+        return
+    log(f"[ws] erro: {type(e).__name__}: {e}")
+
+
 def ws_loop():
-    """Feed principal. Reconecta sozinho — 5 meses sem cair nao existe."""
+    """Feed principal. Reconecta sozinho — 9 meses sem cair nao existe."""
     while True:
         try:
             ws = websocket.WebSocketApp(WS_URL, on_open=_ws_open, on_message=_ws_msg,
-                                        on_close=_ws_close,
-                                        on_error=lambda w, e: log(f"[ws] erro: {e}"))
+                                        on_close=_ws_close, on_error=_ws_err)
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             log(f"[ws] caiu: {type(e).__name__}: {e}")
+        viveu = (time.time() - ws_estado["conectado_desde"]) if ws_estado["conectado_desde"] else 0
         ws_estado["conectado"] = False
         ws_estado["reconexoes"] += 1
-        log(f"[ws] reconectando em 5s (reconexao #{ws_estado['reconexoes']})")
+        log(f"[ws] caiu apos {viveu:.0f}s vivo | reconectando em 5s "
+            f"(reconexao #{ws_estado['reconexoes']}) | a rede de 21s cobre o intervalo")
         time.sleep(5)
 
 
