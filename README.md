@@ -29,61 +29,99 @@ Paper trading prospectivo é o único juiz que fecha essa brecha, porque os dado
 contra o motor original do projeto: **12.324 candles, 0 divergências**. O paper
 testa exatamente a mesma estratégia que passou no cofre.
 
-## Referência a bater (cofre virgem 2017-2020)
+## Referência a bater (cofre virgem 2017-2020, taxa 0% = Lighter)
 
 ```
-3.561 trades | winrate 87,2% | média +0,0518%/trade | desvio 0,8030% | t = 3,85
-1x  +462,3%   (82%/a)   DD 21,0%
-2x  +2.391,8% (206%/a)  DD 39,2%
+3.561 trades | winrate 87,2% | média +0,0718%/trade | desvio 0,8030% | t = 5,33
+1x  +1.045,8% (134%/a)  DD 18,1%   ->  78 USDT vira  894 USDT em 2,9a
+2x  +10.240,9% (403%/a) DD 33,4%   ->  78 USDT vira 8.066 USDT em 2,9a
 ```
 
 ---
 
 # ⏱️ Quanto tempo até saber se passou
 
-**Resposta curta: ~9 meses.**
+**Resposta: ~9,5 meses** (981 trades, a ~3,4 trades/dia).
 
-O edge é **+0,0518% por trade** com desvio de **0,8030%**. O sinal é pequeno
-perto do ruído, então é preciso volume de trades para separar vantagem de sorte:
+### ⚠️ Correção de um erro importante
 
-| Confiança | Trades | Tempo (a 3,4 trades/dia) |
+A conta `n = (1,96 × desvio/média)²` **está errada** e foi usada numa versão
+anterior deste arquivo. Nesse `n`, o t-stat **esperado** é exatamente 1,96 —
+então **metade das amostras cai abaixo por puro acaso**. Isso dá **50% de poder**:
+cara ou coroa. Rodar 4,6 meses e ver "REPROVOU" teria 50% de chance de estar
+matando uma estratégia boa.
+
+O correto inclui o **poder** do teste: `n = ((z_α + z_β) × desvio/média)²`.
+
+Verificado por simulação (4.000 amostras por ponto, edge real de +0,0718%):
+
+| Trades | Tempo | Poder (chance de detectar um edge que existe) |
 |---|---|---|
-| **95%** ← critério | **925** | **~9 meses** |
-| 99% | 1.602 | ~15,5 meses |
-| 99,9% | 2.605 | ~25 meses |
+| 481 | 4,6 meses | **50,2%** ← inútil |
+| **981** | **9,5 meses** | **79,4%** ← o critério |
+| 1.313 | 12,7 meses | 90% |
+| 2.000 | 19,3 meses | 98,2% |
 
 ### Critério de aprovação (travado antes de começar, para não mover a trave)
 
-> **PASSOU** = `n ≥ 925` **E** `t-stat ≥ 1,96` **E** média > 0
+> **PASSOU** = `n ≥ 981` **E** `t-stat ≥ 1,96` **E** média > 0
 
-O `/status` calcula isso sozinho e mostra `PASSOU` / `REPROVOU` / `coletando`.
+O `/status` calcula sozinho e mostra `PASSOU` / `MORTA` / `coletando`.
 
-### Não espere 9 meses em silêncio — sinais de alerta antes disso
+---
+
+# 🏦 Por que Lighter — e por que a taxa zero é obrigatória
+
+O edge é fino demais para pagar taxa. **Um único teste mede todas as corretoras
+ao mesmo tempo** (guardo o retorno bruto e aplico cada taxa em paralelo), então
+você não precisa apostar 9 meses numa só:
+
+| Corretora | Taker | KYC | API | Edge/trade | Trades p/ 80% poder |
+|---|---|---|---|---|---|
+| **Lighter Standard** | **0%** | **Não** | **Sim (fica no Standard)** | **+0,0718%** | **981 → 9,5 meses** |
+| KCEX | 0,01% | Não | ❌ 403 anti-bot | +0,0518% | 1.884 → 18 meses |
+| MEXC / Paradex API | 0,02% | MEXC sim | Sim | +0,0318% | ~5.000 → 48 meses |
+| Aster | 0,035% | Não | Sim | +0,0018% | morta |
+| Hyperliquid | 0,045% | Não | Sim | −0,018% | morta |
+| Phemex | 0,06% | Não | Sim | −0,048% | morta |
+
+**A taxa zero não é só lucro maior — é o que torna o teste viável.**
+Confirmado na doc da API: *"API traders are not forced into Premium — they
+default to Standard (zero fees)"*. A Paradex é a armadilha: zero no varejo,
+**0,02% em quem usa API**.
+
+## Custos de entrar/sair na Lighter (conta de 78 USDT)
+
+- **Lighter cobra ZERO de protocolo** em depósito e saque.
+- Você paga **gas da Ethereum**: ~**$4–18** para depositar, **$8–43** ida e volta.
+- Em 78 USDT isso é **5–23% do capital só para entrar**. É o preço do
+  experimento — com essa quantia, isso é um **teste, não um investimento**.
+- **É custo único, não por trade** — não toca no edge. O trading é off-chain
+  com liquidação em lote; gas só na entrada e na saída.
+- Lote mínimo do ETH: **0,0001 ETH ≈ $0,19** → 78 USDT sobra folgado
+  (a 2x são $156 = 0,083 ETH).
+
+### Não espere 9,5 meses em silêncio — sinais de alerta antes disso
 
 - **~1 mês (100 trades):** o winrate deveria estar perto de 87%. Se estiver
-  abaixo de ~75%, algo está errado (spread, execução ou o edge sumiu).
-- **~3 meses (300 trades):** a média/trade deveria estar perto de +0,05%. Se
-  estiver **negativa**, pode parar — não vai virar.
-- **Qualquer momento:** trade individual pior que −2,5% significa bug (o SL é 2,5%).
+  abaixo de ~75%, algo está errado (execução, latência, ou o edge sumiu).
+- **~3 meses (300 trades):** a média/trade deveria estar perto de +0,07%. Se
+  estiver **claramente negativa**, pode parar — não vai virar.
+- **Qualquer momento:** trade individual pior que −2,5% significa bug (SL = 2,5%).
 
-### ⚠️ O spread muda tudo
+⚠️ **Não conclua nada por "ainda não deu significativo"** antes dos 981 trades —
+foi exatamente esse o erro de 50% de poder descrito acima.
 
-O edge de +0,0518%/trade **já inclui** a taxa do KCEX (0,02% ida-volta), mas
-**não inclui o spread**, e você opera a mercado (paga spread em 100% das trades):
+### ✅ O spread: falso alarme (medido, resolvido)
 
-| Spread ida-volta | Edge líquido | Tempo até 95% |
-|---|---|---|
-| 0,00% | +0,0518% | 9 meses |
-| 0,01% | +0,0418% | 14 meses |
-| 0,02% | +0,0318% | 24 meses |
-| 0,03% | +0,0218% | 50 meses |
-| **0,05%** | **+0,0018%** | **inviável** |
-| **0,06%** | **−0,0082%** | **estratégia morta** |
+Uma versão anterior deste arquivo alarmava que spread de 0,06% mataria tudo,
+usando **0,02% como chute**. Medido de verdade no ETH perp (16/07/2026):
 
-**Um spread de 0,06% zera a estratégia inteira.** Ajuste `SPREAD_RT` em
-`paper.py` para o valor real medido na sua corretora antes de confiar em
-qualquer número. É a variável mais importante do projeto — mais que a taxa,
-mais que a alavancagem.
+**Spread real: 0,00053%** (1 centavo em $1.875) — **97x abaixo** do que mataria.
+**99% do edge sobrevive.** O ETH perp é líquido demais para isso ser problema.
+
+E não é mais estimativa: o motor usa o **bid/ask real de cada instante**
+(entra no ask, sai no bid), então o spread verdadeiro entra no preço de fill.
 
 ---
 
@@ -160,10 +198,19 @@ qualquer um que descubra a URL abre posições na sua conta.
 
 # O que este teste NÃO resolve
 
-- **Slippage real** — paper preenche no preço lido; a mercado você preenche pior.
-- **Funding** — perpétuo cobra ~0,01%/8h (~11%/a a 1x, ~22%/a a 2x). Não está
-  em nenhum número aqui. A 2x, isso derruba 206%/a para ~184%/a.
-- **Liquidez** — o backtest assume que você sempre é preenchido.
+- **Latência de 300ms da conta Standard.** É assim que a Lighter banca a taxa
+  zero: Standard tem **300ms de latência no taker** (Premium tem 0ms, mas cobra).
+  Seu trailing dispara, a ordem sai 300ms depois — e ele dispara justamente
+  quando o preço está correndo contra você. Com edge de 7 bps, isso importa.
+  **Este é o principal risco não medido.**
+- **Funding** — perp cobra funding, e na Lighter o período é de **1 hora**
+  (não 8h). Não está em nenhum número aqui. A 2x pode ser relevante.
+- **Slippage de verdade** — o paper preenche no bid/ask do topo do livro; ordem
+  maior "anda" o livro. Com 78 USDT isso é irrelevante; com conta grande, não.
+- **Viés de seleção** — esta estratégia é 1 escolhida entre 115.030 testadas.
+  Só o teste prospectivo (este) fecha essa brecha.
+- **Risco da própria Lighter** — DEX novo: risco de contrato, de sequencer, e
+  de o modelo de taxa zero mudar.
 
-Se o paper passar em 9 meses, aí sim vale um teste com dinheiro pequeno de
-verdade — que é o único juiz acima deste.
+Se passar em 9,5 meses, aí sim vale o teste com dinheiro pequeno de verdade —
+que é o único juiz acima deste.
