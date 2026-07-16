@@ -177,6 +177,9 @@ def _ws_err(ws, e):
 
 def ws_loop():
     """Feed principal. Reconecta sozinho — 9 meses sem cair nao existe."""
+    # sem isso, um connect que o servidor ignora (pacote descartado) pendura a
+    # thread PARA SEMPRE — run_forever nao tem timeout de conexao proprio
+    websocket.setdefaulttimeout(15)
     while True:
         try:
             ws = websocket.WebSocketApp(WS_URL, on_open=_ws_open, on_message=_ws_msg,
@@ -368,6 +371,22 @@ def status():
     return jsonify(g)
 
 
+@app.route("/debug")
+def debug():
+    """Raio-X: onde cada thread esta AGORA (para diagnosticar travamentos)."""
+    import sys as _sys
+    import html as _html
+    import traceback as _tb
+    frames = _sys._current_frames()
+    partes = [f"uptime={time.time()-APP_INICIO:.0f}s | "
+              f"threads vivas={threading.active_count()}"]
+    for th in threading.enumerate():
+        f = frames.get(th.ident)
+        pilha = "".join(_tb.format_stack(f)) if f else "(sem frame)"
+        partes.append(f"===== {th.name} (daemon={th.daemon})\n{pilha}")
+    return "<pre>" + _html.escape("\n\n".join(partes)) + "</pre>"
+
+
 @app.route("/log")
 def ver_log():
     with _loglock:
@@ -448,9 +467,9 @@ Dinheiro nenhum envolvido.</p>
 
 
 def iniciar():
-    threading.Thread(target=ws_loop, daemon=True).start()      # feed principal
+    threading.Thread(target=ws_loop, name="websocket", daemon=True).start()
     for fn in (sinal_13s, sinal_21s, sinal_30s):
-        threading.Thread(target=fn, daemon=True).start()
+        threading.Thread(target=fn, name=fn.__name__, daemon=True).start()
     log(f"WebSocket + sinais 13s/21s/30s iniciados | ativos: {', '.join(TRADERS)} "
         f"| meta {N_MIN} trades")
 
