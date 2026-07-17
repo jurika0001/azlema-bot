@@ -466,15 +466,34 @@ Dinheiro nenhum envolvido.</p>
 </body></html>"""
 
 
-def iniciar():
-    threading.Thread(target=ws_loop, name="websocket", daemon=True).start()
-    for fn in (sinal_13s, sinal_21s, sinal_30s):
-        threading.Thread(target=fn, name=fn.__name__, daemon=True).start()
-    log(f"WebSocket + sinais 13s/21s/30s iniciados | ativos: {', '.join(TRADERS)} "
-        f"| meta {N_MIN} trades")
+# As threads precisam nascer NO PROCESSO QUE ATENDE O SITE. O gunicorn importa
+# o app num processo-mestre e faz FORK para o worker — e fork NAO copia threads:
+# elas nasciam no mestre e o worker ficava so com uma foto congelada dos
+# contadores (visto no /debug do Render: 'threads vivas=3', nenhuma nossa).
+# Por isso: inicio preguicoso, por PID — cada processo (re)inicia as suas.
+_ini_lock = threading.Lock()
+_ini_pid = None
 
 
-iniciar()
+def garantir_iniciado():
+    global _ini_pid
+    if _ini_pid == os.getpid():
+        return
+    with _ini_lock:
+        if _ini_pid == os.getpid():
+            return
+        threading.Thread(target=ws_loop, name="websocket", daemon=True).start()
+        for fn in (sinal_13s, sinal_21s, sinal_30s):
+            threading.Thread(target=fn, name=fn.__name__, daemon=True).start()
+        _ini_pid = os.getpid()
+        log(f"WebSocket + sinais 13s/21s/30s iniciados no processo {os.getpid()} "
+            f"| ativos: {', '.join(TRADERS)} | meta {N_MIN} trades")
+
+
+@app.before_request
+def _garante_threads():
+    garantir_iniciado()
 
 if __name__ == "__main__":
+    garantir_iniciado()          # local (python app.py): sem fork, inicia ja
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
