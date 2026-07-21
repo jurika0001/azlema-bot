@@ -460,14 +460,21 @@ def home():
             med = 100.0 * sum(rs) / len(rs)
             pior = 100.0 * min(rs)
             arr = np.array(rs, dtype=float)
+            eq1 = np.cumprod(1 + arr)                                        # lucro SO deste ativo
             eq2 = np.cumprod(1 + np.maximum(2 * arr, -0.999))
+            r1 = float((eq1[-1] - 1) * 100)
+            r2 = float((eq2[-1] - 1) * 100)
+            dd1 = float((1 - eq1 / np.maximum.accumulate(eq1)).max() * 100)
             dd2 = float((1 - eq2 / np.maximum.accumulate(eq2)).max() * 100)  # DD SO deste ativo
             est = (f"<td align='right'>{wr:.0f}%</td>"
                    f"<td align='right'>{med:+.4f}%</td>"
                    f"<td align='right'>{pior:+.2f}%</td>"
+                   f"<td align='right'><b>{r1:+.2f}%</b></td>"
+                   f"<td align='right'>{dd1:.1f}%</td>"
+                   f"<td align='right'><b>{r2:+.2f}%</b></td>"
                    f"<td align='right'>{dd2:.1f}%</td>")
         else:
-            est = "<td align='right'>—</td>" * 4
+            est = "<td align='right'>—</td>" * 7
         ativos.append(f"<tr><td><b>{a}</b></td><td>{len(pt.trades)} trades</td>"
                       f"{est}"
                       f"<td>{pt.ultimo_bid} / {pt.ultimo_ask}</td><td>{p}</td>"
@@ -492,7 +499,9 @@ winrate {g.get('winrate', 0):.1f}% <span style="color:#888">(cofre: {REF_WR}%)</
 <h3>Por ativo</h3>
 <table cellpadding="6" style="border-collapse:collapse;font-size:14px">
 <tr style="background:#f0f0f0"><th align="left">ativo</th><th>trades</th>
-<th>winrate</th><th>media/trade</th><th>pior trade</th><th>DD 2x (so deste ativo)</th><th>bid/ask</th>
+<th>winrate</th><th>media/trade</th><th>pior trade</th>
+<th style="background:#e8f4e8">lucro 1x</th><th style="background:#e8f4e8">DD 1x</th>
+<th style="background:#e8f0f8">lucro 2x</th><th style="background:#e8f0f8">DD 2x</th><th>bid/ask</th>
 <th>posicao</th><th>spread real</th><th>funding/periodo</th><th>ticks</th></tr>
 {''.join(ativos)}
 </table>
