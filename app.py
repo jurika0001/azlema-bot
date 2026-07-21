@@ -34,6 +34,7 @@ import websocket
 from flask import Flask, jsonify, request
 
 from estrategia import sinal_atual, TF_MS
+import estado_remoto
 from paper import PaperTrader, FEE_LADO, N_MIN, T_MIN, CENARIOS, ATIVOS, REF_MEDIA, REF_WR
 
 APP_INICIO = time.time()
@@ -157,7 +158,7 @@ def _ws_msg(ws, raw):
                     log(f"[ws] {pt.ativo} FECHOU {'LONG' if t['dir']==1 else 'SHORT'} "
                         f"{t['motivo']} | {t['entry']:.2f} -> {t['saida']:.2f} | "
                         f"bruto {t['bruto']*100:+.3f}% | total={total_trades()}/{N_MIN}")
-                    pt.salvar()
+                    pt.salvar(forcar_gist=True)   # trade fechou -> grava no gist ja
         elif ch == "push.ticker":
             pt.atualiza_cotacao(d["bid1"], d["ask1"], d.get("fundingRate"))
     except Exception as e:
@@ -235,7 +236,7 @@ def sinal_21s():
                     log(f"[21s/rede] {a} FECHOU {'LONG' if t['dir']==1 else 'SHORT'} "
                         f"{t['motivo']} | {t['entry']:.2f} -> {t['saida']:.2f} "
                         f"| bruto {t['bruto']*100:+.3f}% | total={total_trades()}/{N_MIN}")
-                    pt.salvar()
+                    pt.salvar(forcar_gist=True)   # trade fechou -> grava no gist ja
             except Exception as e:
                 log(f"[21s] {a} erro: {e}")
         time.sleep(21)
@@ -352,6 +353,7 @@ def status():
     g = veredito_geral()
     g.update({
         "uptime_s": round(time.time() - APP_INICIO, 1),
+        "persistencia_gist": estado_remoto.status(),
         "referencia_cofre": {"media_pct": REF_MEDIA * 100, "winrate": REF_WR,
                              "eth_t": 5.33, "btc_t": 5.52},
         "websocket": {"conectado": ws_estado["conectado"], "vivo": ws_vivo(),
@@ -393,6 +395,38 @@ def ver_log():
         return "<pre>" + "\n".join(log_recente[-100:]) + "</pre>"
 
 
+@app.route("/ativos")
+def ativos_json():
+    """Cada ativo LIDO SOZINHO — winrate/edge/DD proprios, sem misturar.
+    Combinar ETH+BTC numa conta so infla o DD (perda de um conta pro outro);
+    aqui cada um aparece com o risco real dele, a qualquer momento."""
+    import numpy as _np
+    out = {}
+    for a, pt in TRADERS.items():
+        r = _np.array([t["bruto"] for t in pt.trades], dtype=float)
+        if len(r) == 0:
+            out[a] = {"trades": 0}
+            continue
+        eq1 = _np.cumprod(1 + r)
+        eq2 = _np.cumprod(1 + _np.maximum(2 * r, -0.999))
+        dd1 = float((1 - eq1 / _np.maximum.accumulate(eq1)).max() * 100)
+        dd2 = float((1 - eq2 / _np.maximum.accumulate(eq2)).max() * 100)
+        mu = float(r.mean()); sd = float(r.std(ddof=1)) if len(r) > 1 else 0.0
+        out[a] = {
+            "trades": len(r), "winrate": float((r > 0).mean() * 100),
+            "edge_pct": mu * 100, "desvio_pct": sd * 100,
+            "tstat": (mu / (sd / (len(r) ** 0.5))) if sd > 0 else 0.0,
+            "pior_trade_pct": float(r.min() * 100),
+            "melhor_trade_pct": float(r.max() * 100),
+            "ret_1x_pct": float((eq1[-1] - 1) * 100), "dd_1x_pct": dd1,
+            "ret_2x_pct": float((eq2[-1] - 1) * 100), "dd_2x_pct": dd2,
+            "trades_lista": [{"t": t["fechamento"], "dir": t["dir"],
+                              "motivo": t["motivo"], "bruto_pct": t["bruto"] * 100}
+                             for t in pt.trades],
+        }
+    return jsonify(out)
+
+
 @app.route("/")
 def home():
     g = veredito_geral()
@@ -418,7 +452,24 @@ def home():
                                               (" [armado]" if pt.pos.armed else ""))
         sp = pt.spread_medio_pct()
         fr = pt.funding_medio()
+        # estatisticas SEPARADAS por ativo — um BTC ruim nao pode se esconder
+        # atras de um ETH bom (nem o contrario)
+        rs = [t["bruto"] for t in pt.trades]
+        if rs:
+            wr = 100.0 * sum(1 for r in rs if r > 0) / len(rs)
+            med = 100.0 * sum(rs) / len(rs)
+            pior = 100.0 * min(rs)
+            arr = np.array(rs, dtype=float)
+            eq2 = np.cumprod(1 + np.maximum(2 * arr, -0.999))
+            dd2 = float((1 - eq2 / np.maximum.accumulate(eq2)).max() * 100)  # DD SO deste ativo
+            est = (f"<td align='right'>{wr:.0f}%</td>"
+                   f"<td align='right'>{med:+.4f}%</td>"
+                   f"<td align='right'>{pior:+.2f}%</td>"
+                   f"<td align='right'>{dd2:.1f}%</td>")
+        else:
+            est = "<td align='right'>—</td>" * 4
         ativos.append(f"<tr><td><b>{a}</b></td><td>{len(pt.trades)} trades</td>"
+                      f"{est}"
                       f"<td>{pt.ultimo_bid} / {pt.ultimo_ask}</td><td>{p}</td>"
                       f"<td>{(f'{sp:.5f}%' if sp else '—')}</td>"
                       f"<td>{(f'{fr*100:+.4f}%' if fr is not None else '—')}</td>"
@@ -440,7 +491,8 @@ winrate {g.get('winrate', 0):.1f}% <span style="color:#888">(cofre: {REF_WR}%)</
 
 <h3>Por ativo</h3>
 <table cellpadding="6" style="border-collapse:collapse;font-size:14px">
-<tr style="background:#f0f0f0"><th align="left">ativo</th><th>trades</th><th>bid/ask</th>
+<tr style="background:#f0f0f0"><th align="left">ativo</th><th>trades</th>
+<th>winrate</th><th>media/trade</th><th>pior trade</th><th>DD 2x (so deste ativo)</th><th>bid/ask</th>
 <th>posicao</th><th>spread real</th><th>funding/periodo</th><th>ticks</th></tr>
 {''.join(ativos)}
 </table>

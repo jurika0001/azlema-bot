@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from estrategia import Posicao, TF_MS
+import estado_remoto
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 # No Render o estado vai para o disco persistente (ESTADO_DIR), senao some a
@@ -108,39 +109,63 @@ class PaperTrader:
         self._carregar()
 
     # ------------------------------------------------ persistencia
+    @property
+    def _gist_nome(self):
+        return f"estado_{self.ativo.lower()}.json"
+
+    def _aplicar(self, z):
+        self.trades = z.get("trades", [])
+        self.inicio = z.get("inicio", self.inicio)
+        self.contadores.update(z.get("contadores", {}))
+        self.ultimo_candle_ts = z.get("ultimo_candle_ts")
+        p = z.get("pos")
+        if p:
+            self.pos = Posicao(p["pdir"], p["entry"], p["ts_abertura"])
+            self.pos.peak = p["peak"]; self.pos.armed = p["armed"]
+
     def _carregar(self):
+        # 1) tenta o GIST (sobrevive a restart/deploy do Render free)
+        z = estado_remoto.carregar(self._gist_nome)
+        if z is not None:
+            try:
+                self._aplicar(z)
+                print(f"[{self.ativo}] estado carregado do GIST: "
+                      f"{len(self.trades)} trades", flush=True)
+                return
+            except Exception as e:
+                print(f"[{self.ativo}] gist invalido: {e}", flush=True)
+        # 2) fallback: disco local
         if not os.path.exists(self.estado_path):
             return
         try:
             with open(self.estado_path, "r", encoding="utf-8") as f:
-                z = json.load(f)
-            self.trades = z.get("trades", [])
-            self.inicio = z.get("inicio", self.inicio)
-            self.contadores.update(z.get("contadores", {}))
-            self.ultimo_candle_ts = z.get("ultimo_candle_ts")
-            p = z.get("pos")
-            if p:
-                self.pos = Posicao(p["pdir"], p["entry"], p["ts_abertura"])
-                self.pos.peak = p["peak"]; self.pos.armed = p["armed"]
+                self._aplicar(json.load(f))
         except Exception as e:
             print(f"[paper] estado corrompido, comecando limpo: {e}")
 
-    def salvar(self):
+    def _snapshot(self):
+        return {
+            "inicio": self.inicio,
+            "trades": self.trades,
+            "contadores": self.contadores,
+            "ultimo_candle_ts": self.ultimo_candle_ts,
+            "pos": None if self.pos is None else {
+                "pdir": self.pos.pdir, "entry": self.pos.entry,
+                "peak": self.pos.peak, "armed": self.pos.armed,
+                "ts_abertura": self.pos.ts_abertura},
+        }
+
+    def salvar(self, forcar_gist=False):
         with self.lock:
-            z = {
-                "inicio": self.inicio,
-                "trades": self.trades,
-                "contadores": self.contadores,
-                "ultimo_candle_ts": self.ultimo_candle_ts,
-                "pos": None if self.pos is None else {
-                    "pdir": self.pos.pdir, "entry": self.pos.entry,
-                    "peak": self.pos.peak, "armed": self.pos.armed,
-                    "ts_abertura": self.pos.ts_abertura},
-            }
+            z = self._snapshot()
+        # disco local (cache rapido)
         tmp = self.estado_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(z, f)
-        os.replace(tmp, self.estado_path)      # atomico: nunca corrompe (licao do .npz)
+        os.replace(tmp, self.estado_path)      # atomico: nunca corrompe
+        # gist: forcado quando fecha trade; senao no maximo 1x/2min (poupa API)
+        estado_remoto.salvar(self._gist_nome, z,
+                             min_intervalo=0 if forcar_gist else 120)
 
     # ------------------------------------------------ operacao
     def atualiza_cotacao(self, bid, ask, funding=None):
