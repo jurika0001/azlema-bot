@@ -74,6 +74,20 @@ class Disjuntor:
 disjuntor = Disjuntor()
 
 
+def _int_seguro(nome, valor):
+    """Converte para int SEM ecoar o conteudo (se a chave foi colada no campo
+    errado, o valor NUNCA aparece no erro/painel — so tamanho e uma dica)."""
+    v = (valor or "").strip().strip('"').strip("'")
+    if v.lstrip("-").isdigit():
+        return int(v)
+    dica = f"tem {len(v)} caracteres"
+    if v.lower().startswith("0x"):
+        dica += " e comeca com 0x — isso parece a CHAVE, nao um indice!"
+    elif len(v) > 12:
+        dica += " — longo demais para um indice"
+    raise ValueError(f"{nome} precisa ser um NUMERO inteiro; {dica}")
+
+
 class Lighter:
     """Um cliente, tres mercados. Sem credencial -> fica em simulado."""
 
@@ -100,13 +114,18 @@ class Lighter:
             import lighter
             self._ensure_loop()
 
+            # valida os indices SEM ecoar o conteudo (evita vazar chave se ela foi
+            # colada no campo errado). So diz qual campo e' invalido e uma dica.
+            acc_i = _int_seguro("LIGHTER_ACCOUNT_INDEX", _ACC_IDX)
+            key_i = _int_seguro("LIGHTER_API_KEY_INDEX", _KEY_IDX)
+
             async def _setup():
                 # criado DENTRO do loop -> ha' event loop rodando (corrige o erro
                 # "no running event loop": a SDK e' async e cria recursos do loop)
                 api = lighter.ApiClient(configuration=lighter.Configuration(host=_URL))
                 cli = lighter.SignerClient(
                     url=_URL, private_key=_API_PRIV,
-                    account_index=int(_ACC_IDX), api_key_index=int(_KEY_IDX))
+                    account_index=acc_i, api_key_index=key_i)
                 res = cli.check_client()
                 if asyncio.iscoroutine(res):
                     res = await res
