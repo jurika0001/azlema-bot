@@ -86,27 +86,41 @@ class Lighter:
         if CONFIGURADO:
             self._conectar()
 
-    def _rodar(self, coro):
+    def _ensure_loop(self):
         if self.loop is None:
             self.loop = asyncio.new_event_loop()
             threading.Thread(target=self.loop.run_forever, daemon=True).start()
+
+    def _rodar(self, coro):
+        self._ensure_loop()
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=30)
 
     def _conectar(self):
         try:
             import lighter
-            self.api = lighter.ApiClient(configuration=lighter.Configuration(host=_URL))
-            self.cliente = lighter.SignerClient(
-                url=_URL, private_key=_API_PRIV,
-                account_index=int(_ACC_IDX), api_key_index=int(_KEY_IDX))
-            err = self.cliente.check_client()
+            self._ensure_loop()
+
+            async def _setup():
+                # criado DENTRO do loop -> ha' event loop rodando (corrige o erro
+                # "no running event loop": a SDK e' async e cria recursos do loop)
+                api = lighter.ApiClient(configuration=lighter.Configuration(host=_URL))
+                cli = lighter.SignerClient(
+                    url=_URL, private_key=_API_PRIV,
+                    account_index=int(_ACC_IDX), api_key_index=int(_KEY_IDX))
+                res = cli.check_client()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                return api, cli, res
+
+            self.api, self.cliente, err = asyncio.run_coroutine_threadsafe(
+                _setup(), self.loop).result(timeout=30)
             if err is not None:
                 raise RuntimeError(f"check_client: {err}")
             self.pronto = True
-            print(f"[lighter] conectado | conta {_ACC_IDX} | MODO REAL | ETH/BTC/SOL", flush=True)
+            print(f"[lighter] conectado | conta {_ACC_IDX} | ETH/BTC/SOL", flush=True)
         except Exception as e:
             self.erro_init = f"{type(e).__name__}: {e}"; self.pronto = False
-            print(f"[lighter] FALHA ao conectar: {self.erro_init} — fica SIMULADO", flush=True)
+            print(f"[lighter] FALHA ao conectar: {self.erro_init}", flush=True)
 
     # ------------------------------------------------ leitura (fonte da verdade)
     def _posicoes_raw(self):
