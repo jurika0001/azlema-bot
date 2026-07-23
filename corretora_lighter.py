@@ -37,6 +37,7 @@ _API_PRIV = os.environ.get("LIGHTER_API_KEY_PRIVATE", "").strip()
 _ACC_IDX = os.environ.get("LIGHTER_ACCOUNT_INDEX", "").strip()
 _KEY_IDX = os.environ.get("LIGHTER_API_KEY_INDEX", "").strip()
 _URL = os.environ.get("LIGHTER_URL", "https://mainnet.zklighter.elliot.ai")
+_CHAIN = int(os.environ.get("LIGHTER_CHAIN_ID", "304"))   # 304 = mainnet zklighter
 
 CONFIGURADO = bool(_API_PRIV and _ACC_IDX and _KEY_IDX)
 REAL = (MODO == "real") and CONFIGURADO
@@ -93,7 +94,7 @@ class Lighter:
 
     def __init__(self):
         self.api = None; self.cliente = None; self.loop = None
-        self.pronto = False; self.erro_init = None
+        self.pronto = False; self.erro_init = None; self.key_i = None
         # CONECTA sempre que houver credencial (mesmo em simulado): conectar e LER
         # saldo/posicoes e' seguro (read-only). So ENVIAR ORDEM depende de REAL.
         # Assim da' pra verificar a conexao antes de virar a chave.
@@ -118,14 +119,16 @@ class Lighter:
             # colada no campo errado). So diz qual campo e' invalido e uma dica.
             acc_i = _int_seguro("LIGHTER_ACCOUNT_INDEX", _ACC_IDX)
             key_i = _int_seguro("LIGHTER_API_KEY_INDEX", _KEY_IDX)
+            self.key_i = key_i
 
             async def _setup():
                 # criado DENTRO do loop -> ha' event loop rodando (corrige o erro
-                # "no running event loop": a SDK e' async e cria recursos do loop)
+                # "no running event loop": a SDK e' async e cria recursos do loop).
+                # api_private_keys e' um DICT {indice: chave} (assinatura real do SDK).
                 api = lighter.ApiClient(configuration=lighter.Configuration(host=_URL))
                 cli = lighter.SignerClient(
-                    url=_URL, private_key=_API_PRIV,
-                    account_index=acc_i, api_key_index=key_i)
+                    url=_URL, account_index=acc_i,
+                    api_private_keys={key_i: _API_PRIV}, chain_id=_CHAIN)
                 res = cli.check_client()
                 if asyncio.iscoroutine(res):
                     res = await res
@@ -152,8 +155,11 @@ class Lighter:
                 if mid not in POR_ID:
                     continue
                 sz = float(getattr(p, "position", 0) or 0)
-                if abs(sz) > 1e-12:
-                    out[POR_ID[mid]] = (1 if sz > 0 else -1, abs(sz))
+                if abs(sz) <= 1e-12:
+                    continue
+                sg = getattr(p, "sign", None)
+                d = (1 if int(sg) == 1 else -1) if sg is not None else (1 if sz > 0 else -1)
+                out[POR_ID[mid]] = (d, abs(sz))
         return out
 
     def posicoes_todas(self):
@@ -217,7 +223,7 @@ class Lighter:
                 client_order_index=int(time.time()) % 1_000_000,
                 base_amount=self._lotes(ativo, base),
                 avg_execution_price=self._preco_int(ativo, pior),
-                is_ask=(direcao == -1)))
+                is_ask=(direcao == -1), api_key_index=self.key_i))
             if err is not None:
                 disjuntor.registra_erro(err); return (False, f"corretora recusou: {err}")
             disjuntor.registra_ok()
@@ -241,7 +247,7 @@ class Lighter:
                 client_order_index=int(time.time()) % 1_000_000,
                 base_amount=self._lotes(ativo, base),
                 avg_execution_price=self._preco_int(ativo, pior),
-                is_ask=(contra == -1)))
+                is_ask=(contra == -1), api_key_index=self.key_i))
             if err is not None:
                 disjuntor.registra_erro(err); return (False, f"corretora recusou: {err}")
             disjuntor.registra_ok()
