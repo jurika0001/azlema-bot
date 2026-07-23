@@ -43,6 +43,11 @@ ESTADO = os.path.join(ESTADO_DIR, "estado_paper.json")
 # sem precisar apostar 5 meses numa so.
 FEE_LADO = 0.0                      # Lighter Standard (cenario principal)
 
+# Versao da estrategia. Se mudar, o estado salvo (Gist/disco) e' DESCARTADO —
+# senao trades da estrategia antiga se misturariam com a nova e corromperiam a
+# estatistica. Trocou de config -> muda esta string -> comeca do zero limpo.
+STRATEGY_VERSION = "HA-2h-400/80/15-norev-sess"
+
 CENARIOS = {                        # taker por LADO
     "lighter_0%":       0.0,
     "kcex_0.01%":       1e-4,
@@ -84,7 +89,7 @@ REF_MEDIA = 0.000718
 REF_DESVIO = 0.008030
 REF_WR = 87.2
 
-ATIVOS = {"ETH": "ETH_USDT", "BTC": "BTC_USDT"}
+ATIVOS = {"ETH": "ETH_USDT", "BTC": "BTC_USDT", "SOL": "SOL_USDT"}
 
 
 class PaperTrader:
@@ -114,6 +119,11 @@ class PaperTrader:
         return f"estado_{self.ativo.lower()}.json"
 
     def _aplicar(self, z):
+        # se o estado salvo e' de outra versao da estrategia, DESCARTA
+        if z.get("strategy_version") != STRATEGY_VERSION:
+            print(f"[{self.ativo}] estado e' de outra estrategia "
+                  f"({z.get('strategy_version')}) -> comecando limpo", flush=True)
+            return
         self.trades = z.get("trades", [])
         self.inicio = z.get("inicio", self.inicio)
         self.contadores.update(z.get("contadores", {}))
@@ -145,6 +155,7 @@ class PaperTrader:
 
     def _snapshot(self):
         return {
+            "strategy_version": STRATEGY_VERSION,
             "inicio": self.inicio,
             "trades": self.trades,
             "contadores": self.contadores,
@@ -236,10 +247,13 @@ class PaperTrader:
     def on_candle_fechado(self, direcao, bid, ask, ts_ms):
         """Chamado quando fecha um candle de 2h e temos a direcao do proximo."""
         bid = float(bid); ask = float(ask)
+        from estrategia import NO_REV
         with self.lock:
             fechada = None
-            # reversao: sinal inverteu e temos posicao aberta (norev=0)
-            if self.pos is not None and direcao != 0 and direcao != self.pos.pdir:
+            # reversao: sinal inverteu e temos posicao aberta.
+            # Se NO_REV, NAO fecha na reversao — segura ate SL/TP/trailing.
+            if (not NO_REV) and self.pos is not None and direcao != 0 \
+                    and direcao != self.pos.pdir:
                 saida = bid if self.pos.pdir == 1 else ask
                 fechada = self._fechar(saida, "reversao", ts_ms)
             if self.pos is None and direcao != 0:

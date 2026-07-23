@@ -35,6 +35,7 @@ from flask import Flask, jsonify, request
 
 from estrategia import sinal_atual, TF_MS
 import estado_remoto
+import executor
 from paper import PaperTrader, FEE_LADO, N_MIN, T_MIN, CENARIOS, ATIVOS, REF_MEDIA, REF_WR
 
 APP_INICIO = time.time()
@@ -42,8 +43,10 @@ UA = {"User-Agent": "Mozilla/5.0"}
 TICKER = "https://contract.mexc.com/api/v1/contract/ticker?symbol={s}"
 KLINE = "https://contract.mexc.com/api/v1/contract/kline/{s}?interval=Min60&start={t}"
 
+from trio_paper import Trio
 app = Flask(__name__)
 TRADERS = {a: PaperTrader(a) for a in ATIVOS}
+TRIO = Trio()                          # paper trading do trio (1 posicao entre os 3)
 log_recente = []
 _loglock = threading.Lock()
 
@@ -153,14 +156,26 @@ def _ws_msg(ws, raw):
             # cada msg traz 1+ negocios; alimenta todos (gatilho fino, ~0,42s)
             for neg in (d if isinstance(d, list) else [d]):
                 ws_estado["ticks"] += 1
+                # alimenta o TRIO com o mesmo tick (gerencia se a posicao e' deste ativo)
+                tt = TRIO.on_tick(pt.ativo, neg["p"])
+                if tt:
+                    log(f"[trio] FECHOU {tt['ativo']} {'LONG' if tt['dir']==1 else 'SHORT'} "
+                        f"{tt['motivo']} | bruto {tt['bruto']*100:+.3f}% | total={len(TRIO.trades)}")
+                    TRIO.salvar(forcar_gist=True)
                 t = pt.on_tick(neg["p"], int(neg.get("t", time.time() * 1000)))
                 if t:
                     log(f"[ws] {pt.ativo} FECHOU {'LONG' if t['dir']==1 else 'SHORT'} "
                         f"{t['motivo']} | {t['entry']:.2f} -> {t['saida']:.2f} | "
                         f"bruto {t['bruto']*100:+.3f}% | total={total_trades()}/{N_MIN}")
                     pt.salvar(forcar_gist=True)   # trade fechou -> grava no gist ja
+                    # espelha o FECHAMENTO na corretora (so o ativo escolhido)
+                    r = executor.fechar(pt.ativo, t["saida"], t["motivo"])
+                    if r:
+                        executor.disjuntor.registra_trade(t["bruto"] * 100)
+                        log(f"[real] fechar {pt.ativo}: {r['detalhe']}")
         elif ch == "push.ticker":
             pt.atualiza_cotacao(d["bid1"], d["ask1"], d.get("fundingRate"))
+            TRIO.cotacao(pt.ativo, d["bid1"], d["ask1"])
     except Exception as e:
         log(f"[ws] erro ao processar: {type(e).__name__}: {e}")
 
@@ -255,9 +270,24 @@ def sinal_30s():
                     if len(c) >= 60:
                         d = sinal_atual(o, h, l, c, ts)
                         b, k = bid_ask(pt.simbolo)
+                        antes = pt.pos.pdir if pt.pos else 0
                         fech = pt.on_candle_fechado(d, b, k, agora)
                         if fech:
                             log(f"[30s] {a} FECHOU por reversao | bruto {fech['bruto']*100:+.3f}%")
+                            r = executor.fechar(a, fech["saida"], "reversao")
+                            if r:
+                                executor.disjuntor.registra_trade(fech["bruto"] * 100)
+                                log(f"[real] fechar {a}: {r['detalhe']}")
+                        # espelha a ABERTURA (so se o paper realmente abriu agora)
+                        if pt.pos is not None and antes == 0:
+                            r = executor.abrir(a, pt.pos.pdir, pt.pos.entry)
+                            if r:
+                                log(f"[real] abrir {a}: {r['detalhe']}")
+                        # TRIO: mesmo candle -> abre no 1o par livre (uma posicao entre os 3)
+                        tf = TRIO.on_candle(a, d, b, k, agora)
+                        if tf:
+                            log(f"[trio] {a} FECHOU por reversao | bruto {tf['bruto']*100:+.3f}%")
+                        TRIO.salvar()
                         log(f"[30s] {a} candle 2h virou | sinal="
                             f"{ {1:'LONG', -1:'SHORT', 0:'nada'}[d] } | bid={b:.2f} ask={k:.2f}")
                     else:
@@ -265,6 +295,11 @@ def sinal_30s():
                 pt.salvar()
             except Exception as e:
                 log(f"[30s] {a} erro: {e}")
+        # RECONCILIACAO: quem manda sobre a posicao aberta e' a CORRETORA
+        try:
+            executor.sincronizar(TRADERS)
+        except Exception as e:
+            log(f"[real] erro na reconciliacao: {type(e).__name__}: {e}")
         time.sleep(30)
 
 
@@ -395,6 +430,31 @@ def ver_log():
         return "<pre>" + "\n".join(log_recente[-100:]) + "</pre>"
 
 
+@app.route("/trio")
+def trio_status():
+    """Paper trading do trio ETH+BTC+SOL (1 posicao por vez). SEM meta."""
+    return jsonify(TRIO.stats())
+
+
+@app.route("/real")
+def real_status():
+    """Estado da EXECUCAO REAL: modo, posicao na corretora, travas, disjuntor."""
+    return jsonify(executor.status())
+
+
+@app.route("/parar", methods=["POST"])
+def parar_tudo():
+    """PARADA DE EMERGENCIA: trava a execucao e fecha o que estiver aberto.
+    O paper trading continua rodando normalmente (o teste nao e' interrompido)."""
+    executor.disjuntor.trava("parada manual pelo /parar")
+    pt = TRADERS.get(executor.ATIVO_REAL)
+    preco = getattr(pt, "ultimo_preco", None) if pt else None
+    r = executor.fechar(executor.ATIVO_REAL, preco, "parada manual") if preco else None
+    log("[real] PARADA DE EMERGENCIA acionada")
+    return jsonify({"travado": True, "fechamento": r,
+                    "obs": "execucao travada; paper trading continua"})
+
+
 @app.route("/ativos")
 def ativos_json():
     """Cada ativo LIDO SOZINHO — winrate/edge/DD proprios, sem misturar.
@@ -425,6 +485,27 @@ def ativos_json():
                              for t in pt.trades],
         }
     return jsonify(out)
+
+
+def _trio_html():
+    s = TRIO.stats()
+    pos = s.get("posicao")
+    posx = "nenhuma" if not pos else f"{pos['ativo']} {'LONG' if pos['dir']==1 else 'SHORT'}"
+    pa = " · ".join(f"{a}: {v['n']}tr" + (f" edge {v['edge_pct']:+.3f}%" if v['edge_pct'] is not None else "")
+                    for a, v in s["por_ativo"].items())
+    br = s["backtest_ref"]
+    linha2 = ""
+    if "edge_por_trade_pct" in s:
+        linha2 = (f'<br>edge/trade <b>{s["edge_por_trade_pct"]:+.4f}%</b> '
+                  f'<span style="color:#888">(backtest: {br["edge_pct"]:+.3f}%)</span> · '
+                  f't={s["tstat"]} <span style="color:#888">(bt {br["t"]})</span> · '
+                  f'WR {s["winrate"]}% · DD {s["dd_pct"]}% '
+                  f'<span style="color:#888">(bt {br["dd_pct"]}%)</span>')
+    return (f'<div style="border:2px solid #06c;padding:10px;margin:14px 0;background:#f2f7ff">'
+            f'<b>TRIO ETH+BTC+SOL</b> (paper, 1 posicao por vez, SEM meta) — '
+            f'{s["n"]} trades em {s["dias"]:.1f} dias ({s["trades_por_dia"]}/dia) · '
+            f'posicao: {posx}{linha2}'
+            f'<br><span style="color:#666;font-size:12px">{pa} · <a href="/trio">/trio</a></span></div>')
 
 
 @app.route("/")
@@ -481,6 +562,26 @@ def home():
                       f"<td>{(f'{sp:.5f}%' if sp else '—')}</td>"
                       f"<td>{(f'{fr*100:+.4f}%' if fr is not None else '—')}</td>"
                       f"<td>{pt.ticks:,}</td></tr>")
+    ex = executor.status()
+    cr = ex["corretora"]
+    modo_real = cr["modo"] == "REAL"
+    dj = cr["disjuntor"]
+    exec_html = (
+        f'<div style="border:2px solid {"#c00" if modo_real else "#999"};padding:10px;'
+        f'margin:14px 0;background:{"#fff4f4" if modo_real else "#f7f7f7"}">'
+        f'<b>EXECUCAO: <span style="color:{"#c00" if modo_real else "#666"}">'
+        f'{"DINHEIRO REAL" if modo_real else "SIMULADO (nenhuma ordem enviada)"}</span></b>'
+        f' &nbsp;|&nbsp; ativo: <b>{ex["ativo_real"]}</b> 1x'
+        f' &nbsp;|&nbsp; posicao na corretora: {cr["posicao_na_corretora"]}'
+        + (f' &nbsp;|&nbsp; <span style="color:#c00;font-weight:700">DISJUNTOR TRAVADO: '
+           f'{dj["motivo"]}</span>' if dj["travado"] else
+           f' &nbsp;|&nbsp; disjuntor ok (PnL dia {dj["pnl_dia_pct"]:+.2f}%)')
+        + (f'<br><span style="color:#a00">erro de conexao: {cr["erro_init"]}</span>'
+           if cr.get("erro_init") else "")
+        + f'<br><span style="color:#666;font-size:12px">teto {cr["limites"]["teto_usd"]:.0f} USD'
+        f' | para tudo se perder {cr["limites"]["perda_dia_max_pct"]:.0f}% no dia'
+        f' | deslizamento max {cr["limites"]["deslizamento_max_pct"]:.2f}%'
+        f' | <a href="/real">/real</a></span></div>')
     wsv = ws_vivo()
     ws_html = (f'<span style="color:{"#0a0" if wsv else "#c00"};font-weight:700">'
                f'{"VIVO" if wsv else "MUDO (rede de 21s assumiu)"}</span> '
@@ -494,6 +595,8 @@ def home():
 winrate {g.get('winrate', 0):.1f}% <span style="color:#888">(cofre: {REF_WR}%)</span>
 &nbsp;|&nbsp; {g.get('trades_por_dia', 0):.1f} trades/dia</p>
 
+{_trio_html()}
+{exec_html}
 <p style="font-size:14px">WebSocket (feed principal, tick a ~0,42s): {ws_html}</p>
 
 <h3>Por ativo</h3>

@@ -24,12 +24,14 @@ import numpy as np
 PI = 3.14159265359
 
 # ---- parametros travados (nao mexer: sao os validados no cofre 2017-20) ----
-SL_PTS = 250.0
-TP_PTS = 30.0
-TR_PTS = 25.0
+# HA-2h 400/80/15 norev sess — melhor no BTC (fill realista, taxa 0):
+# +114%/ano a 1x, DD 32%, t=3,58. Passa em 2 ativos (BTC forte, ETH ok).
+SL_PTS = 400.0
+TP_PTS = 80.0
+TR_PTS = 15.0
 MM = 0.0
 SESS_ON = True
-NO_REV = False
+NO_REV = True         # sinal invertendo NAO fecha; segura ate SL/TP/trailing
 TF_MS = 2 * 3600 * 1000          # candle de 2 horas
 
 
