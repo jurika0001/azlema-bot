@@ -1,47 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-PONTE entre a estrategia (que decide) e a corretora (que executa).
+PONTE entre o TRIO (que decide) e a Lighter (que executa).
 
-Fica DE FORA do paper.py de proposito: o paper trading continua rodando puro,
-sem risco de um bug da execucao contaminar o teste estatistico. Aqui so
-acontece o espelhamento: quando o paper abre/fecha, isto manda para a Lighter.
+O TRIO tem UMA posicao por vez entre ETH/BTC/SOL. Este modulo espelha isso na
+corretora: quando o trio abre em X, abre em X (1x, saldo total); quando fecha,
+fecha em X. Fica FORA do paper de proposito — um bug de execucao nao contamina
+o teste estatistico.
 
-REGRA CENTRAL: a posicao real e' a que a CORRETORA diz que existe. A memoria do
-bot e' apenas um palpite; num reinicio, num erro de rede ou numa ordem recusada,
-os dois divergem — e quem manda e' a corretora, sempre.
+REGRA CENTRAL: a posicao real e' a que a CORRETORA diz que existe. Num reinicio,
+erro de rede ou ordem recusada, a memoria e a corretora divergem — e quem manda
+e' a corretora, sempre (reconciliacao).
 """
-import os
 import threading
 
-from corretora_lighter import Lighter, disjuntor, REAL, CONFIGURADO
+from corretora_lighter import Lighter, disjuntor, REAL, CONFIGURADO, MERCADOS
 
-ATIVO_REAL = os.environ.get("ATIVO_REAL", "BTC").strip().upper()
 _lock = threading.Lock()
-_corretora = None
-_historico = []
+_lighter = None
+_hist = []
 
 
 def corretora():
-    global _corretora
-    if _corretora is None:
-        _corretora = Lighter(ATIVO_REAL)
-    return _corretora
+    global _lighter
+    if _lighter is None:
+        _lighter = Lighter()
+    return _lighter
 
 
-def _reg(evento, ok, detalhe, extra=None):
-    r = {"evento": evento, "ok": ok, "detalhe": detalhe}
+def _reg(ev, ok, det, extra=None):
+    r = {"evento": ev, "ok": ok, "detalhe": det}
     if extra:
         r.update(extra)
-    _historico.append(r)
-    del _historico[:-200]
-    print(f"[executor] {evento}: {'OK' if ok else 'FALHOU'} — {detalhe}", flush=True)
+    _hist.append(r); del _hist[:-200]
+    print(f"[executor] {ev}: {'OK' if ok else 'FALHOU'} — {det}", flush=True)
     return r
 
 
 def abrir(ativo, direcao, preco):
-    """Espelha na corretora a abertura que a estrategia decidiu."""
-    if ativo != ATIVO_REAL:
-        return None                      # so o ativo escolhido opera de verdade
+    """Espelha a abertura que o TRIO decidiu."""
+    if ativo not in MERCADOS:
+        return None
     with _lock:
         c = corretora()
         if not (REAL and c.pronto):
@@ -51,61 +49,59 @@ def abrir(ativo, direcao, preco):
         saldo = c.saldo()
         if saldo <= 0:
             return _reg("abrir", False, f"saldo indisponivel ({saldo})")
-        base = c.tamanho_1x(saldo, preco)     # 1x, respeitando o teto
+        base = c.tamanho_1x(ativo, saldo, preco)
         if base <= 0:
             return _reg("abrir", False,
-                        f"saldo {saldo:.2f} nao cobre o minimo de {c.m['min_base']} {ativo}")
-        ok, det = c.abrir(direcao, base, preco)
-        return _reg("abrir", ok, det,
-                    {"ativo": ativo, "dir": direcao, "base": base, "preco": preco})
+                        f"saldo {saldo:.2f} nao cobre o minimo de {ativo}")
+        ok, det = c.abrir(ativo, direcao, base, preco)
+        return _reg("abrir", ok, det, {"ativo": ativo, "dir": direcao, "base": base})
 
 
 def fechar(ativo, preco, motivo=""):
-    """Espelha o fechamento. Sempre confere com a corretora antes."""
-    if ativo != ATIVO_REAL:
+    if ativo not in MERCADOS:
         return None
     with _lock:
         c = corretora()
         if not (REAL and c.pronto):
             return _reg("fechar", False, "modo simulado")
-        ok, det = c.fechar(preco)
+        ok, det = c.fechar(ativo, preco)
         return _reg("fechar", ok, f"{det} (motivo: {motivo})", {"ativo": ativo})
 
 
-def sincronizar(paper_traders):
-    """RECONCILIACAO — roda no arranque e periodicamente.
+def sincronizar(trio):
+    """RECONCILIACAO — a corretora manda. Roda periodicamente e no arranque.
 
-    Compara o que o bot ACHA que tem aberto com o que a corretora diz. Se
-    divergirem, a corretora vence. Isso cobre: reinicio do servico, ordem que
-    foi recusada, ordem que executou mas a resposta se perdeu, e liquidacao.
-    """
+    Compara o que o TRIO acha aberto com o que a Lighter diz. Divergiu ->
+    a corretora vence. Cobre reinicio, ordem recusada, resposta perdida,
+    liquidacao. Posicao orfa (a Lighter tem, o trio nao sabe) -> fecha, para
+    nao ficar exposto a algo que ninguem gerencia."""
     c = corretora()
     if not (REAL and c.pronto):
         return {"modo": "simulado"}
-    d_real, base = c.posicao()
-    if d_real is None:
+    pos = c.posicoes_todas()
+    if pos is None:
         return {"erro": "corretora nao respondeu — nao mexo em nada"}
-    pt = paper_traders.get(ATIVO_REAL)
-    d_bot = 0 if (pt is None or pt.pos is None) else pt.pos.pdir
-    if d_real == d_bot:
-        return {"ok": True, "dir": d_real, "base": base, "divergencia": False}
-    _reg("reconciliacao", True,
-         f"DIVERGENCIA: bot achava {d_bot}, corretora tem {d_real} ({base}). "
-         f"A corretora manda.", {"dir_corretora": d_real, "dir_bot": d_bot})
-    # posicao orfa na corretora (bot nao sabe dela) -> fecha, para nao ficar
-    # exposto a uma posicao que ninguem esta gerenciando
-    if d_real != 0 and d_bot == 0:
-        preco = getattr(pt, "ultimo_preco", None) if pt else None
-        if not preco or preco <= 0:
-            return _reg("fechar_orfa", False,
-                        "posicao orfa detectada mas SEM preco confiavel — "
-                        "nao envio ordem as cegas. Sera' refeito no proximo ciclo.")
-        ok, det = c.fechar(preco)
-        _reg("fechar_orfa", ok, det)
-    return {"ok": True, "divergencia": True, "dir_corretora": d_real, "dir_bot": d_bot}
+    tativo = trio.pos_ativo
+    tdir = trio.pos.pdir if trio.pos else 0
+    real = {a: d for a, (d, b) in pos.items()}
+    # 1) a corretora tem alguma posicao que o trio NAO conhece -> fecha (orfa)
+    for a, d in real.items():
+        if a != tativo:
+            preco = (trio.ultimo.get(a) or {}).get("preco")
+            if preco and preco > 0:
+                ok, det = c.fechar(a, preco)
+                _reg("fechar_orfa", ok, f"{a} dir {d}: {det}")
+            else:
+                _reg("fechar_orfa", False, f"{a} orfa mas sem preco — refaz no proximo ciclo")
+    # 2) o trio acha que tem posicao mas a corretora NAO tem -> alerta (nao mexe)
+    if tativo and tativo not in real:
+        _reg("divergencia", True,
+             f"trio acha {tativo} dir {tdir}, corretora NAO tem. A corretora manda.")
+    return {"ok": True, "corretora": real,
+            "trio": ({tativo: tdir} if tativo else {})}
 
 
 def status():
-    c = corretora()
-    return {"ativo_real": ATIVO_REAL, "configurado": CONFIGURADO,
-            "corretora": c.status(), "ultimos_eventos": _historico[-10:]}
+    return {"estrategia": "TRIO ETH+BTC+SOL (1 posicao por vez, 1x)",
+            "configurado": CONFIGURADO, "corretora": corretora().status(),
+            "ultimos_eventos": _hist[-10:]}

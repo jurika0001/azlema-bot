@@ -156,23 +156,23 @@ def _ws_msg(ws, raw):
             # cada msg traz 1+ negocios; alimenta todos (gatilho fino, ~0,42s)
             for neg in (d if isinstance(d, list) else [d]):
                 ws_estado["ticks"] += 1
-                # alimenta o TRIO com o mesmo tick (gerencia se a posicao e' deste ativo)
+                # TRIO alimenta a EXECUCAO REAL (uma posicao entre os 3)
                 tt = TRIO.on_tick(pt.ativo, neg["p"])
                 if tt:
                     log(f"[trio] FECHOU {tt['ativo']} {'LONG' if tt['dir']==1 else 'SHORT'} "
                         f"{tt['motivo']} | bruto {tt['bruto']*100:+.3f}% | total={len(TRIO.trades)}")
                     TRIO.salvar(forcar_gist=True)
+                    r = executor.fechar(tt["ativo"], tt["saida"], tt["motivo"])
+                    if r:
+                        executor.disjuntor.registra_trade(tt["bruto"] * 100)
+                        log(f"[real] fechar {tt['ativo']}: {r['detalhe']}")
+                # paper por-ativo (controle independente, NAO opera dinheiro real)
                 t = pt.on_tick(neg["p"], int(neg.get("t", time.time() * 1000)))
                 if t:
                     log(f"[ws] {pt.ativo} FECHOU {'LONG' if t['dir']==1 else 'SHORT'} "
                         f"{t['motivo']} | {t['entry']:.2f} -> {t['saida']:.2f} | "
                         f"bruto {t['bruto']*100:+.3f}% | total={total_trades()}/{N_MIN}")
-                    pt.salvar(forcar_gist=True)   # trade fechou -> grava no gist ja
-                    # espelha o FECHAMENTO na corretora (so o ativo escolhido)
-                    r = executor.fechar(pt.ativo, t["saida"], t["motivo"])
-                    if r:
-                        executor.disjuntor.registra_trade(t["bruto"] * 100)
-                        log(f"[real] fechar {pt.ativo}: {r['detalhe']}")
+                    pt.salvar(forcar_gist=True)
         elif ch == "push.ticker":
             pt.atualiza_cotacao(d["bid1"], d["ask1"], d.get("fundingRate"))
             TRIO.cotacao(pt.ativo, d["bid1"], d["ask1"])
@@ -270,23 +270,22 @@ def sinal_30s():
                     if len(c) >= 60:
                         d = sinal_atual(o, h, l, c, ts)
                         b, k = bid_ask(pt.simbolo)
-                        antes = pt.pos.pdir if pt.pos else 0
-                        fech = pt.on_candle_fechado(d, b, k, agora)
-                        if fech:
-                            log(f"[30s] {a} FECHOU por reversao | bruto {fech['bruto']*100:+.3f}%")
-                            r = executor.fechar(a, fech["saida"], "reversao")
+                        # paper por-ativo (controle independente, sem dinheiro)
+                        pt.on_candle_fechado(d, b, k, agora)
+                        # TRIO -> EXECUCAO REAL: uma posicao entre os 3
+                        trio_antes = TRIO.pos_ativo
+                        tf = TRIO.on_candle(a, d, b, k, agora)
+                        if tf:      # fechou por reversao (so se NO_REV=False)
+                            log(f"[trio] {tf['ativo']} FECHOU por reversao | bruto {tf['bruto']*100:+.3f}%")
+                            r = executor.fechar(tf["ativo"], tf["saida"], "reversao")
                             if r:
-                                executor.disjuntor.registra_trade(fech["bruto"] * 100)
-                                log(f"[real] fechar {a}: {r['detalhe']}")
-                        # espelha a ABERTURA (so se o paper realmente abriu agora)
-                        if pt.pos is not None and antes == 0:
-                            r = executor.abrir(a, pt.pos.pdir, pt.pos.entry)
+                                executor.disjuntor.registra_trade(tf["bruto"] * 100)
+                                log(f"[real] fechar {tf['ativo']}: {r['detalhe']}")
+                        # o trio ABRIU agora? (estava livre, agora tem posicao neste ativo)
+                        if trio_antes is None and TRIO.pos_ativo == a:
+                            r = executor.abrir(a, TRIO.pos.pdir, TRIO.pos.entry)
                             if r:
                                 log(f"[real] abrir {a}: {r['detalhe']}")
-                        # TRIO: mesmo candle -> abre no 1o par livre (uma posicao entre os 3)
-                        tf = TRIO.on_candle(a, d, b, k, agora)
-                        if tf:
-                            log(f"[trio] {a} FECHOU por reversao | bruto {tf['bruto']*100:+.3f}%")
                         TRIO.salvar()
                         log(f"[30s] {a} candle 2h virou | sinal="
                             f"{ {1:'LONG', -1:'SHORT', 0:'nada'}[d] } | bid={b:.2f} ask={k:.2f}")
@@ -297,7 +296,7 @@ def sinal_30s():
                 log(f"[30s] {a} erro: {e}")
         # RECONCILIACAO: quem manda sobre a posicao aberta e' a CORRETORA
         try:
-            executor.sincronizar(TRADERS)
+            executor.sincronizar(TRIO)
         except Exception as e:
             log(f"[real] erro na reconciliacao: {type(e).__name__}: {e}")
         time.sleep(30)
@@ -447,12 +446,17 @@ def parar_tudo():
     """PARADA DE EMERGENCIA: trava a execucao e fecha o que estiver aberto.
     O paper trading continua rodando normalmente (o teste nao e' interrompido)."""
     executor.disjuntor.trava("parada manual pelo /parar")
-    pt = TRADERS.get(executor.ATIVO_REAL)
-    preco = getattr(pt, "ultimo_preco", None) if pt else None
-    r = executor.fechar(executor.ATIVO_REAL, preco, "parada manual") if preco else None
+    fechamentos = []
+    # fecha o que estiver aberto na corretora, em qualquer ativo
+    c = executor.corretora()
+    pos = c.posicoes_todas() if executor.REAL else {}
+    for ativo in (pos or {}):
+        preco = (TRIO.ultimo.get(ativo) or {}).get("preco")
+        if preco:
+            fechamentos.append(executor.fechar(ativo, preco, "parada manual"))
     log("[real] PARADA DE EMERGENCIA acionada")
-    return jsonify({"travado": True, "fechamento": r,
-                    "obs": "execucao travada; paper trading continua"})
+    return jsonify({"travado": True, "fechamentos": fechamentos,
+                    "obs": "execucao travada; papers continuam"})
 
 
 @app.route("/ativos")
@@ -571,8 +575,8 @@ def home():
         f'margin:14px 0;background:{"#fff4f4" if modo_real else "#f7f7f7"}">'
         f'<b>EXECUCAO: <span style="color:{"#c00" if modo_real else "#666"}">'
         f'{"DINHEIRO REAL" if modo_real else "SIMULADO (nenhuma ordem enviada)"}</span></b>'
-        f' &nbsp;|&nbsp; ativo: <b>{ex["ativo_real"]}</b> 1x'
-        f' &nbsp;|&nbsp; posicao na corretora: {cr["posicao_na_corretora"]}'
+        f' &nbsp;|&nbsp; <b>TRIO ETH+BTC+SOL</b> 1x'
+        f' &nbsp;|&nbsp; posicoes na corretora: {cr["posicoes_na_corretora"]}'
         + (f' &nbsp;|&nbsp; <span style="color:#c00;font-weight:700">DISJUNTOR TRAVADO: '
            f'{dj["motivo"]}</span>' if dj["travado"] else
            f' &nbsp;|&nbsp; disjuntor ok (PnL dia {dj["pnl_dia_pct"]:+.2f}%)')
@@ -599,7 +603,10 @@ winrate {g.get('winrate', 0):.1f}% <span style="color:#888">(cofre: {REF_WR}%)</
 {exec_html}
 <p style="font-size:14px">WebSocket (feed principal, tick a ~0,42s): {ws_html}</p>
 
-<h3>Por ativo</h3>
+<h3>Controles: cada ativo SOZINHO (testes independentes — NÃO é o trio)</h3>
+<p style="color:#888;font-size:12px">Cada linha e' um paper separado que opera so aquele ativo,
+para medir o edge solo de cada um. Por isso podem ter posicoes ao mesmo tempo. O TRIO
+(caixa azul acima) tem UMA posicao por vez entre os tres — e' esse que importa agora.</p>
 <table cellpadding="6" style="border-collapse:collapse;font-size:14px">
 <tr style="background:#f0f0f0"><th align="left">ativo</th><th>trades</th>
 <th>winrate</th><th>media/trade</th><th>pior trade</th>
