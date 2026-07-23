@@ -441,6 +441,14 @@ def real_status():
     return jsonify(executor.status())
 
 
+@app.route("/retomar", methods=["POST"])
+def retomar():
+    """Religa a execucao depois de uma parada (botao RETOMAR)."""
+    executor.disjuntor.destrava()
+    log("[real] execucao RELIGADA pelo painel")
+    return jsonify({"travado": False, "obs": "execucao religada"})
+
+
 @app.route("/parar", methods=["POST"])
 def parar_tudo():
     """PARADA DE EMERGENCIA: trava a execucao e fecha o que estiver aberto.
@@ -510,6 +518,39 @@ def _trio_html():
             f'{s["n"]} trades em {s["dias"]:.1f} dias ({s["trades_por_dia"]}/dia) · '
             f'posicao: {posx}{linha2}'
             f'<br><span style="color:#666;font-size:12px">{pa} · <a href="/trio">/trio</a></span></div>')
+
+
+def _botoes_html(travado):
+    """Botao de PARADA DE EMERGENCIA (e RETOMAR quando travado)."""
+    return f"""
+<div style="margin-top:12px">
+  <button onclick="pararBot()" style="background:#c00;color:#fff;border:0;
+     padding:12px 26px;font-size:16px;font-weight:700;border-radius:6px;
+     cursor:pointer">&#9632; PARAR O BOT (emergencia)</button>
+  {'<button onclick="retomarBot()" style="background:#0a0;color:#fff;border:0;padding:12px 26px;font-size:16px;font-weight:700;border-radius:6px;cursor:pointer;margin-left:10px">&#9654; RETOMAR</button>' if travado else ''}
+  <div id="resultado_botao" style="margin-top:8px;font-size:13px"></div>
+</div>
+<script>
+function pararBot() {{
+  if (!confirm('PARAR O BOT?\\n\\nIsto trava a execucao e FECHA as posicoes abertas na corretora.\\nO paper trading continua rodando.')) return;
+  document.getElementById('resultado_botao').textContent = 'parando...';
+  fetch('/parar', {{method:'POST'}}).then(r=>r.json()).then(d=>{{
+    document.getElementById('resultado_botao').innerHTML =
+      '<b style="color:#c00">BOT PARADO.</b> ' + JSON.stringify(d.fechamentos||[]);
+    setTimeout(()=>location.reload(), 2500);
+  }}).catch(e=>{{
+    document.getElementById('resultado_botao').innerHTML =
+      '<b style="color:#c00">FALHOU: '+e+'</b> — se nao conseguir, use Revoke na Lighter!';
+  }});
+}}
+function retomarBot() {{
+  if (!confirm('RETOMAR a operacao com dinheiro real?')) return;
+  fetch('/retomar', {{method:'POST'}}).then(r=>r.json()).then(d=>{{
+    document.getElementById('resultado_botao').innerHTML = '<b style="color:#0a0">Religado.</b>';
+    setTimeout(()=>location.reload(), 1500);
+  }});
+}}
+</script>"""
 
 
 @app.route("/")
@@ -585,7 +626,11 @@ def home():
         + f'<br><span style="color:#666;font-size:12px">teto {cr["limites"]["teto_usd"]:.0f} USD'
         f' | para tudo se perder {cr["limites"]["perda_dia_max_pct"]:.0f}% no dia'
         f' | deslizamento max {cr["limites"]["deslizamento_max_pct"]:.2f}%'
-        f' | <a href="/real">/real</a></span></div>')
+        f' | saldo: {cr.get("saldo")}'
+        f' | <a href="/real">/real</a></span>'
+        + _botoes_html(dj["travado"]) + '</div>')
+
+
     wsv = ws_vivo()
     ws_html = (f'<span style="color:{"#0a0" if wsv else "#c00"};font-weight:700">'
                f'{"VIVO" if wsv else "MUDO (rede de 21s assumiu)"}</span> '

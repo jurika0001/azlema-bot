@@ -27,7 +27,10 @@ MERCADOS = {
 }
 POR_ID = {m["id"]: a for a, m in MERCADOS.items()}
 
-MODO = os.environ.get("MODO_EXECUCAO", "simulado").strip().lower()
+# >>> PADRAO = REAL: opera com DINHEIRO DE VERDADE assim que houver credencial. <<<
+# Para desligar sem mexer no codigo: crie MODO_EXECUCAO=simulado no Render,
+# ou use o botao PARAR do painel (trava na hora e fecha as posicoes).
+MODO = os.environ.get("MODO_EXECUCAO", "real").strip().lower()
 TETO_USD = float(os.environ.get("TETO_USD", "80"))
 PERDA_DIA_MAX = float(os.environ.get("PERDA_DIA_MAX", "15"))
 DESLIZAMENTO_MAX = float(os.environ.get("DESLIZAMENTO_MAX", "0.30"))
@@ -67,6 +70,12 @@ class Disjuntor:
     def trava(self, motivo):
         self.travado = True; self.motivo = motivo
         print(f"[DISJUNTOR] OPERACAO TRAVADA: {motivo}", flush=True)
+
+    def destrava(self):
+        """Religa a operacao (botao RETOMAR). Zera erros e o PnL do dia."""
+        self.travado = False; self.motivo = ""; self.erros = 0
+        self.dia = None; self.pnl_dia = 0.0
+        print("[DISJUNTOR] operacao RELIGADA manualmente", flush=True)
 
     def liberado(self):
         return not self.travado
