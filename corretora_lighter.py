@@ -80,7 +80,10 @@ class Lighter:
     def __init__(self):
         self.api = None; self.cliente = None; self.loop = None
         self.pronto = False; self.erro_init = None
-        if REAL:
+        # CONECTA sempre que houver credencial (mesmo em simulado): conectar e LER
+        # saldo/posicoes e' seguro (read-only). So ENVIAR ORDEM depende de REAL.
+        # Assim da' pra verificar a conexao antes de virar a chave.
+        if CONFIGURADO:
             self._conectar()
 
     def _rodar(self, coro):
@@ -122,8 +125,9 @@ class Lighter:
 
     def posicoes_todas(self):
         """Dict {ativo: (dir, base)} de TODAS as posicoes abertas na corretora.
-        Vazio = nada aberto. None = corretora nao respondeu (nao assume nada)."""
-        if not (REAL and self.pronto):
+        Vazio = nada aberto. None = corretora nao respondeu (nao assume nada).
+        Leitura e' segura em qualquer modo (nao envia ordem)."""
+        if not self.pronto:
             return {}
         try:
             r = self._posicoes_raw(); disjuntor.registra_ok(); return r
@@ -133,7 +137,7 @@ class Lighter:
             return None
 
     def saldo(self):
-        if not (REAL and self.pronto):
+        if not self.pronto:
             return 0.0
         try:
             import lighter
@@ -213,9 +217,10 @@ class Lighter:
             disjuntor.registra_erro(e); return (False, f"{type(e).__name__}: {e}")
 
     def status(self):
-        pos = self.posicoes_todas() if (REAL and self.pronto) else {}
+        pos = self.posicoes_todas() if self.pronto else {}
         return {"modo": "REAL" if (REAL and self.pronto) else "simulado",
                 "configurado": CONFIGURADO, "conectado": self.pronto,
+                "saldo": self.saldo() if self.pronto else None,
                 "erro_init": self.erro_init, "posicoes_na_corretora": pos,
                 "disjuntor": {"travado": disjuntor.travado, "motivo": disjuntor.motivo,
                               "erros": disjuntor.erros, "pnl_dia_pct": disjuntor.pnl_dia},
