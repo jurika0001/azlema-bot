@@ -129,10 +129,18 @@ class Lighter:
             acc_i = _int_seguro("LIGHTER_ACCOUNT_INDEX", _ACC_IDX)
             key_i = _int_seguro("LIGHTER_API_KEY_INDEX", _KEY_IDX)
             self.key_i = key_i
-            # NAO valido o indice: ja funcionou com indice 0 nesta conta. Se der
-            # "private key does not match", quase sempre a chave foi ROTACIONADA
-            # (botao Refresh na Lighter gera um par novo) e o Render ficou com a
-            # privada antiga — a solucao e' atualizar a chave, nao mudar o indice.
+            # INDICES 0..3 SAO DO APP DA LIGHTER (desktop/mobile) — comprovado:
+            # o pubkey registrado no indice 0 MUDOU sozinho entre duas checagens
+            # (77fc9917... -> 28a3587b...) sem o usuario mexer. Toda vez que o
+            # site app.lighter.xyz e' aberto, ele re-registra a chave DELE no
+            # indice 0 e sobrescreve a nossa -> "private key does not match".
+            # Por isso funciona no comeco e quebra depois. Use indice >= 4.
+            if key_i < 4:
+                raise RuntimeError(
+                    f"LIGHTER_API_KEY_INDEX={key_i}: os indices 0 a 3 pertencem ao "
+                    f"APP da Lighter e sao sobrescritos toda vez que voce abre o site "
+                    f"(por isso funciona e depois para). Crie uma api key com indice "
+                    f">= 4 em app.lighter.xyz/apikeys e use esse numero aqui.")
 
             async def _setup():
                 # criado DENTRO do loop -> ha' event loop rodando (corrige o erro
