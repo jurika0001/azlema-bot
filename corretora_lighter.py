@@ -129,6 +129,10 @@ class Lighter:
             acc_i = _int_seguro("LIGHTER_ACCOUNT_INDEX", _ACC_IDX)
             key_i = _int_seguro("LIGHTER_API_KEY_INDEX", _KEY_IDX)
             self.key_i = key_i
+            # NAO valido o indice: ja funcionou com indice 0 nesta conta. Se der
+            # "private key does not match", quase sempre a chave foi ROTACIONADA
+            # (botao Refresh na Lighter gera um par novo) e o Render ficou com a
+            # privada antiga — a solucao e' atualizar a chave, nao mudar o indice.
 
             async def _setup():
                 # criado DENTRO do loop -> ha' event loop rodando (corrige o erro

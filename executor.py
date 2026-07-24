@@ -12,8 +12,13 @@ erro de rede ou ordem recusada, a memoria e a corretora divergem — e quem mand
 e' a corretora, sempre (reconciliacao).
 """
 import threading
+import time
 
 from corretora_lighter import Lighter, disjuntor, REAL, CONFIGURADO, MERCADOS
+
+# carencia antes de declarar uma posicao "fantasma": tempo para uma ordem
+# recem-enviada aparecer na corretora (o reconciliador roda a cada 30s)
+GRACA_MS = 180_000          # 3 minutos
 
 _lock = threading.Lock()
 _lighter = None
@@ -93,10 +98,33 @@ def sincronizar(trio):
                 _reg("fechar_orfa", ok, f"{a} dir {d}: {det}")
             else:
                 _reg("fechar_orfa", False, f"{a} orfa mas sem preco — refaz no proximo ciclo")
-    # 2) o trio acha que tem posicao mas a corretora NAO tem -> alerta (nao mexe)
+    # 2) o trio acha que tem posicao mas a corretora NAO tem -> POSICAO FANTASMA.
+    #    Antes isto so LOGAVA, e o bot travava: o trio nunca abre nova posicao
+    #    enquanto se acha ocupado, entao uma abertura que falhou (ou que ocorreu
+    #    no paper antes do modo real) congelava a operacao para sempre.
+    #    A funcao promete "a corretora manda" — entao MANDA: descarta a posicao
+    #    fantasma do trio para ele voltar a operar no proximo sinal.
     if tativo and tativo not in real:
-        _reg("divergencia", True,
-             f"trio acha {tativo} dir {tdir}, corretora NAO tem. A corretora manda.")
+        # CARENCIA: se a posicao acabou de ser aberta, a ordem pode estar em voo
+        # (o reconciliador roda a cada 30s). So descarta depois de GRACA_MS, para
+        # nao matar uma posicao legitima que ainda vai aparecer na corretora.
+        idade_ms = (time.time() * 1000) - (trio.pos.ts_abertura if trio.pos else 0)
+        if idade_ms < GRACA_MS:
+            _reg("divergencia", True,
+                 f"trio tem {tativo} ha {idade_ms/1000:.0f}s e a corretora ainda nao "
+                 f"mostra — dentro da carencia de {GRACA_MS/1000:.0f}s, aguardando")
+        else:
+            with trio.lock:
+                trio.pos = None
+                trio.pos_ativo = None
+            try:
+                trio.salvar(forcar_gist=True)
+            except Exception:
+                pass
+            _reg("fantasma_limpa", True,
+                 f"trio achava {tativo} dir {tdir} ha {idade_ms/1000/60:.0f}min mas a "
+                 f"corretora NAO tem: posicao fantasma DESCARTADA (a abertura real "
+                 f"nunca ocorreu). Bot liberado para operar no proximo sinal.")
     return {"ok": True, "corretora": real,
             "trio": ({tativo: tdir} if tativo else {})}
 
